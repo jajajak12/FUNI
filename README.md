@@ -1,227 +1,218 @@
-# FUNI — Robinhood LP Operator
+# FUNI — Operator LP Robinhood
 
-A safety-first TypeScript monorepo for a single-operator Uniswap v3 and v4 LP
-operator on Robinhood Chain (chain ID `4663`) plus a reusable read-only
-Robinhood infrastructure stack, a Telegram operator bot, registry/state-cache
-workers, and an optional alert channel.
+Monorepo TypeScript yang mengutamakan keamanan untuk operator tunggal LP
+Uniswap v3 dan v4 di Robinhood Chain (chain ID `4663`), beserta tumpukan
+infrastruktur Robinhood baca-saja yang dapat digunakan kembali, bot operator
+Telegram, worker registry/cache-state, dan kanal peringatan opsional.
 
 > **Status**
 >
-> Live execution is disabled by default. The shipped `.env.example` values
-> keep every transaction path off until a human explicitly flips them after a
-> complete preflight, deployment verification, and independent code-hash
-> review. This repository is published for source review; it does not
-> include any operational state, databases, secrets, or runtime
-> identifiers.
+> Eksekusi live dinonaktifkan secara bawaan. Nilai di `.env.example` yang
+> disertakan membuat seluruh jalur transaksi tetap mati sampai manusia
+> mengaktifkannya secara eksplisit setelah preflight lengkap, verifikasi
+> deployment, dan tinjauan hash kode independen. Repositori ini diterbitkan
+> untuk tinjauan sumber; tidak menyertakan state operasional, database, secret,
+> maupun identifier runtime.
 
-## What is FUNI
+## Apa itu FUNI
 
-FUNI is the public name of the Robinhood LP operator repository. The package
-namespace, CLI command names, database tables, migrations, and runtime
-identifiers are unchanged from the canonical Robin design. The word FUNI
-appears only in the public-facing README and the repository name.
+FUNI adalah nama publik repositori operator LP Robinhood. Namespace paket,
+nama perintah CLI, tabel database, migrasi, dan identifier runtime tetap
+menggunakan desain Robin kanonis. Kata FUNI hanya muncul pada README yang
+ditujukan untuk publik dan nama repositori.
 
-## Supported functionality
+## Fungsionalitas yang didukung
 
 ### Chain
 
-- Robinhood Chain mainnet, chain ID `4663`, ETH gas.
-- Public RPC and an Alchemy endpoint pool are both supported. The Alchemy
-  pool is hot-swappable per process via the standard `ALCHEMY_RPC_URLS`
-  comma list.
+- Robinhood Chain mainnet, chain ID `4663`, gas ETH.
+- RPC publik dan pool endpoint Alchemy didukung. Pool Alchemy dapat diganti
+  panas per proses melalui daftar koma standar `ALCHEMY_RPC_URLS`.
 
-### Protocols
+### Protokol
 
-- **Uniswap v3** — pool discovery, position inspection, allowance audit,
-  read-only fee estimation, and an end-to-end fork-based mint approval
-  simulator.
-- **Uniswap v4** — pool registry bootstrap and refresh, single-sided
-  downside mint previews, persistent position view, operational open
-  intents, target/funding swaps, full close, burn, exact-hash
-  reconciliation, and rebalance lifecycle (preview → authorize → execute
-  → complete).
+- **Uniswap v3** — penemuan pool, inspeksi posisi, audit allowance, estimasi
+  biaya baca-saja, dan simulator persetujuan mint berbasis fork end-to-end.
+- **Uniswap v4** — bootstrap serta refresh registry pool, pratinjau mint
+  downside satu sisi, tampilan posisi persisten, intent open operasional,
+  swap target/funding, penutupan penuh, burn, rekonsiliasi exact-hash, dan
+  siklus hidup rebalance (pratinjau → otorisasi → eksekusi → selesai).
 
-### Pool registry
+### Registry pool
 
-- Periodic bootstrap and refresh of a bounded set of pools
-  (configurable window size and per-cycle limit) keyed by `poolId`.
-- Per-pool validation status (`ELIGIBLE` / `BLOCKED`) and blocker reasons
-  for downstream UI.
+- Bootstrap dan refresh periodik untuk kumpulan pool terbatas (ukuran jendela
+  dan batas per siklus dapat dikonfigurasi) dengan kunci `poolId`.
+- Status validasi per pool (`ELIGIBLE` / `BLOCKED`) beserta alasan pemblokiran
+  untuk UI downstream.
 
-### Portfolio and external-position visibility
+### Portofolio dan visibilitas posisi eksternal
 
-- `BOT_OPERATIONAL` positions opened and managed by this operator.
-- `MANUAL_EXTERNAL` positions owned by the configured wallet but
-  adopted from on-chain transfer history; visible but excluded from
-  BOT-managed exposure accounting.
-- `TRACKED` positions held for awareness without committed capital.
-- Per-position live state, fee claimable, and historical PnL via a
-  bounded two-minute portfolio snapshot, refreshed by a state-cache
-  worker.
+- Posisi `BOT_OPERATIONAL` dibuka dan dikelola oleh operator ini.
+- Posisi `MANUAL_EXTERNAL` dimiliki wallet yang dikonfigurasi, tetapi diadopsi
+  dari riwayat transfer on-chain; terlihat, tetapi tidak dihitung dalam
+  eksposur yang dikelola bot.
+- Posisi `TRACKED` disimpan untuk pemantauan tanpa modal yang dikomitkan.
+- State live per posisi, fee yang dapat diklaim, dan PnL historis melalui
+  snapshot portofolio dua menit yang dibatasi, diperbarui oleh worker cache
+  state.
 
-### Direct open, collect, close, burn, and rebalance lifecycle
+### Siklus hidup open, collect, close, burn, dan rebalance langsung
 
-- `v4-open-preflight` — read-only preview of a v4 single-sided downside
-  mint.
-- `v4-position-import` — adopt an on-chain v4 NFT into the local
-  positions table and reconciliation queue.
+- `v4-open-preflight` — pratinjau baca-saja mint downside satu sisi v4.
+- `v4-position-import` — adopsi NFT v4 on-chain ke tabel posisi lokal dan
+  antrean rekonsiliasi.
 - `v4-position-collect-preflight`, `v4-position-partial-close-preflight`,
-  `v4-position-full-close-preflight` — read-only previews of collect,
-  partial close, and full close.
-- `v4-pnl-audit` — closed-position PnL computed from canonical
-  principal-first accounting.
-- Rebalance preview, authorization, and rebalance-resume flow with a
-  durable SQLite-backed journal, projected funding allocation, and
-  state-bound recovery for `FAILED_RECOVERABLE` workflows.
-- Exact-hash reconciliation: `rebalance-exact-hash-reconcile` reconciles
-  a confirmed on-chain broadcast whose engine journal still shows
-  `PREPARED` (e.g. transient RPC error during a prior submit) and is
-  the canonical durable fix.
+  `v4-position-full-close-preflight` — pratinjau baca-saja untuk collect,
+  close parsial, dan close penuh.
+- `v4-pnl-audit` — PnL posisi tertutup dari akuntansi kanonis
+  principal-first.
+- Pratinjau, otorisasi, dan alur `rebalance-resume` dengan jurnal persisten
+  berbasis SQLite, alokasi funding terproyeksi, serta pemulihan berbasis state
+  untuk workflow `FAILED_RECOVERABLE`.
+- Rekonsiliasi exact-hash: `rebalance-exact-hash-reconcile` merekonsiliasi
+  broadcast on-chain yang sudah terkonfirmasi tetapi jurnal engine masih
+  menunjukkan `PREPARED` (misalnya karena galat RPC sementara saat submit),
+  dan merupakan perbaikan persisten kanonis.
 
-### BOT_OPERATIONAL versus MANUAL_EXTERNAL
+### BOT_OPERATIONAL dibanding MANUAL_EXTERNAL
 
-- `BOT_OPERATIONAL` positions are opened by the bot and contribute to
-  the `BOT_MANAGED_EXPOSURE` aggregate.
-- `MANUAL_EXTERNAL` positions are owned by the configured wallet but
-  were not opened by the bot. They are visible in the portfolio and
-  surface as "External" badges in the Telegram UX, and they are
-  excluded from the BOT-managed exposure cap and from the rebalance
-  candidate set. They never receive a `BOT_OPERATIONAL` mint in the
-  backend.
-- `TRACKED` positions are held for awareness without committed capital
-  and never enter the rebalance path.
+- Posisi `BOT_OPERATIONAL` dibuka bot dan berkontribusi pada agregat
+  `BOT_MANAGED_EXPOSURE`.
+- Posisi `MANUAL_EXTERNAL` dimiliki wallet terkonfigurasi namun tidak dibuka
+  bot. Posisi ini terlihat di portofolio, diberi lencana “External” di UX
+  Telegram, dikecualikan dari batas eksposur yang dikelola bot dan kandidat
+  rebalance, serta tidak pernah menerima mint `BOT_OPERATIONAL` di backend.
+- Posisi `TRACKED` hanya untuk pemantauan tanpa modal yang dikomitkan dan tidak
+  pernah memasuki jalur rebalance.
 
-### BOT-managed exposure cap
+### Batas eksposur yang dikelola bot
 
-- `MAX_BOT_MANAGED_EXPOSURE_USD` caps the aggregate of open and pending
-  BOT-managed positions, including the projected reopen principal of any
-  non-terminal rebalance workflow that lacks a confirmed replacement
-  position. Per-position costs are derived from a fresh price reference;
-  stale price references fail closed.
+- `MAX_BOT_MANAGED_EXPOSURE_USD` membatasi agregat posisi yang terbuka dan
+  tertunda yang dikelola bot, termasuk principal reopen terproyeksi dari
+  workflow rebalance non-terminal yang belum memiliki posisi pengganti
+  terkonfirmasi. Biaya per posisi diturunkan dari referensi harga segar;
+  referensi harga kedaluwarsa gagal-tertutup.
 
-### Exact-hash transaction attribution and nonce safety
+### Atribusi transaksi exact-hash dan keamanan nonce
 
-- Every broadcast is journaled in `rebalance_transactions` with the
-  serialized request and the persisted hash.
-- The engine re-queries the exact hash across the configured RPC pool
-  after every send. A matching on-chain receipt reconciles the row to
-  `CONFIRMED` in one transaction; a `PENDING` proof is monitored;
-  an `ABSENT` proof fails closed without a blind retry.
-- A per-wallet `nonce_mutex` row prevents concurrent broadcasts on the
-  same nonce, even across process restarts. External activity on the
-  same wallet is detected via `pending != latest` and the engine will
-  not blindly rebroadcast.
+- Setiap broadcast dicatat dalam `rebalance_transactions` bersama request
+  terserialisasi dan hash persisten.
+- Engine mengkueri ulang hash yang sama pada pool RPC terkonfigurasi setelah
+  setiap pengiriman. Receipt on-chain yang cocok merekonsiliasi baris menjadi
+  `CONFIRMED` dalam satu transaksi; bukti `PENDING` dipantau; bukti `ABSENT`
+  gagal-tertutup tanpa retry buta.
+- Baris `nonce_mutex` per wallet mencegah broadcast bersamaan pada nonce yang
+  sama, bahkan setelah proses dimulai ulang. Aktivitas eksternal pada wallet
+  yang sama dideteksi melalui `pending != latest` dan engine tidak akan
+  membroadcast ulang secara buta.
 
-### Dry-run and emergency safety
+### Keamanan dry-run dan darurat
 
-- `DRY_RUN=true` is the default. Pre-flight commands are the public
-  path; broadcast commands require an explicit `EXECUTION_ENABLED=true`
-  flip and a confirmed safety-state pass.
-- `EMERGENCY_PAUSE=true` plus the durable `manualPause=true` row in
-  `operator_safety_state` form a two-gate close.
-- `safety-pause` and `safety-resume` require a literal reason string
-  and a confirmation marker; the durable row is the authoritative
-  source of truth at boot.
+- `DRY_RUN=true` adalah nilai bawaan. Perintah preflight merupakan jalur
+  publik; perintah broadcast memerlukan perubahan eksplisit
+  `EXECUTION_ENABLED=true` dan lolos state keamanan terkonfirmasi.
+- `EMERGENCY_PAUSE=true` bersama baris persisten `manualPause=true` pada
+  `operator_safety_state` membentuk penutupan dua gerbang.
+- `safety-pause` dan `safety-resume` memerlukan string alasan literal dan
+  penanda konfirmasi; baris persisten adalah sumber kebenaran otoritatif saat
+  boot.
 
-## Local installation
+## Instalasi lokal
 
 ```
 git clone <repository>
 cd <repository>
 npm ci
 cp .env.example .env
-# Edit .env to set RH_RPC_URL, ALCHEMY_RPC_URLS, and the rest of the
-# placeholders. All values must be synthetic at first run; see
-# .env.example for warnings.
+# Edit .env untuk mengatur RH_RPC_URL, ALCHEMY_RPC_URLS, dan placeholder lain.
+# Semua nilai harus sintetis saat pertama kali dijalankan; lihat peringatan di
+# .env.example.
 npm run typecheck
 npm test
 ```
 
-The shipped `.env.example` resolves to:
+`.env.example` yang disertakan menetapkan:
 
 - `EXECUTION_ENABLED=false`
 - `DRY_RUN=true`
 - `EMERGENCY_PAUSE=true`
 - `LIVE_CANARY_ENABLED=false`
 - `V4_LIVE_CANARY_ENABLED=false`
-- Conservative limits on per-transaction gas, lifecycle gas, and
-  slippage.
+- Batas konservatif untuk gas per transaksi, gas siklus hidup, dan slippage.
 
-A live first run with a real wallet is **not** the documented path.
-The canonical onboarding sequence is documented in
-`docs/ROBINHOOD_RECON.md` and the deployment audit (`npm run cli --
-deployment-audit --live`). Live execution is operator-class and requires
-a complete preflight, deployment verification, and independent
-code-hash review.
+Penggunaan live pertama dengan wallet nyata **bukan** jalur yang didokumentasikan.
+Urutan onboarding kanonis didokumentasikan di `docs/ROBINHOOD_RECON.md` dan
+audit deployment (`npm run cli -- deployment-audit --live`). Eksekusi live
+bersifat tingkat-operator dan memerlukan preflight lengkap, verifikasi
+deployment, serta tinjauan hash kode independen.
 
-## Database initialization
+## Inisialisasi database
 
-The canonical database path is `${DATA_DIR}/robinhood-lp.sqlite`. The
-migrations are append-only and numbered (`001_initial.sql` through the
-highest `infra/migrations/*.sql`). Initialization is automatic on every
-CLI invocation that opens the database:
+Jalur database kanonis adalah `${DATA_DIR}/robinhood-lp.sqlite`. Migrasi bersifat
+append-only dan bernomor (`001_initial.sql` hingga
+`infra/migrations/*.sql` tertinggi). Inisialisasi berlangsung otomatis pada
+setiap pemanggilan CLI yang membuka database:
 
 ```
-npm run cli -- db-migrate   # explicit migrate + status
-npm run cli -- db-status     # applied + pending migrations
-npm run cli -- db-backup     # timestamped online backup via the SQLite backup API
+npm run cli -- db-migrate   # migrasi eksplisit + status
+npm run cli -- db-status    # migrasi yang sudah diterapkan + tertunda
+npm run cli -- db-backup    # backup online bertanda waktu melalui SQLite Backup API
 ```
 
-A pre-`db-migrate` directory check is performed at boot; the CLI
-will fail closed if the database is missing or unreadable.
+Pemeriksaan direktori sebelum `db-migrate` dilakukan saat boot; CLI akan
+gagal-tertutup bila database hilang atau tidak dapat dibaca.
 
-## Typecheck and tests
+## Typecheck dan pengujian
 
 ```
 npm run typecheck
 npm test
 ```
 
-The test suite is bounded to the canonical `*.test.ts` files in
-`tests/`. Tests that require a local Anvil fork are gated on
-`ANVIL_BIN`; tests that require a mainnet RPC are gated on the
-`ALCHEMY_RPC_URLS` env var and will skip when unset. Live-only tests
-are skipped during `npm test` in this public release; they are not
-required to validate the public typecheck or the canonical unit
-coverage.
+Suite pengujian dibatasi pada berkas kanonis `*.test.ts` dalam `tests/`.
+Pengujian yang memerlukan fork Anvil lokal digerbang oleh `ANVIL_BIN`; pengujian
+yang memerlukan RPC mainnet digerbang oleh environment variable
+`ALCHEMY_RPC_URLS` dan akan dilewati bila tidak disetel. Pengujian khusus live
+dilewati saat `npm test` pada rilis publik ini; pengujian tersebut tidak
+diperlukan untuk memvalidasi typecheck publik atau cakupan unit kanonis.
 
-## Operator model summary
+## Ringkasan model operator
 
-- One operator, one Telegram bot, one configured wallet.
-- `DEDICATED_WALLET_ADDRESS` (or `OPERATOR_WALLET` / `WALLET_ADDRESS`)
-  is the only EOA used for both reads and (when execution is enabled)
-  writes. The wallet must be a low-balance dedicated signer.
-- `LP_PRIVATE_KEY` is the optional EOA private key. Leave empty in
-  shared environments; use the platform's secret manager when needed.
-- Telegram access is gated on `TELEGRAM_ALLOWED_USER_IDS`; the
-  configured chat id is `ROBIN_TELEGRAM_CHAT_ID`.
+- Satu operator, satu bot Telegram, satu wallet terkonfigurasi.
+- `DEDICATED_WALLET_ADDRESS` (atau `OPERATOR_WALLET` / `WALLET_ADDRESS`) adalah
+  satu-satunya EOA untuk baca dan (saat eksekusi aktif) tulis. Wallet harus
+  merupakan signer khusus dengan saldo rendah.
+- `LP_PRIVATE_KEY` adalah private key EOA opsional. Biarkan kosong di
+  lingkungan bersama; gunakan secret manager platform bila diperlukan.
+- Akses Telegram digerbang oleh `TELEGRAM_ALLOWED_USER_IDS`; chat id yang
+  dikonfigurasi adalah `ROBIN_TELEGRAM_CHAT_ID`.
 
-## Repository layout
+## Tata letak repositori
 
 ```
 apps/
-  cli/                 # public-safety CLI (db, runtime, wallet, preflight,
-                      #   rebalance, exact-hash reconciliation, audit,
+  cli/                 # CLI keselamatan publik (db, runtime, wallet, preflight,
+                      #   rebalance, rekonsiliasi exact-hash, audit,
                       #   rebalance-commitment-release)
-  shared/              # shared cross-app helpers (credential-isolation,
-                      #   secret redaction)
-  telegram-lp-bot/     # grammy-based operator bot (positions, portfolio,
-                      #   range callbacks, persistence-first paint)
-  workers/             # state-cache worker, v4 registry worker,
-                      #   optional alert channel
+  shared/              # helper lintas aplikasi (isolasi kredensial,
+                      #   redaksi secret)
+  telegram-lp-bot/     # bot operator berbasis grammy (posisi, portofolio,
+                      #   callback range, tampilan persistence-first)
+  workers/             # worker cache-state, worker registry v4,
+                      #   kanal peringatan opsional
 packages/
-  robinhood-core/      # RPC, health, v3 helpers, ERC-20 utilities
-  uniswap-v3-adapter/  # v3 ticks/range/liquidity math, exec gates
-  uniswap-v4-adapter/  # v4 poolId, sqrtPriceX, amounts, tick math
-  lp-ledger/           # append-only event ledger, PnL accounting
-  astra-robinhood-adapter/  # Robinhood-side observability adapter
+  robinhood-core/      # RPC, kesehatan, helper v3, utilitas ERC-20
+  uniswap-v3-adapter/  # matematika tick/range/likuiditas v3, gerbang eksekusi
+  uniswap-v4-adapter/  # poolId v4, sqrtPriceX, jumlah, matematika tick
+  lp-ledger/           # ledger event append-only, akuntansi PnL
+  astra-robinhood-adapter/  # adapter observabilitas sisi Robinhood
 infra/
-  migrations/          # append-only SQL migrations
+  migrations/          # migrasi SQL append-only
 config/
-  robinhood-v3-deployments.<block>.json   # pinned v3 deployment registry
+  robinhood-v3-deployments.<block>.json   # registry deployment v3 yang dipin
 docs/
-  ROBINHOOD_RECON.md   # chain and v3 deployment audit (public addresses only)
-tests/                 # canonical *.test.ts files
+  ROBINHOOD_RECON.md   # audit chain dan deployment v3 (hanya alamat publik)
+tests/                 # berkas kanonis *.test.ts
 .env.example
 .gitignore
 package.json
@@ -230,42 +221,39 @@ tsconfig.json
 vitest.config.ts
 ```
 
-## Known limitations
+## Keterbatasan yang diketahui
 
-- Uniswap v4 support is gated on the pool's fee semantics and hook
-  classification; pools with `dynamicFee` or unsupported hooks are
-  reported as `BLOCKED` in the registry and excluded from
-  previews.
-- The rebalance executor is bounded to a single live execution window
-  per workflow. `rebalance-resume` is the canonical recovery path for
-  workflows that reach `FAILED_RECOVERABLE`; it never re-creates a
-  preview.
-- Telegram delivery is bounded to a single chat id per bot and
-  requires `TELEGRAM_ALLOWED_USER_IDS` to contain the operator's user
-  id. The bot will refuse to start otherwise.
-- The state-cache and v4-registry workers use a bounded cadence and
-  a bounded per-cycle batch limit. The default cadence is 60s for the
-  state cache and 15s for the registry; both are configurable via
-  `STATE_CACHE_CADENCE_MS` and `V4_REGISTRY_CADENCE_MS`.
-- The exact-hash reconciliation require the RPC pool to return the
-  same hash across the configured providers. Provider disagreement
-  fails closed and surfaces as `INCONCISE:PROVIDER_DISAGREEMENT` on the
-  preview.
+- Dukungan Uniswap v4 digerbang oleh semantik fee dan klasifikasi hook pool;
+  pool dengan `dynamicFee` atau hook tidak didukung akan dilaporkan `BLOCKED`
+  di registry dan dikecualikan dari pratinjau.
+- Eksekutor rebalance dibatasi pada satu jendela eksekusi live per workflow.
+  `rebalance-resume` adalah jalur pemulihan kanonis untuk workflow yang
+  mencapai `FAILED_RECOVERABLE`; perintah ini tidak pernah membuat ulang
+  pratinjau.
+- Pengiriman Telegram dibatasi pada satu chat id per bot dan memerlukan
+  `TELEGRAM_ALLOWED_USER_IDS` berisi user id operator. Bot akan menolak mulai
+  bila tidak demikian.
+- Worker cache-state dan registry v4 memakai cadence dan batas batch per siklus
+  yang dibatasi. Cadence bawaan adalah 60 dtk untuk cache state dan 15 dtk
+  untuk registry; keduanya dapat dikonfigurasi melalui
+  `STATE_CACHE_CADENCE_MS` dan `V4_REGISTRY_CADENCE_MS`.
+- Rekonsiliasi exact-hash mengharuskan pool RPC mengembalikan hash yang sama
+  dari seluruh provider terkonfigurasi. Ketidaksepakatan provider gagal-tertutup
+  dan muncul sebagai `INCONCISE:PROVIDER_DISAGREEMENT` pada pratinjau.
 
-## Disclaimers
+## Penafian
 
-- This is a personal, single-operator, dry-run-first LP tool. It is
-  not a custodial product, not a multi-tenant service, and not a
-  general-purpose trading bot. Do not deposit funds you cannot lose.
-- Always pair a code update with a deployment audit, a fresh
-  preflight, and a manual review of the `rebalance_*,` `v4_lifecycle_*`,
-  and `v4_positions` journal for the target workflow.
-- Public chain addresses, contract bytecodes, and pool identifiers
-  referenced in this repository are recorded for transparency; they are
-  not recommendations to interact with any specific contract or pool.
+- Ini adalah alat LP personal, operator tunggal, dengan dry-run sebagai
+  prioritas. Ini bukan produk kustodian, layanan multi-tenant, atau bot trading
+  serbaguna. Jangan menyetor dana yang tidak sanggup Anda rugikan.
+- Selalu pasangkan pembaruan kode dengan audit deployment, preflight baru, dan
+  tinjauan manual jurnal `rebalance_*`, `v4_lifecycle_*`, serta `v4_positions`
+  untuk workflow target.
+- Alamat chain publik, bytecode kontrak, dan identifier pool yang dirujuk dalam
+  repositori ini dicatat untuk transparansi; bukan rekomendasi untuk berinteraksi
+  dengan kontrak atau pool tertentu.
 
-## License
+## Lisensi
 
-No license is included. The operator has not selected a license for
-this public release. All rights reserved by default until a license is
-added.
+Tidak ada lisensi yang disertakan. Operator belum memilih lisensi untuk rilis
+publik ini. Secara bawaan, seluruh hak dilindungi sampai lisensi ditambahkan.

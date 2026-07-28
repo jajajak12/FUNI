@@ -13,9 +13,9 @@ const key:V4PoolKey={currency0:robinhoodMainnet.assets.WETH,currency1:robinhoodM
 
 function fixture(){
  const dir=mkdtempSync(join(tmpdir(),'v4-rebalance-protocol-scope-')),path=join(dir,'db.sqlite');migrateSqlite(path,'infra/migrations');const repo=new SqliteLedgerRepository(path),id=poolId(key);
- repo.ensurePosition('v4:358237','358237',id);
- repo.upsertV4Position({tokenId:358237n,owner,poolId:id,poolKey:key,currency0:key.currency0,currency1:key.currency1,fee:key.fee,tickSpacing:key.tickSpacing,hooks:key.hooks,tickLower:-201000,tickUpper:-199000,liquidity:1_000_000n,initialAmount0:0n,initialAmount1:25_000_000n,mintHash:`0x${'1'.repeat(64)}`,targetToken:key.currency0,fundingToken:key.currency1,targetSymbol:'WETH',fundingSymbol:'USDG',targetDecimals:18,fundingDecimals:6,targetIndex:0,fundingIndex:1,openIntentId:'v4-open'});
- repo.ingestDeposit({id:'open',positionId:'v4:358237',txHash:`0x${'1'.repeat(64)}`,logIndex:0,amounts:{token0:0n,token1:25_000_000n},blockNumber:100n,blockTimestamp:new Date().toISOString()});
+ repo.ensurePosition('v4:4243','4243',id);
+ repo.upsertV4Position({tokenId:4243n,owner,poolId:id,poolKey:key,currency0:key.currency0,currency1:key.currency1,fee:key.fee,tickSpacing:key.tickSpacing,hooks:key.hooks,tickLower:-201000,tickUpper:-199000,liquidity:1_000_000n,initialAmount0:0n,initialAmount1:25_000_000n,mintHash:`0x${'1'.repeat(64)}`,targetToken:key.currency0,fundingToken:key.currency1,targetSymbol:'WETH',fundingSymbol:'USDG',targetDecimals:18,fundingDecimals:6,targetIndex:0,fundingIndex:1,openIntentId:'synthetic-v4-open'});
+ repo.ingestDeposit({id:'open',positionId:'v4:4243',txHash:`0x${'1'.repeat(64)}`,logIndex:0,amounts:{token0:0n,token1:25_000_000n},blockNumber:100n,blockTimestamp:new Date().toISOString()});
  return {repo,id,close(){repo.close();rmSync(dir,{recursive:true,force:true});}};
 }
 
@@ -26,7 +26,7 @@ describe('v4 rebalance protocol-scoped preflight',()=>{
   const sqrtPriceX96=sqrtPriceAtTick(-200000),state=Promise.resolve({owner,liquidity:1_000_000n,tickLower:-201000,tickUpper:-199000,key,pool:{id:f.id,key,sqrtPriceX96,tick:-200000,liquidity:10_000_000n,initialized:true,blockNumber:100n},token0:{address:key.currency0,symbol:'WETH',decimals:18},token1:{address:key.currency1,symbol:'USDG',decimals:6},currentAmounts:{token0:1_000_000_000_000_000n,token1:20_000_000n},rangeState:'in_range',price1Per0:2063,claimableFees:{token0:0n,token1:0n}});
   try{
    const result=await Promise.race([
-    buildPortfolioAudit({rpc,repo:f.repo,wallet:owner,positionIds:['v4:358237'],v4PositionStates:new Map([['358237',state as any]]),protocolScope:'v4',wethUsdReference:()=>{unrelatedReferenceCalls++;return new Promise(()=>{});}}),
+    buildPortfolioAudit({rpc,repo:f.repo,wallet:owner,positionIds:['v4:4243'],v4PositionStates:new Map([['4243',state as any]]),protocolScope:'v4',wethUsdReference:()=>{unrelatedReferenceCalls++;return new Promise(()=>{});}}),
     new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('v4 portfolio was blocked by unrelated reference')),200)),
    ]);
    expect(result.positions[0]).toMatchObject({protocol:'v4',valuationStatus:'PRICED'});

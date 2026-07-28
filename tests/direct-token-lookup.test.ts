@@ -8,7 +8,7 @@ import { migrateSqlite,SqliteLedgerRepository } from '@robin/ledger';
 import { robinhoodMainnet } from '@robin/core';
 import { attachDirectLookupSubscriber,cleanupLegacyDirectLookupFanout,completeDirectLookupOutbox,completeDirectTokenLookup,createOrReuseDirectLookup,directLookupCandidatePoolIds,executeDirectTokenLookup,expireDueDirectTokenLookups,leaseDirectLookupOutbox,leaseDirectTokenLookup,retryDirectLookupOutbox } from '../apps/cli/src/direct-token-lookup.js';
 
-const token=getAddress('0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3');
+const token=getAddress('0x000000000000000000000000000000000000c0de');
 function fixture(count=180){
  const dir=mkdtempSync(join(tmpdir(),'direct-lookup-')),path=join(dir,'test.sqlite');migrateSqlite(path,'infra/migrations');const repo=new SqliteLedgerRepository(path);
  repo.upsertTokenMetadata({address:token,symbol:'TEST',name:'Test',decimals:18});
@@ -43,7 +43,7 @@ describe('durable direct token lookup',()=>{
   const f=fixture(3);try{const ids=directLookupCandidatePoolIds(f.repo,token,3);for(const id of ids)f.repo.enqueueV4StateRefresh(id,90,'recent-telegram-token',1_000);f.repo.upsertV4Position({tokenId:1n,owner:'0x0000000000000000000000000000000000000001',poolId:ids[0]!,poolKey:{currency0:token,currency1:robinhoodMainnet.assets.USDG,fee:500,tickSpacing:10,hooks:zeroAddress},currency0:token,currency1:robinhoodMainnet.assets.USDG,fee:500,tickSpacing:10,hooks:zeroAddress,tickLower:-10,tickUpper:10,liquidity:1n,initialAmount0:0n,initialAmount1:0n,mintHash:'0x1'});const result=cleanupLegacyDirectLookupFanout(f.repo,true,2_000);expect(result.removed).toBe(2);expect(f.repo.db.prepare('SELECT pool_id FROM v4_state_refresh_queue').all()).toEqual([{pool_id:ids[0]}]);}finally{f.close();}});
  it('keeps cached lookup and Telegram handlers free of hydration polling and fan-out side effects',()=>{
   const registry=readFileSync('apps/cli/src/v4-registry.ts','utf8'),telegram=readFileSync('apps/telegram-lp-bot/src/index.ts','utf8'),cached=registry.slice(registry.indexOf('export function cachedV4PoolsForToken'),registry.indexOf('export async function v4RegistryStatus'));
-  expect(cached).not.toContain('noteTokenRequest');expect(cached).not.toContain('enqueueV4StateRefresh');expect(telegram).not.toContain('scheduleHydrationEdit');expect(telegram).not.toContain('noChangeRenderCount');expect(telegram).toContain('pollingIterations:0');
+  expect(cached).not.toContain('noteTokenRequest');expect(cached).not.toContain('enqueueV4StateRefresh');expect(telegram).not.toContain('scheduleHydrationEdit');expect(telegram).not.toContain('noChangeRenderCount');expect(telegram).toMatch(/pollingIterations\s*:\s*0/);
  });
  it('times out durably even when no worker ever leases the request',()=>{
   const f=fixture(1);try{const created=createOrReuseDirectLookup({repo:f.repo,token,nowMs:1_000,deadlineMs:500});attachDirectLookupSubscriber({repo:f.repo,requestId:created.request.id,requestRevision:created.request.revision,interactionId:'deadline',userId:'u',chatId:'c',messageId:2,sessionId:'s',nowMs:1_010});expect(expireDueDirectTokenLookups(f.repo,1_501)).toBe(1);expect((f.repo.db.prepare('SELECT status FROM direct_token_lookup_requests WHERE id=?').get(created.request.id) as any).status).toBe('LOOKUP_TIMED_OUT');expect(leaseDirectLookupOutbox(f.repo,1_000,1_502)).toBeTruthy();}finally{f.close();}});

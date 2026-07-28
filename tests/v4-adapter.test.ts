@@ -1,7 +1,8 @@
 import { describe,expect,it } from 'vitest';
 import { encodeAbiParameters } from 'viem';
 import { amountsForLiquidity, buildGenericV4SingleSidedDownsidePlan, buildPermit2Approval, buildStrictToken1Plan, buildV4Burn, buildV4Collect, buildV4Decrease, buildV4Mint, buildV4SingleSidedDownsidePlan, decodePositionInfo, decodeV4Lifecycle, decodeV4Mint, inspectV4PositionTerminalAware, isCanonicalV4NotMinted, poolId, slippageMinimums, sqrtPriceAtTick, V4_ACTIONS, v4ApprovalRequirement, type V4PoolKey } from '@robin/v4';
-const key:V4PoolKey={currency0:'0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'};
+const key:V4PoolKey={currency0:'0x00000000000000000000000000000000000000B0',currency1:'0x00000000000000000000000000000000000000B1',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'};
+// Documented Anvil account #1; this is public test data.
 const owner='0x70997970C51812dc3A010C7d01b50e0d17dc79C8' as const;
 describe('Uniswap v4 mint adapter',()=>{
  it('encodes deployed MINT_POSITION then SETTLE_PAIR and round-trips',()=>{const p=buildV4Mint({key,tickLower:-201620,tickUpper:-200560,liquidity:2193110814363n,amount0Max:0n,amount1Max:5_000_000n,owner,hookData:'0x',deadline:123n}),d=decodeV4Mint(p.calldata);expect(p.actions).toBe('0x020d');expect(d.actions).toBe('0x020d');expect(d.mint).toMatchObject({tickLower:-201620,tickUpper:-200560,liquidity:2193110814363n,amount0Max:0n,amount1Max:5_000_000n,owner});expect(d.settle).toEqual([key.currency0,key.currency1]);expect(p.actions).not.toContain(V4_ACTIONS.MINT_POSITION_FROM_DELTAS.toString(16).padStart(2,'0'));});
@@ -15,7 +16,7 @@ describe('Uniswap v4 mint adapter',()=>{
 });
 describe('v4 terminal position interpretation',()=>{
  const data=`0x08c379a0${encodeAbiParameters([{type:'string'}],['NOT_MINTED']).slice(2)}` as const,error={data};
- it('requires canonical NOT_MINTED plus durable burn evidence',async()=>{expect(isCanonicalV4NotMinted(error)).toBe(true);const rpc={withClient:async(fn:any)=>fn({readContract:async()=>{throw error;}})} as any;await expect(inspectV4PositionTerminalAware(rpc,305784n,{previouslyMinted:true,burnConfirmed:true,burnTxHash:'0x1234'})).resolves.toMatchObject({status:'burned',terminal:true,owner:null,onchainLiquidity:0n,nftExists:false});await expect(inspectV4PositionTerminalAware(rpc,999999n)).resolves.toMatchObject({status:'not_found',terminal:false});});
+ it('requires canonical NOT_MINTED plus durable burn evidence',async()=>{expect(isCanonicalV4NotMinted(error)).toBe(true);const rpc={withClient:async(fn:any)=>fn({readContract:async()=>{throw error;}})} as any;await expect(inspectV4PositionTerminalAware(rpc,42n,{previouslyMinted:true,burnConfirmed:true,burnTxHash:'0x1234'})).resolves.toMatchObject({status:'burned',terminal:true,owner:null,onchainLiquidity:0n,nftExists:false});await expect(inspectV4PositionTerminalAware(rpc,43n)).resolves.toMatchObject({status:'not_found',terminal:false});});
  it('fails closed on an unknown revert',async()=>{const rpc={withClient:async(fn:any)=>fn({readContract:async()=>{throw {data:'0xdeadbeef'};}})} as any;await expect(inspectV4PositionTerminalAware(rpc,1n,{previouslyMinted:true,burnConfirmed:true,burnTxHash:'0x1234'})).rejects.toBeTruthy();});
 });
 describe('Uniswap v4 lifecycle codec',()=>{

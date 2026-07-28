@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe,expect,it } from 'vitest';
 import { migrateSqlite, SqliteLedgerRepository } from '@robin/ledger';
 
-const key={currency0:'0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'};
+const key={currency0:'0x00000000000000000000000000000000000000b0',currency1:'0x00000000000000000000000000000000000000b1',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'};
 function opened(){const path=join(mkdtempSync(join(tmpdir(),'v4-ledger-')),'db.sqlite');migrateSqlite(path,'infra/migrations');const repo=new SqliteLedgerRepository(path);repo.ensurePosition('v4:1','1','pool');repo.upsertV4Position({tokenId:1n,owner:'owner',poolId:'pool',poolKey:key,currency0:key.currency0,currency1:key.currency1,fee:500,tickSpacing:10,hooks:key.hooks,tickLower:-20,tickUpper:-10,liquidity:1000n,initialAmount0:0n,initialAmount1:5000000n,mintHash:'0xmint'});repo.ingestDeposit({id:'d',positionId:'v4:1',txHash:'0xmint',logIndex:0,amounts:{token0:0n,token1:5000000n},blockNumber:1n,blockTimestamp:new Date().toISOString()});return repo;}
 describe('v4 lifecycle persistence and principal-first accounting',()=>{
  it('persists protocol-specific identity without affecting generic positions',()=>{const repo=opened();try{expect(repo.v4Position(1n)).toMatchObject({protocol_version:'v4',pool_id:'pool',status:'open'});expect(repo.listV4Positions()).toHaveLength(1);}finally{repo.close();}});

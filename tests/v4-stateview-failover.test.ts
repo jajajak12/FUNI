@@ -85,7 +85,8 @@ describe('v4 StateView failover',()=>{
   expect(adapter).not.toMatch(/createPublicClient|http\(/);
   expect(executor).toContain('input.rpc.withClient');
   expect(adapter).toContain("stage:'v4_pool_inspection'");
-  expect(transaction).toContain('walletClient as unknown as {sendRawTransaction');
+  expect(transaction).toContain('broadcastSignedTransaction');
+  expect(transaction).toContain("method:'eth_sendRawTransaction'");
   expect(transaction).toContain('waitReceipt(input.rpc,hash)');
  });
 });

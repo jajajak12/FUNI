@@ -13,7 +13,7 @@ const base={
   signerConfigured:true,
   authorized:true,
   deploymentVerified:true,
-  pool:{id:'0xfcfae8fa0bd6da961bcf5d990f27690932deac4f093e99bf3e871691c6586593',key:{currency0:'0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n},
+  pool:{id:`0x${'a'.repeat(64)}`,key:{currency0:'0x00000000000000000000000000000000000000b0',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n},
   price:{fresh:true,usdPerFunding:1},
   positionUsd:5,
   approvalUsd:5,
@@ -111,7 +111,7 @@ describe('v4 operational open gate',()=>{
 
 describe('v4 operational open executor (no broadcast)',()=>{
   const baseRuntime={executionEnabled:true,dryRun:false,emergencyPause:false,signerConfigured:true,allowlisted:true} as const;
-  const basePool={id:'0xfcfae8fa0bd6da961bcf5d990f27690932deac4f093e99bf3e871691c6586593',key:{currency0:'0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n,registryMatch:true,noExecutionBlockers:true} as const;
+  const basePool={id:`0x${'a'.repeat(64)}`,key:{currency0:'0x00000000000000000000000000000000000000b0',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n,registryMatch:true,noExecutionBlockers:true} as const;
   const baseGas={nativeBalance:1n,maxTxUsd:0.25,maxLifecycleUsd:1,perTxUsd:0.1,lifecycleUsd:0.3} as const;
 
   it('returns V4_BROADCAST_HOLD with zero transactions and zero mainnet when the gate passes and both canary flags are false',()=>{
@@ -174,7 +174,7 @@ describe('v4 operational gas calculation',()=>{
   });
 });
 
-function executionGatePass(){return evaluateV4OperationalGates({chainId:4663,executionEnabled:true,dryRun:false,emergencyPause:false,liveCanaryEnabled:false,v4LiveCanaryEnabled:false,signerConfigured:true,authorized:true,deploymentVerified:true,pool:{id:'0xfcfae8fa0bd6da961bcf5d990f27690932deac4f093e99bf3e871691c6586593',key:{currency0:'0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n},price:{fresh:true,usdPerFunding:1},positionUsd:5,approvalUsd:5,maxPositionUsd:1000,maxApprovalUsd:1000,hasOpenIntent:false,fundingBalance:5_000_000n,gas:{nativeBalance:1n,maxTxUsd:0.25,maxLifecycleUsd:1,perTxUsd:0.1,lifecycleUsd:0.3},range:{valid:true},selection:{targetIndex:0,fundingIndex:1,targetZeroRequired:true,fundingPositiveRequired:true},canary:{state:'OPENED',tokenId:'99'}});}
+function executionGatePass(){return evaluateV4OperationalGates({chainId:4663,executionEnabled:true,dryRun:false,emergencyPause:false,liveCanaryEnabled:false,v4LiveCanaryEnabled:false,signerConfigured:true,authorized:true,deploymentVerified:true,pool:{id:`0x${'a'.repeat(64)}`,key:{currency0:'0x00000000000000000000000000000000000000b0',currency1:'0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',fee:500,tickSpacing:10,hooks:'0x0000000000000000000000000000000000000000'},initialized:true,liquidity:1_000n},price:{fresh:true,usdPerFunding:1},positionUsd:5,approvalUsd:5,maxPositionUsd:1000,maxApprovalUsd:1000,hasOpenIntent:false,fundingBalance:5_000_000n,gas:{nativeBalance:1n,maxTxUsd:0.25,maxLifecycleUsd:1,perTxUsd:0.1,lifecycleUsd:0.3},range:{valid:true},selection:{targetIndex:0,fundingIndex:1,targetZeroRequired:true,fundingPositiveRequired:true},canary:{state:'OPENED',tokenId:'99'}});}
 function executionGateBlockOnPosition(){return evaluateV4OperationalGates({...base,positionUsd:9_999});}
 function executionGateBlockOnApproval(){return evaluateV4OperationalGates({...base,approvalUsd:9_999});}
 function executionGateBlockOnCanary(){return evaluateV4OperationalGates({...base,emergencyPause:true});}

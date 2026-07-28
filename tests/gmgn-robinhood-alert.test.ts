@@ -211,7 +211,7 @@ describe('GMGN Robinhood natural dedup', () => {
   });
 
   it('repeated identical GME PASS cycles produce one alert (snapshot-hash churn does not generate new identities)', () => {
-    const token = '0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3' as `0x${string}`;
+    const token = '0x000000000000000000000000000000000000c0de' as `0x${string}`;
     const itemA = normalizeTrendingObservation({ ...baseRank, address: token }, 1_700_000_000_000);
     recordNaturalAlert(repo!, token, itemA, 1_700_000_000_000);
     const stored = loadNaturalDedupe(repo!, token)!;
@@ -233,7 +233,7 @@ describe('GMGN Robinhood natural dedup', () => {
   });
 
   it('timestamp-only changes produce no re-alert (no material metric change)', () => {
-    const token = '0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3' as `0x${string}`;
+    const token = '0x000000000000000000000000000000000000c0de' as `0x${string}`;
     const itemA = normalizeTrendingObservation({ ...baseRank, address: token }, 1_700_000_000_000);
     recordNaturalAlert(repo!, token, itemA, 1_700_000_000_000);
     const stored = loadNaturalDedupe(repo!, token)!;
@@ -251,7 +251,7 @@ describe('GMGN Robinhood natural dedup', () => {
   });
 
   it('material change after the re-alert interval produces one new alert', () => {
-    const token = '0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3' as `0x${string}`;
+    const token = '0x000000000000000000000000000000000000c0de' as `0x${string}`;
     const itemA = normalizeTrendingObservation({ ...baseRank, address: token }, 1_700_000_000_000);
     recordNaturalAlert(repo!, token, itemA, 1_700_000_000_000);
     const stored = loadNaturalDedupe(repo!, token)!;
@@ -270,7 +270,7 @@ describe('GMGN Robinhood natural dedup', () => {
   });
 
   it('worker restart preserves dedup (table-backed, deterministic key)', () => {
-    const token = '0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3' as `0x${string}`;
+    const token = '0x000000000000000000000000000000000000c0de' as `0x${string}`;
     const itemA = normalizeTrendingObservation({ ...baseRank, address: token }, 1_700_000_000_000);
     recordNaturalAlert(repo!, token, itemA, 1_700_000_000_000);
     const before = loadNaturalDedupe(repo!, token)!;
@@ -288,7 +288,7 @@ describe('GMGN Robinhood natural dedup', () => {
   });
 
   it('rejected → admitted transition alerts once (no prior PASS exists)', () => {
-    const token = '0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3' as `0x${string}`;
+    const token = '0x000000000000000000000000000000000000c0de' as `0x${string}`;
     // No prior dedup row → initial alert.
     const item = normalizeTrendingObservation({ ...baseRank, address: token }, 1_700_000_000_000);
     const decision = decideRealert({

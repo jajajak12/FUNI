@@ -1,0 +1,8 @@
+import { describe, expect, it } from 'vitest';
+import { auditRobinhoodV3Deployments, discoverV3Pools, FallbackRpc, inspectErc20, robinhoodMainnet } from '@robin/core';
+
+/** Read-only public-RPC integration: no account, signer, transaction, or funds required. */
+describe.skipIf(process.env.RUN_LIVE_RPC_TESTS!=='true')('Robinhood Chain public RPC integration',()=>{
+ it('reports the official chain ID and deployed canonical asset bytecode',async()=>{const rpc=new FallbackRpc(robinhoodMainnet);const health=await rpc.health();expect(health.some(x=>x.healthy&&x.chainId===4663)).toBe(true);const weth=await inspectErc20(rpc,robinhoodMainnet.assets.WETH);const usdg=await inspectErc20(rpc,robinhoodMainnet.assets.USDG);expect(weth.status).toBe('available');expect(usdg.status).toBe('available');if(weth.status==='available')expect(weth.value.canonical).toBe(true);if(usdg.status==='available')expect(usdg.value.canonical).toBe(true);},20_000);
+ it('audits official v3 deployments and discovers initialized WETH/USDG pools through getPool',async()=>{const rpc=new FallbackRpc(robinhoodMainnet);const registry=await auditRobinhoodV3Deployments(rpc);expect(registry.status).toBe('available');if(registry.status==='available'){expect(Object.values(registry.value.relationships).every(Boolean)).toBe(true);const pools=await discoverV3Pools(rpc,registry,robinhoodMainnet.assets.WETH);expect(pools.status).toBe('available');if(pools.status==='available'){expect(pools.value.length).toBeGreaterThan(0);expect(pools.value.every(p=>p.factory.toLowerCase()===registry.value.factory.toLowerCase()&&p.initialized)).toBe(true);}}},30_000);
+});

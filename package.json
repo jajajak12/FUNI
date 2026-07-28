@@ -1,0 +1,47 @@
+{
+  "name": "robinhood-lp-operator",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "cli": "tsx apps/cli/src/index.ts",
+    "preflight": "tsx apps/cli/src/index.ts bot-preflight",
+    "bot-preflight": "tsx apps/cli/src/index.ts bot-preflight",
+    "db-migrate": "tsx apps/cli/src/index.ts db-migrate",
+    "db-status": "tsx apps/cli/src/index.ts db-status",
+    "db-backup": "tsx apps/cli/src/index.ts db-backup",
+    "db-restore-test": "tsx apps/cli/src/index.ts db-restore-test",
+    "reconcile-all": "tsx apps/cli/src/index.ts reconcile-all",
+    "runtime-status": "tsx apps/cli/src/index.ts runtime-status",
+    "wallet-status": "tsx apps/cli/src/index.ts wallet-status",
+    "wallet-preflight": "tsx apps/cli/src/index.ts wallet-preflight",
+    "allowance-audit": "tsx apps/cli/src/index.ts allowance-audit",
+    "live-canary-preflight": "tsx apps/cli/src/index.ts live-canary-preflight",
+    "live-canary-route-preflight": "tsx apps/cli/src/index.ts live-canary-route-preflight",
+    "fork-e2e": "tsx apps/cli/src/index.ts fork-e2e",
+    "fork-e2e:single-sided": "FORK_STRATEGY=single-sided-downside tsx apps/cli/src/index.ts fork-e2e"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "22.10.2",
+    "hardhat": "^2.22.9",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.7.0",
+    "dotenv": "16.4.7",
+    "grammy": "1.34.0",
+    "pino": "9.5.0",
+    "viem": "^2.55.5",
+    "zod": "3.24.1"
+  }
+}

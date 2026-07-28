@@ -1,0 +1,37 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createWalletClient, getAddress, http, type Address, type Hash } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { FallbackRpc, robinhoodMainnet } from '@robin/core';
+import { migrateSqlite, SqliteLedgerRepository } from '@robin/ledger';
+import { inspectV4Pool, permit2Allowance, poolId, V4_ROBINHOOD_DEPLOYMENTS, type V4PoolKey } from '@robin/v4';
+import { executeV4Lifecycle } from './v4-lifecycle.js';
+import { executeV4LiveCanaryClose, executeV4LiveCanaryOpen } from './v4-live-canary.js';
+import { startPinnedFork } from './fork-fixture.js';
+import { runtimePaths } from './runtime.js';
+
+const AI=getAddress('0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18'),USDG=robinhoodMainnet.assets.USDG;
+const KEY:V4PoolKey={currency0:AI,currency1:USDG,fee:10_000,tickSpacing:200,hooks:'0x0000000000000000000000000000000000000000'};
+const HOOKED_KEY:V4PoolKey={currency0:robinhoodMainnet.assets.WETH,currency1:AI,fee:8_388_608,tickSpacing:100,hooks:getAddress('0xFeDa24F0d3805170E7566cE617CfBa01cE05D080')};
+const erc20=[{type:'function',name:'transfer',stateMutability:'nonpayable',inputs:[{type:'address'},{type:'uint256'}],outputs:[{type:'bool'}]},{type:'function',name:'balanceOf',stateMutability:'view',inputs:[{type:'address'}],outputs:[{type:'uint256'}]},{type:'function',name:'allowance',stateMutability:'view',inputs:[{type:'address'},{type:'address'}],outputs:[{type:'uint256'}]}] as const;
+const chain={id:4663,name:'Robinhood Fork',nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},rpcUrls:{default:{http:['http://127.0.0.1']}}} as const;
+const assert:(value:unknown,message:string)=>asserts value=(value,message)=>{if(!value)throw new Error(`ASSERTION_FAILED:${message}`);};
+const json=(value:unknown)=>JSON.stringify(value,(_,v)=>typeof v==='bigint'?v.toString():v,2);
+const proof=(path:string)=>{if(!existsSync(path))return {exists:false};const s=statSync(path);return {exists:true,size:s.size,mtimeMs:s.mtimeMs,sha256:createHash('sha256').update(readFileSync(path)).digest('hex')};};
+
+export async function runGenericV4ForkE2E(){
+ const productionBefore=proof(runtimePaths.databasePath),fork=await startPinnedFork(),artifactPath=join(fork.dir,'v4-generic-fork-e2e.json'),artifact:any={artifactPath,pinnedBlock:17_400_000,mainnetTransactionsSent:0,poolId:poolId(KEY),hookedPoolId:poolId(HOOKED_KEY)};
+ try{
+  const rpc=new FallbackRpc({...robinhoodMainnet,rpcUrls:[fork.url]}),pool=await inspectV4Pool(rpc,KEY),hooked=await inspectV4Pool(rpc,HOOKED_KEY);assert(pool.status==='available'&&pool.value.initialized&&pool.value.liquidity>0n,'AI/USDG pool inactive');assert(hooked.status==='available'&&hooked.value.feeSemantics?.dynamicFee&&hooked.value.hookSemantics?.supported===false,'hooked dynamic pool was not blocked');
+  const operator=privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'),wallet=createWalletClient({account:operator,chain,transport:http(fork.url)}),source='0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca' as Address,cap=5_000_000n;
+  for(const address of [operator.address,source])await (fork.client as any).request({method:'anvil_setBalance',params:[address,'0x3635C9ADC5DEA00000']});await (fork.client as any).request({method:'anvil_impersonateAccount',params:[source]});const sourceWallet=createWalletClient({account:source,chain,transport:http(fork.url)}),fundHash=await sourceWallet.writeContract({address:USDG,abi:erc20,functionName:'transfer',args:[operator.address,cap]});await fork.client.waitForTransactionReceipt({hash:fundHash});await (fork.client as any).request({method:'anvil_stopImpersonatingAccount',params:[source]});
+  assert(await fork.client.readContract({address:AI,abi:erc20,functionName:'balanceOf',args:[operator.address]})===0n,'initial target balance not zero');
+  const dbPath=join(fork.dir,'generic.sqlite');migrateSqlite(dbPath,'infra/migrations');const repo=new SqliteLedgerRepository(dbPath),selection={poolId:poolId(KEY),key:KEY,target:AI,funding:USDG,targetIndex:0 as const,fundingIndex:1 as const,amount:cap,targetSymbol:'AI',fundingSymbol:'USDG',targetDecimals:18,fundingDecimals:6,feeSemantics:pool.value.feeSemantics,hookStatus:pool.value.hookSemantics,valuationProvenance:{status:'unavailable',reason:'active liquidity is not TVL'},selectionId:'fork-ai-usdg'};
+  const runtime={executionEnabled:true,dryRun:false,emergencyPause:false,v4LiveCanaryEnabled:true,signerConfigured:true,allowlisted:true},limits={maxTxGasUsd:.25,totalGasUsd:1,nativeUsd:1},open=await executeV4LiveCanaryOpen({repo,rpc,walletClient:wallet,wallet:operator.address,runtime,idempotencyKey:'generic-ai-open',selection,range:{upperDropPct:0,lowerDropPct:30},limits,allowLocalTest:true});assert(open.status==='POSITION_RECONCILED','generic open failed');const tokenId=BigInt(open.tokenId),mintHash=open.mintHash as Hash,row=repo.v4Position(tokenId);assert(row?.target_token===AI&&row?.funding_token===USDG&&Number(row?.funding_index)===1,'generic metadata missing');
+  const partial=await executeV4Lifecycle({repo,rpc,walletClient:wallet,wallet:operator.address,tokenId,action:'partial_close',percent:25,slippageBps:50,deadlineSeconds:600,idempotencyKey:'generic-ai-partial'});assert(partial.ok&&partial.remainingLiquidity>0n,'generic partial close failed');
+  const closed=await executeV4LiveCanaryClose({repo,rpc,walletClient:wallet,wallet:operator.address,runtime,tokenId,idempotencyKey:'generic-ai-close',selection,limits,allowLocalTest:true});assert(closed.status==='CLOSED','generic full close/burn failed');const first=await (async()=>{const before=repo.reconciliationDelta(`v4:${tokenId}`);const result=repo.reconcileAll();const after=repo.reconciliationDelta(`v4:${tokenId}`);return {result,inserted:{events:after.events-before.events,deposits:after.deposits-before.deposits,principal:after.principal-before.principal,fees:after.fees-before.fees}};})(),second=await (async()=>{const before=repo.reconciliationDelta(`v4:${tokenId}`);const result=repo.reconcileAll();const after=repo.reconciliationDelta(`v4:${tokenId}`);return {result,inserted:{events:after.events-before.events,deposits:after.deposits-before.deposits,principal:after.principal-before.principal,fees:after.fees-before.fees}};})();
+  const permit=await permit2Allowance(rpc,operator.address,USDG,V4_ROBINHOOD_DEPLOYMENTS.positionManager),erc20Allowance=await fork.client.readContract({address:USDG,abi:erc20,functionName:'allowance',args:[operator.address,V4_ROBINHOOD_DEPLOYMENTS.permit2]});repo.close();assert(Object.values(second.inserted).every(x=>x===0),'second reconciliation inserted rows');assert(proof(runtimePaths.databasePath).sha256===productionBefore.sha256,'production database changed');
+  Object.assign(artifact,{ok:true,tokenId,mintHash,partialHash:partial.hash,closeHash:closed.close.hash,burnHash:closed.burn.hash,hookedDynamicRejection:{fee:hooked.value.feeSemantics,hooks:hooked.value.hookSemantics},reconciliation:{first,second},allowances:{erc20ToPermit2:erc20Allowance,permit2ToPositionManager:permit[0]},productionIsolation:{before:productionBefore,after:proof(runtimePaths.databasePath)}});writeFileSync(artifactPath,json(artifact));return artifact;
+ }catch(error){artifact.error=error instanceof Error?error.stack??error.message:String(error);writeFileSync(artifactPath,json(artifact));throw new Error(`${artifact.error}\nartifact:${artifactPath}`);}finally{await fork.stop();}
+}

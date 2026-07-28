@@ -1,0 +1,9 @@
+export const POOL_PAGE_SIZE=9;
+export type PoolListingSection='v4_eligible'|'v4_checking'|'v4_no_active'|'v4_unavailable'|'v3_eligible';
+export type PoolListingItem={section:PoolListingSection;label:string;data:string;detail?:string;rank?:number};
+export type PoolListing={tokenSymbol:string;tokenAddress:string;items:PoolListingItem[];counts:{v4Eligible:number;v3Eligible:number;v4Unavailable:number;zeroLiquidity:number;checking:number;unsupported:number}};
+const sectionOrder:Record<PoolListingSection,number>={v4_eligible:0,v4_checking:1,v4_no_active:2,v4_unavailable:3,v3_eligible:4};
+export function compactLabel(value:string,max=58){return value.length<=max?value:`${value.slice(0,Math.max(1,max-1))}…`;}
+export function rankPoolListing(items:readonly PoolListingItem[]){return [...items].sort((a,b)=>sectionOrder[a.section]-sectionOrder[b.section]||(a.rank??Number.MAX_SAFE_INTEGER)-(b.rank??Number.MAX_SAFE_INTEGER)||a.label.localeCompare(b.label)||a.data.localeCompare(b.data));}
+export function poolListingPage(listing:PoolListing,page:number,pageSize=POOL_PAGE_SIZE){const totalPages=Math.max(1,Math.ceil(listing.items.length/pageSize)),current=Math.min(Math.max(0,page),totalPages-1),start=current*pageSize,items=listing.items.slice(start,start+pageSize);return {current,totalPages,items,hasPrevious:current>0,hasNext:current+1<totalPages};}
+export function poolListingSummary(listing:PoolListing,page:number,pageSize=POOL_PAGE_SIZE){const view=poolListingPage(listing,page,pageSize),zero=listing.counts.zeroLiquidity??0,checking=listing.counts.checking??0,unsupported=listing.counts.unsupported??0,hidden=zero||checking||unsupported?`\nHidden: zero liquidity ${zero}; checking ${checking}; unsupported ${unsupported}`:'';return [`${listing.tokenSymbol} (${listing.tokenAddress})`,`Eligible v4: ${listing.counts.v4Eligible} · eligible v3: ${listing.counts.v3Eligible}`,`v4 prioritized.`, `Page ${view.current+1}/${view.totalPages}${hidden}`].join('\n');}

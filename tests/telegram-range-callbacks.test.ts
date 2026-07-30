@@ -23,7 +23,7 @@ describe('Telegram range callback isolation',()=>{
 
  it('acknowledges every callback before routing and guards duplicate acknowledgements',()=>{
   const source=readFileSync('apps/telegram-lp-bot/src/index.ts','utf8');
-  expect(source).toContain("bot.use(async(ctx,next)=>{if(ctx.callbackQuery)await acknowledgeCallback(ctx);return next();});");
-  expect(source).toContain("if(!ctx.callbackQuery||acknowledgedCallbacks.has(String(ctx.callbackQuery.id)))return 0;");
+  expect(source).toMatch(/bot\.use\s*\(\s*async\s*\(\s*ctx\s*,\s*next\s*\)\s*=>\s*\{\s*if\s*\(\s*ctx\.callbackQuery\s*\)\s*await\s+acknowledgeCallback\s*\(\s*ctx\s*\)\s*;?\s*return\s+next\s*\(\s*\)/);
+  expect(source).toMatch(/if\s*\(\s*!ctx\.callbackQuery\s*\|\|\s*acknowledgedCallbacks\.has\s*\(\s*String\s*\(\s*ctx\.callbackQuery\.id\s*\)\s*\)\s*\)\s*return\s+0/);
  });
 });

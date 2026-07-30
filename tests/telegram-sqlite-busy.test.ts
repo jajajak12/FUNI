@@ -20,6 +20,6 @@ describe('Telegram SQLite busy handling',()=>{
   let calls=0,transactions=0;expect(()=>retrySqliteBusySync({operation:'transitionTelegramFlow',baseWaitMs:1,maxAttempts:2,log:()=>{},run:()=>{calls++;throw busy;}})).toThrow(/locked/);expect(calls).toBe(2);expect(transactions).toBe(0);expect(isSqliteBusy(busy)).toBe(true);
  });
  it('keeps a non-fatal process-level catch handler installed',async()=>{
-  const source=await import('node:fs/promises').then(fs=>fs.readFile('apps/telegram-lp-bot/src/index.ts','utf8'));expect(source).toContain('bot.catch(async error=>');expect(source).toContain('Temporarily busy. Please tap the button again in a moment.');expect(source).toContain("retryable:busy");
+  const source=await import('node:fs/promises').then(fs=>fs.readFile('apps/telegram-lp-bot/src/index.ts','utf8'));expect(source).toMatch(/bot\.catch\s*\(\s*async\s*\(\s*error\s*\)\s*=>/);expect(source).toContain('Temporarily busy. Please tap the button again in a moment.');expect(source).toMatch(/retryable\s*:\s*busy/);
  });
 });

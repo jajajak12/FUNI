@@ -1,0 +1,36 @@
+{
+  "registryVersion": 1,
+  "chainKey": "robinhood",
+  "chainId": 4663,
+  "deployments": [
+    {
+      "registryVersion": 1,
+      "chainKey": "robinhood",
+      "chainId": 4663,
+      "protocol": "uniswap_v3",
+      "contracts": {
+        "factory": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+        "positionManager": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+        "quoter": "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
+        "router": "0xcaf681a66d020601342297493863e78c959e5cb2",
+        "universalRouter": "0x8876789976decbfcbbbe364623c63652db8c0904",
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "wrappedNative": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+      }
+    },
+    {
+      "registryVersion": 1,
+      "chainKey": "robinhood",
+      "chainId": 4663,
+      "protocol": "uniswap_v4",
+      "contracts": {
+        "poolManager": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "positionManager": "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+        "stateView": "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+        "quoter": "0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
+        "universalRouter": "0x8876789976decbfcbbbe364623c63652db8c0904",
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+      }
+    }
+  ]
+}

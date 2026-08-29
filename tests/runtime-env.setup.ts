@@ -1,0 +1,2 @@
+process.env.MAX_POSITION_VALUE_USD??='1000';
+process.env.MAX_APPROVAL_VALUE_USD??='1000';

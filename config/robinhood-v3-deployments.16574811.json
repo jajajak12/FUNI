@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "chainId": 4663,
+  "verificationBlock": "16574811",
+  "blockTimestamp": "2026-07-22T16:37:54Z",
+  "snapshotCreatedAt": "2026-07-22T16:37:54Z",
+  "officialSourceUrls": ["https://developers.uniswap.org/docs/protocols/v3/deployments/v3-robinhood-chain-deployments", "https://developers.uniswap.org/deployments.json", "https://robinhoodchain.blockscout.com"],
+  "contracts": {
+    "factory": {"address":"0x1f7d7550b1b028f7571e69a784071f0205fd2efa","runtimeCodeHash":"0xec72b1abd1f2faee020cfea9c646bd8994f9fb389054f6e574f103a895091739","runtimeCodeSize":24535},
+    "interfaceMulticall": {"address":"0x282a3c4d320cc7f0d5eaf56b8029e4b88338f0a3","runtimeCodeHash":"0xaa2f42ac8eed7b6fce9828f68d29f3734387c3508e9a71fa83068cdff475cee8","runtimeCodeSize":1383},
+    "tickLens": {"address":"0x7dfd4f31be6814d2906bde155c3e1b146eac1468","runtimeCodeHash":"0xbf1bb07babb013f146395ed6e1127f8f48d598f1765bc660a91d7b164cf93ff8","runtimeCodeSize":1385},
+    "quoterV2": {"address":"0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7","runtimeCodeHash":"0x3db0868d945e9304c9bc6a8b2181948109ea617647142f3c4083e14393496a28","runtimeCodeSize":8273},
+    "positionManager": {"address":"0x73991a25c818bf1f1128deaab1492d45638de0d3","runtimeCodeHash":"0x0a493d1af3d0f25fed8efa205244ebee14114267a08647fc38c515c7cd6ead4f","runtimeCodeSize":24384},
+    "positionDescriptor": {"address":"0x6f84dae9c064ff453e5c8af51efb819f8f610225","runtimeCodeHash":"0x6c57ccabb87f0ac1de9a2115c27e517cc87c3c1e3dd3ac407d1a42d19a327c86","runtimeCodeSize":752},
+    "nftDescriptor": {"address":"0x2e9d45bb7b30549f5216813ada9a6b7982c5b3ed","runtimeCodeHash":"0xdc9cfcaffd316cf35f823dc7f3db1a17e30233a1ca5b24d51f5e747f369914af","runtimeCodeSize":24539},
+    "swapRouter02": {"address":"0xcaf681a66d020601342297493863e78c959e5cb2","runtimeCodeHash":"0x6f36c378e272c6324c48f045182bcb54bd8ad654cf9ebd42e8893d52c4cb25dc","runtimeCodeSize":24497},
+    "permit2": {"address":"0x000000000022D473030F116dDEE9F6B43aC78BA3","runtimeCodeHash":"0x5208783f52488f7d3493e5e38311ab707c1d75457fe472a19b0b4d57d66a7fca","runtimeCodeSize":9152},
+    "universalRouter": {"address":"0x8876789976decbfcbbbe364623c63652db8c0904","runtimeCodeHash":"0x2ce6aaaf9f4151f5e1cbf774668772f17f532ae11b15e9284fd0a072a8b0fbde","runtimeCodeSize":24546},
+    "WETH": {"address":"0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73","runtimeCodeHash":"0x5706be52f64875fee65a2cec0d80e47a23d8793cbe85d214b48445e2d05f5353","runtimeCodeSize":2202},
+    "USDG": {"address":"0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168","runtimeCodeHash":"0x864cc9ad53b338b82da1f7cab85ab0b3d5c8861acb422b6fec63cf36234f36a6","runtimeCodeSize":170}
+  },
+  "relationships": {
+    "factory": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+    "weth": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "factoryConsumers": ["positionManager", "quoterV2", "swapRouter02"],
+    "wethConsumers": ["positionManager", "quoterV2", "swapRouter02"],
+    "feeTierTickSpacing": {"100":1,"500":10,"3000":60,"10000":200}
+  },
+  "checksum": "sha256:3cfb66350704dd615625c3eeed6d2cc8dcefa3dc67e2eebc37164e2673174fca"
+}

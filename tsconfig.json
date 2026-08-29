@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target":"ES2022", "module":"NodeNext", "moduleResolution":"NodeNext", "strict":true,
+    "esModuleInterop":true, "skipLibCheck":true, "declaration":true, "outDir":"dist",
+    "baseUrl":".",
+    "paths":{"@funi/core":["packages/robinhood-core/src/index.ts"],"@funi/v3":["packages/uniswap-v3-adapter/src/index.ts"],"@funi/v4":["packages/uniswap-v4-adapter/src/index.ts"],"@funi/ledger":["packages/lp-ledger/src/index.ts"]}
+  },
+  "include":["packages/**/*.ts","apps/**/*.ts","tests/**/*.test.ts"]
+}

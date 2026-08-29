@@ -1,0 +1,46 @@
+import { createHash } from 'node:crypto';
+import type { SqliteLedgerRepository } from '@funi/ledger';
+
+export const ECONOMIC_RECONCILIATION_CHAIN_ID=4663;
+export type EconomicWorkflowKind='V4_BID_LADDER_OPEN'|'V4_OPERATIONAL_OPEN'|'V4_BID_LADDER_CLOSE'|'V4_GENERIC_CLOSE'|'V4_BID_LADDER_CLAIM'|'V4_GENERIC_CLAIM';
+export type EconomicWorkSource='chain_transaction_journal'|'v4_live_open_intents'|'v4_lifecycle_intents';
+export type EconomicWorkStatus='PENDING'|'LEASED'|'RETRYABLE'|'COMPLETED'|'FAILED_CLOSED';
+export type EconomicWorkIdentity={chainId:number;workflowKind:EconomicWorkflowKind;workflowIdentity:string;semanticStage:string;transactionHash:string};
+
+function part(value:string,name:string){const normalized=value.trim();if(!normalized||normalized.includes('\u0000'))throw new Error(`ECONOMIC_RECONCILIATION_${name}_INVALID`);return normalized;}
+export function normalizedEconomicHash(value:string){const hash=value.trim().toLowerCase();if(!/^0x[0-9a-f]{64}$/.test(hash))throw new Error('ECONOMIC_RECONCILIATION_TRANSACTION_HASH_INVALID');return hash;}
+export function canonicalEconomicWorkKey(input:EconomicWorkIdentity){
+ if(!Number.isSafeInteger(input.chainId)||input.chainId<=0)throw new Error('ECONOMIC_RECONCILIATION_CHAIN_ID_INVALID');
+ return [String(input.chainId),input.workflowKind,part(input.workflowIdentity,'WORKFLOW_IDENTITY'),part(input.semanticStage,'SEMANTIC_STAGE'),normalizedEconomicHash(input.transactionHash)].join('\u0000');
+}
+export function canonicalEconomicWorkId(input:EconomicWorkIdentity){return `economic:${createHash('sha256').update(canonicalEconomicWorkKey(input)).digest('hex')}`;}
+export function ensureEconomicReconciliationWork(repo:SqliteLedgerRepository,input:EconomicWorkIdentity&{protocol?:string;sourceTable:EconomicWorkSource;sourceIdentity:string;priority?:number;nowMs?:number}){
+ const now=input.nowMs??Date.now(),transactionHash=normalizedEconomicHash(input.transactionHash),workId=canonicalEconomicWorkId({...input,transactionHash}),sourceIdentity=part(input.sourceIdentity,'SOURCE_IDENTITY'),protocol=part(input.protocol??'uniswap_v4','PROTOCOL');
+ repo.db.prepare(`INSERT INTO economic_reconciliation_work(work_id,chain_id,protocol,workflow_kind,workflow_identity,semantic_stage,transaction_hash,source_table,source_identity,status,priority,available_at_ms,created_at_ms,updated_at_ms)
+ VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?) ON CONFLICT(chain_id,workflow_kind,workflow_identity,semantic_stage,transaction_hash) DO UPDATE SET
+ priority=max(priority,excluded.priority),available_at_ms=CASE WHEN status IN ('PENDING','RETRYABLE') THEN min(available_at_ms,excluded.available_at_ms) ELSE available_at_ms END,updated_at_ms=max(updated_at_ms,excluded.updated_at_ms)`).run(workId,input.chainId,protocol,input.workflowKind,part(input.workflowIdentity,'WORKFLOW_IDENTITY'),part(input.semanticStage,'SEMANTIC_STAGE'),transactionHash,input.sourceTable,sourceIdentity,input.priority??100,now,now,now);
+ const row=repo.db.prepare('SELECT * FROM economic_reconciliation_work WHERE work_id=?').get(workId) as Record<string,unknown>|undefined;
+ if(!row||String(row.source_table)!==input.sourceTable||String(row.source_identity)!==sourceIdentity)throw new Error('ECONOMIC_RECONCILIATION_CANONICAL_IDENTITY_CONFLICT');
+ return row;
+}
+export function leaseEconomicReconciliationWork(repo:SqliteLedgerRepository,input:{owner:string;limit?:number;leaseMs?:number;nowMs?:number}){
+ const owner=part(input.owner,'LEASE_OWNER'),limit=Math.max(1,Math.min(32,input.limit??8)),leaseMs=Math.max(1_000,Math.min(300_000,input.leaseMs??60_000)),now=input.nowMs??Date.now();
+ return repo.db.transaction(()=>{const rows=repo.db.prepare(`SELECT * FROM economic_reconciliation_work WHERE ((status IN ('PENDING','RETRYABLE') AND available_at_ms<=?) OR (status='LEASED' AND leased_until_ms<=?)) ORDER BY priority DESC,available_at_ms,work_id LIMIT ?`).all(now,now,limit) as Record<string,unknown>[],claim=repo.db.prepare(`UPDATE economic_reconciliation_work SET status='LEASED',lease_owner=?,leased_until_ms=?,attempts=attempts+1,updated_at_ms=? WHERE work_id=? AND ((status IN ('PENDING','RETRYABLE') AND available_at_ms<=?) OR (status='LEASED' AND leased_until_ms<=?))`),leased:Record<string,unknown>[]=[];for(const row of rows)if(claim.run(owner,now+leaseMs,now,row.work_id,now,now).changes===1)leased.push(repo.db.prepare('SELECT * FROM economic_reconciliation_work WHERE work_id=?').get(row.work_id) as Record<string,unknown>);return leased;})();
+}
+function code(value:string){const normalized=value.toUpperCase().replace(/[^A-Z0-9_:-]/g,'_').slice(0,128);return normalized||'ECONOMIC_RECONCILIATION_FAILED';}
+export function completeEconomicReconciliationWork(repo:SqliteLedgerRepository,input:{workId:string;owner:string;nowMs?:number}){const now=input.nowMs??Date.now();return repo.db.prepare("UPDATE economic_reconciliation_work SET status='COMPLETED',completed_at_ms=?,leased_until_ms=NULL,lease_owner=NULL,sanitized_error_code=NULL,updated_at_ms=? WHERE work_id=? AND status='LEASED' AND lease_owner=?").run(now,now,input.workId,input.owner).changes===1;}
+export function retryEconomicReconciliationWork(repo:SqliteLedgerRepository,input:{workId:string;owner:string;errorCode:string;nowMs?:number;terminal?:boolean}){const now=input.nowMs??Date.now(),row=repo.db.prepare("SELECT attempts FROM economic_reconciliation_work WHERE work_id=? AND status='LEASED' AND lease_owner=?").get(input.workId,input.owner) as {attempts:number}|undefined;if(!row)return false;const delay=Math.min(300_000,1_000*2**Math.min(Number(row.attempts),8));return repo.db.prepare("UPDATE economic_reconciliation_work SET status=?,available_at_ms=?,leased_until_ms=NULL,lease_owner=NULL,sanitized_error_code=?,updated_at_ms=? WHERE work_id=? AND status='LEASED' AND lease_owner=?").run(input.terminal?'FAILED_CLOSED':'RETRYABLE',now+delay,code(input.errorCode),now,input.workId,input.owner).changes===1;}
+
+function successfulReceipt(value:string){try{return JSON.parse(value).status==='success';}catch{return false;}}
+/** Reconstructs handoffs from authoritative receipt stores only. This scanner
+ * has no signer, wallet client, nonce operation, or broadcast dependency. */
+export function discoverMissingEconomicReconciliationWork(repo:SqliteLedgerRepository,nowMs=Date.now()){
+ let materialized=0;
+ const journals=repo.db.prepare(`SELECT j.* FROM chain_transaction_journal j JOIN v4_bid_ladders l ON l.ladder_id=j.workflow_identity WHERE j.chain_id=4663 AND j.protocol='uniswap_v4' AND (j.semantic_stage IN ('OPEN_BATCH','CLOSE_BATCH') OR j.semantic_stage LIKE 'COLLECT_BATCH:%') AND j.status IN ('PREPARED','SUBMITTED','CONFIRMED') AND (j.status IN ('PREPARED','SUBMITTED') OR json_extract(j.receipt_json,'$.status')='success') AND ((j.semantic_stage='OPEN_BATCH' AND (l.status='PLANNED' OR (l.status='OPEN' AND (SELECT COUNT(*) FROM position_deposits d JOIN v4_positions p ON d.position_id='v4:'||p.token_id WHERE p.open_intent_id=l.ladder_id)<>5))) OR (j.semantic_stage='CLOSE_BATCH' AND l.status='OPEN') OR (j.semantic_stage LIKE 'COLLECT_BATCH:%' AND l.status='OPEN' AND (SELECT COUNT(*) FROM collections c WHERE lower(c.tx_hash)=lower(j.expected_hash))<>5))`).all() as Record<string,unknown>[];
+ for(const row of journals){const stage=String(row.semantic_stage),kind:EconomicWorkflowKind=stage==='OPEN_BATCH'?'V4_BID_LADDER_OPEN':stage==='CLOSE_BATCH'?'V4_BID_LADDER_CLOSE':'V4_BID_LADDER_CLAIM';ensureEconomicReconciliationWork(repo,{chainId:4663,workflowKind:kind,workflowIdentity:String(row.workflow_identity),semanticStage:stage,transactionHash:String(row.expected_hash),sourceTable:'chain_transaction_journal',sourceIdentity:String(row.journal_id),priority:kind==='V4_BID_LADDER_OPEN'?1_000:500,nowMs});materialized++;}
+ const opens=repo.db.prepare("SELECT i.id,i.mint_hash,r.receipt_json FROM v4_live_open_intents i JOIN v4_operational_open_receipts r ON r.intent_id=i.id AND r.phase='V4_MINT' AND lower(r.tx_hash)=lower(i.mint_hash) WHERE i.mint_hash IS NOT NULL AND i.state<>'POSITION_RECONCILED'").all() as Record<string,unknown>[];
+ for(const row of opens)if(successfulReceipt(String(row.receipt_json))){ensureEconomicReconciliationWork(repo,{chainId:4663,workflowKind:'V4_OPERATIONAL_OPEN',workflowIdentity:String(row.id),semanticStage:'V4_MINT',transactionHash:String(row.mint_hash),sourceTable:'v4_live_open_intents',sourceIdentity:String(row.id),priority:1_000,nowMs});materialized++;}
+ const lifecycle=repo.db.prepare("SELECT i.id,i.action,i.tx_hash,r.receipt_json FROM v4_lifecycle_intents i JOIN v4_lifecycle_receipts r ON r.intent_id=i.id AND lower(r.tx_hash)=lower(i.tx_hash) WHERE i.action IN ('full_close','collect') AND i.tx_hash IS NOT NULL AND i.state IN ('CONFIRMED_RECONCILIATION_REQUIRED','CONFIRMED')").all() as Record<string,unknown>[];
+ for(const row of lifecycle)if(successfulReceipt(String(row.receipt_json))){const close=String(row.action)==='full_close';ensureEconomicReconciliationWork(repo,{chainId:4663,workflowKind:close?'V4_GENERIC_CLOSE':'V4_GENERIC_CLAIM',workflowIdentity:String(row.id),semanticStage:`V4_LIFECYCLE:${String(row.action)}`,transactionHash:String(row.tx_hash),sourceTable:'v4_lifecycle_intents',sourceIdentity:String(row.id),priority:500,nowMs});materialized++;}
+ return {scanned:journals.length+opens.length+lifecycle.length,materialized};
+}

@@ -1,0 +1,54 @@
+{
+  "name": "funi",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "FUNI — alat LP manual V3/V4 yang source-available dan privacy-first.",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jajajak12/FUNI.git"
+  },
+  "homepage": "https://github.com/jajajak12/FUNI#readme",
+  "engines": {
+    "node": ">=20.18",
+    "npm": ">=10"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "cli": "tsx apps/cli/src/dispatch.ts",
+    "preflight": "tsx apps/cli/src/index.ts bot-preflight",
+    "bot-preflight": "tsx apps/cli/src/index.ts bot-preflight",
+    "db-migrate": "tsx apps/cli/src/index.ts db-migrate",
+    "db-status": "tsx apps/cli/src/index.ts db-status",
+    "db-backup": "tsx apps/cli/src/index.ts db-backup",
+    "db-restore-test": "tsx apps/cli/src/index.ts db-restore-test",
+    "pm2-sync-funi": "pm2 startOrReload infra/pm2/ecosystem.config.cjs --update-env",
+    "reconcile-all": "tsx apps/cli/src/index.ts reconcile-all",
+    "runtime-status": "tsx apps/cli/src/index.ts runtime-status",
+    "wallet-status": "tsx apps/cli/src/index.ts wallet-status",
+    "wallet-preflight": "tsx apps/cli/src/index.ts wallet-preflight",
+    "allowance-audit": "tsx apps/cli/src/index.ts allowance-audit"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.7.0",
+    "dotenv": "16.4.7",
+    "grammy": "1.34.0",
+    "pino": "9.5.0",
+    "viem": "^2.55.5",
+    "zod": "3.24.1"
+  }
+}

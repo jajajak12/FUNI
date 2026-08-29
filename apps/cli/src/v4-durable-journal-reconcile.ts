@@ -1,9 +1,26 @@
-import { getAddress, type Address, type Hash, type TransactionReceipt } from "viem";
+import {
+  decodeFunctionData,
+  getAddress,
+  type Address,
+  type Hash,
+  type Hex,
+  type TransactionReceipt,
+} from "viem";
 import { robinhoodMainnet, type FallbackRpc } from "@funi/core";
 import type { SqliteLedgerRepository } from "@funi/ledger";
 import { V4_ROBINHOOD_DEPLOYMENTS } from "@funi/v4";
-import { exactHashEvidence, type ExactHashEvidence } from "./transaction-boundary.js";
+import {
+  canonicalRequestFingerprint,
+  exactHashEvidence,
+  type DurablePreparedTransaction,
+  type ExactHashEvidence,
+} from "./transaction-boundary.js";
 import { reconcileConfirmedV4BidLadderJournal } from "./v4-bid-ladder-live.js";
+import {
+  durableV4RecoveryStageSql,
+  isDurableV4ApprovalStage,
+  isDurableV4LifecycleStage,
+} from "./v4-durable-journal-stages.js";
 
 const CHAIN_ID = 4663;
 export const V4_DURABLE_RECOVERY_LIMIT = 8;
@@ -11,14 +28,36 @@ type Candidate = {
   journal_id: string;
   wallet_address: string;
   workflow_identity: string;
-  semantic_stage: "OPEN_BATCH" | "CLOSE_BATCH" | `COLLECT_BATCH:${string}`;
+  semantic_stage: string;
   attempt: number;
   status: "PREPARED" | "SUBMITTED" | "CONFIRMED";
   nonce: number;
   expected_hash: string;
   to_address: string;
+  request_fingerprint: string;
+  provider_evidence_json: string;
   receipt_json: string | null;
 };
+
+const erc20ApproveAbi = [{
+  type: "function",
+  name: "approve",
+  stateMutability: "nonpayable",
+  inputs: [{ type: "address", name: "spender" }, { type: "uint256", name: "amount" }],
+  outputs: [{ type: "bool" }],
+}] as const;
+const permit2ApproveAbi = [{
+  type: "function",
+  name: "approve",
+  stateMutability: "nonpayable",
+  inputs: [
+    { type: "address", name: "token" },
+    { type: "address", name: "spender" },
+    { type: "uint160", name: "amount" },
+    { type: "uint48", name: "expiration" },
+  ],
+  outputs: [],
+}] as const;
 
 function receipt(value: string): TransactionReceipt {
   return JSON.parse(value, (key, item) =>
@@ -53,7 +92,7 @@ export function durableV4RecoveryCandidates(
        JOIN v4_bid_ladders AS ladder ON ladder.ladder_id=journal.workflow_identity
        WHERE journal.chain_id=? ${walletPredicate} ${journalPredicate}
          AND journal.protocol='uniswap_v4'
-         AND (journal.semantic_stage IN ('OPEN_BATCH','CLOSE_BATCH') OR journal.semantic_stage LIKE 'COLLECT_BATCH:%')
+         AND ${durableV4RecoveryStageSql("journal")}
          AND (
            journal.status IN ('PREPARED','SUBMITTED')
            OR (journal.status='CONFIRMED' AND (
@@ -80,6 +119,105 @@ export function durableV4RecoveryCandidates(
        LIMIT ?`,
     )
     .all(...(wallet ? [CHAIN_ID, wallet.toLowerCase(),...(journalIds??[]),limit] : [CHAIN_ID,...(journalIds??[]),limit])) as Candidate[];
+}
+
+function approvalAmount(repo: SqliteLedgerRepository, candidate: Candidate) {
+  if (candidate.semantic_stage.startsWith("REPOSITION_PREPARE_")) {
+    const raw = candidate.semantic_stage.slice(candidate.semantic_stage.lastIndexOf(":") + 1);
+    if (!/^\d+$/.test(raw))
+      throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+    const amount = BigInt(raw);
+    if (amount <= 0n || amount > 2n ** 160n - 1n)
+      throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+    return amount;
+  }
+  const ladder = repo.loadBidLadder(candidate.workflow_identity),
+    legs = repo.listBidLadderLegs(candidate.workflow_identity);
+  if (!ladder || !legs.length)
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  const amount = legs.reduce(
+    (total, leg) => total + BigInt(String(leg.funding_amount_raw)),
+    0n,
+  );
+  if (
+    amount <= 0n ||
+    amount > 2n ** 160n - 1n ||
+    amount !== BigInt(String(ladder.total_funding_amount_raw))
+  )
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  return amount;
+}
+
+function preparedApproval(repo: SqliteLedgerRepository, candidate: Candidate) {
+  let prepared: DurablePreparedTransaction;
+  try {
+    prepared = JSON.parse(candidate.provider_evidence_json).prepared;
+  } catch {
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  }
+  const request = prepared?.request;
+  if (!request)
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  const identity = {
+    workflowId: prepared.workflowId,
+    semanticStage: prepared.semanticStage,
+    attempt: prepared.attempt,
+    request,
+  };
+  if (
+    prepared.workflowId !== candidate.workflow_identity ||
+    prepared.semanticStage !== candidate.semantic_stage ||
+    prepared.attempt !== candidate.attempt ||
+    prepared.expectedHash.toLowerCase() !== candidate.expected_hash.toLowerCase() ||
+    prepared.requestFingerprint !== candidate.request_fingerprint ||
+    canonicalRequestFingerprint(identity) !== candidate.request_fingerprint ||
+    getAddress(request.account) !== getAddress(candidate.wallet_address) ||
+    request.chainId !== CHAIN_ID ||
+    request.nonce !== candidate.nonce ||
+    getAddress(request.to) !== getAddress(candidate.to_address) ||
+    BigInt(request.value) !== 0n
+  )
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  return request;
+}
+
+function assertApprovalIdentity(repo: SqliteLedgerRepository, candidate: Candidate) {
+  const ladder = repo.loadBidLadder(candidate.workflow_identity);
+  if (!ladder)
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  const token = getAddress(String(ladder.funding_token)),
+    amount = approvalAmount(repo, candidate),
+    request = preparedApproval(repo, candidate),
+    permit2Stage = candidate.semantic_stage.includes("PERMIT2_APPROVAL");
+  try {
+    if (permit2Stage) {
+      if (getAddress(candidate.to_address) !== V4_ROBINHOOD_DEPLOYMENTS.permit2)
+        throw new Error();
+      const decoded = decodeFunctionData({ abi: permit2ApproveAbi, data: request.data as Hex });
+      const [decodedToken, spender, decodedAmount, expiration] = decoded.args;
+      if (
+        decoded.functionName !== "approve" ||
+        getAddress(decodedToken) !== token ||
+        getAddress(spender) !== V4_ROBINHOOD_DEPLOYMENTS.positionManager ||
+        decodedAmount !== amount ||
+        BigInt(expiration) <= 0n
+      )
+        throw new Error();
+    } else {
+      if (getAddress(candidate.to_address) !== token)
+        throw new Error();
+      const decoded = decodeFunctionData({ abi: erc20ApproveAbi, data: request.data as Hex });
+      const [spender, decodedAmount] = decoded.args;
+      if (
+        decoded.functionName !== "approve" ||
+        getAddress(spender) !== V4_ROBINHOOD_DEPLOYMENTS.permit2 ||
+        decodedAmount !== amount
+      )
+        throw new Error();
+    }
+  } catch {
+    throw new Error("V4_DURABLE_RECOVERY_APPROVAL_IDENTITY_MISMATCH");
+  }
 }
 
 function fundingUsd(repo: SqliteLedgerRepository, ladderId: string) {
@@ -129,19 +267,25 @@ export async function reconcileDurableV4Journals(input: {
     observe = input.observe ?? exactHashEvidence,
     results: Array<Record<string, unknown>> = [];
   const assertReceiptIdentity = (candidate: Candidate, value: TransactionReceipt) => {
+    const expectedTarget = isDurableV4ApprovalStage(candidate.semantic_stage)
+      ? getAddress(candidate.to_address)
+      : V4_ROBINHOOD_DEPLOYMENTS.positionManager;
     if (
       value.transactionHash.toLowerCase() !== candidate.expected_hash.toLowerCase() ||
       !value.to ||
-      value.to.toLowerCase() !== V4_ROBINHOOD_DEPLOYMENTS.positionManager.toLowerCase()
+      getAddress(value.to) !== expectedTarget ||
+      (isDurableV4ApprovalStage(candidate.semantic_stage) &&
+        (!value.from || getAddress(value.from) !== getAddress(candidate.wallet_address)))
     )
       throw new Error("V4_DURABLE_RECOVERY_RECEIPT_IDENTITY_MISMATCH");
   };
   for (const candidate of candidates) {
     try {
-      if (
-        (input.wallet && getAddress(candidate.wallet_address) !== getAddress(input.wallet)) ||
-        getAddress(candidate.to_address) !== V4_ROBINHOOD_DEPLOYMENTS.positionManager
-      )
+      if (input.wallet && getAddress(candidate.wallet_address) !== getAddress(input.wallet))
+        throw new Error("V4_DURABLE_RECOVERY_SCOPE_MISMATCH");
+      if (isDurableV4ApprovalStage(candidate.semantic_stage))
+        assertApprovalIdentity(input.repo, candidate);
+      else if (getAddress(candidate.to_address) !== V4_ROBINHOOD_DEPLOYMENTS.positionManager)
         throw new Error("V4_DURABLE_RECOVERY_SCOPE_MISMATCH");
       const candidateWallet = getAddress(candidate.wallet_address);
       let exactReceipt: TransactionReceipt | undefined;
@@ -212,6 +356,17 @@ export async function reconcileDurableV4Journals(input: {
         }
       }
       assertReceiptIdentity(candidate, exactReceipt);
+      if (isDurableV4ApprovalStage(candidate.semantic_stage)) {
+        results.push({
+          journalId: candidate.journal_id,
+          outcome: "CONFIRMED_RECONCILED",
+          semanticStage: candidate.semantic_stage,
+          reconciliation: { journalTerminal: "CONFIRMED", stageAwareApproval: true },
+        });
+        continue;
+      }
+      if (!isDurableV4LifecycleStage(candidate.semantic_stage))
+        throw new Error("V4_DURABLE_RECOVERY_STAGE_UNSUPPORTED");
       const reconciliation = await reconcileConfirmedV4BidLadderJournal({
         repo: input.repo,
         rpc: input.rpc,

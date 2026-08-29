@@ -631,6 +631,8 @@ function durableReconciliationPendingText(error: unknown, title: string, workflo
     title,
     "Transaction status is being reconciled.",
     "Do not retry this transaction.",
+    "Wallet transaction pending — avoid sending another wallet transaction while FUNI is reconciling.",
+    "If immediate risk reduction is necessary, you may act manually. FUNI will reconcile from canonical on-chain truth afterward.",
     "FUNI will recover the position automatically if the transaction landed.",
     `Workflow: ${workflowId ?? pending.workflowId}`,
     `Expected tx: ${pending.expectedHash}`,
@@ -1799,7 +1801,7 @@ async function usdResetRepositionConsumer() {
               log("v4_bid_ladder_reposition_single_flight", details),
           };
           const durableClose = db.db.prepare("SELECT 1 FROM economic_reconciliation_work w JOIN v4_bid_ladder_usdg_reset_v1 r ON r.ladder_id=w.workflow_identity WHERE w.workflow_kind='V4_BID_LADDER_CLOSE' AND w.status IN ('PENDING','RETRYABLE','LEASED') AND r.phase NOT IN ('COMPLETED','BLOCKED','OPERATOR_CLOSED') LIMIT 1").get();
-          if(durableClose) await runEconomicReconciliationCycle({repo:db,rpc,owner:`telegram-reposition:${process.pid}`,limit:4});
+          if(durableClose) await runEconomicReconciliationCycle({repo:db,rpc,logsRpc,owner:`telegram-reposition:${process.pid}`,limit:4});
           const now=Date.now(),results:Array<Record<string,unknown>>=[];
           const immediate = db.db.prepare("SELECT r.ladder_id FROM v4_bid_ladder_usdg_reset_v1 r LEFT JOIN v4_bid_ladder_usdg_reset_execution_leases x ON x.ladder_id=r.ladder_id AND x.lease_until_ms>? WHERE r.phase IN ('CLOSE_CONFIRMED','PRINCIPAL_RECONCILED','REOPEN_PLANNED','REOPEN_PREPARED','REOPEN_SUBMITTED') AND x.ladder_id IS NULL ORDER BY r.updated_at_ms LIMIT 4").all(now) as Array<{ladder_id:string}>;
           if(immediate.length)for(const row of immediate)results.push(await processV4BidLadderUsdReset({...cycleInput,callerSource:'IMMEDIATE_RECOVERY'},String(row.ladder_id)));

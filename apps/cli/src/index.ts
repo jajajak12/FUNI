@@ -18,6 +18,7 @@ import {
 import {
   allowanceAudit,
   dedicatedWallet,
+  logsRpc,
   runtimeEnv as env,
   runtimePaths,
   runtimeRpc as rpc,
@@ -123,6 +124,7 @@ async function main() {
         const economic = await runEconomicReconciliationCycle({
           repo: repository,
           rpc,
+          logsRpc,
           owner: dedicatedWallet().address,
           limit: 16,
         });

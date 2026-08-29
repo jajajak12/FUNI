@@ -56,8 +56,8 @@ export function convergeTerminalV4BidLadder(input: {
     }
     writes += input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET status='CLOSED',close_batch_id=CASE WHEN ? IS NULL THEN close_batch_id ELSE COALESCE(close_batch_id,?) END,updated_at_ms=? WHERE ladder_id=? AND status='OPEN'")
       .run(close?.journal_id ?? null, close?.journal_id ?? null, nowMs, input.ladderId).changes;
-    writes += input.repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='OPEN'")
-      .run(provenance === "FUNI_CLOSE_CONFIRMED" ? "FUNI_EXECUTED" : "UNKNOWN_EXTERNAL", nowMs, input.ladderId).changes;
+    writes += input.repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance=?,terminal_provenance=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='OPEN'")
+      .run(provenance === "FUNI_CLOSE_CONFIRMED" ? "FUNI_EXECUTED" : "UNKNOWN_EXTERNAL", provenance === "FUNI_CLOSE_CONFIRMED" ? "FUNI_AUTHORED_CLOSE_BATCH" : "EXTERNAL_ONCHAIN_MUTATION", nowMs, input.ladderId).changes;
     const reset = input.repo.loadBidLadderUsdReset(input.ladderId);
     if (reset && provenance === "EXTERNAL_OR_UNKNOWN_TERMINAL" && !["BLOCKED", "COMPLETED", "OPERATOR_CLOSED"].includes(String(reset.phase)))
       writes += input.repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET phase='BLOCKED',block_reason='EXTERNAL_OR_UNKNOWN_TERMINAL_ACCOUNTING_RECONCILIATION_REQUIRED',revision=revision+1,updated_at_ms=? WHERE ladder_id=?").run(nowMs, input.ladderId).changes;

@@ -60,6 +60,14 @@ V4_LIVE_CANARY_ENABLED=false
 
 Instalasi, discovery, pembacaan portfolio, dan preview tidak mengizinkan transaksi. Alur live memerlukan konfigurasi sadar pengguna, bukti preflight yang masih segar, wallet yang cocok, dan konfirmasi final. Bukti yang ambigu tetap berstatus menunggu rekonsiliasi; FUNI tidak menganggap ketidakpastian provider sebagai alasan aman untuk mengirim ulang transaksi.
 
+## Intervensi Manual Darurat
+
+Dalam kondisi normal, hindari mengirim transaksi wallet lain ketika FUNI masih merekonsiliasi transaksi `PREPARED` atau `SUBMITTED`. FUNI dapat memblokir tindakan baru sementara ketika kebenaran transaksi belum final.
+
+Jika risiko pasar sangat berat dan menunggu dapat menambah kerugian secara material, pengguna dapat mengurangi atau menutup exposure secara manual melalui wallet atau antarmuka Uniswap yang tepercaya. Tindakan manual tidak bebas risiko dan dapat memakai nonce yang sebelumnya telah disiapkan FUNI.
+
+Setelahnya, FUNI merekonsiliasi status posisi dari kebenaran on-chain kanonis. Tindakan tersebut tetap diberi provenance `EXTERNAL_ONCHAIN_MUTATION`, bukan diklaim sebagai transaksi FUNI. Accounting ditandai `FULL`, `PARTIAL`, atau `INCOMPLETE` sesuai bukti receipt/log yang tersedia; posisi yang terbukti tertutup tidak dibuka kembali hanya karena accounting belum lengkap. Bila memungkinkan, tunggu rekonsiliasi selesai sebelum melanjutkan operasi normal FUNI.
+
 ## Persyaratan
 
 - Linux, macOS, atau WSL2;

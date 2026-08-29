@@ -65,6 +65,7 @@ import {
 import { rawUsdMicros, usdMicrosToText, valueV4ReturnsFromSqrtPriceX96 } from "./v4-realized-accounting.js";
 import { ensureEconomicReconciliationWork, type EconomicWorkflowKind } from "./economic-reconciliation-work.js";
 import { convergeTerminalV4BidLadder } from "./v4-bid-ladder-terminal-convergence.js";
+import { assertDurableV4RecoveryStage } from "./v4-durable-journal-stages.js";
 
 const CHAIN_ID = 4663,
   CHAIN_KEY = "robinhood",
@@ -715,6 +716,7 @@ async function submit(
     closeValuation?: BoundCloseValuation;
   },
 ) {
+  assertDurableV4RecoveryStage(input.stage);
   const existing = journalRow(input.repo, input.ladderId, input.stage),
     attempt =
       String(existing?.status) === "FAILED"

@@ -43,7 +43,7 @@ export const runtimeEnvSchema = z
     V4_LIVE_CANARY_ENABLED: bool("V4_LIVE_CANARY_ENABLED", false),
     MAX_POSITION_VALUE_USD: z.coerce.number().positive().max(1_000_000).default(1_000),
     MAX_APPROVAL_VALUE_USD: z.coerce.number().positive().max(1_000_000).default(1_000),
-    MAX_GAS_COST_USD: z.coerce.number().positive().max(0.25).default(0.25),
+    MAX_GAS_COST_USD: z.coerce.number().positive().max(1).default(0.5),
     MAX_LIFECYCLE_GAS_USD: z.coerce.number().positive().max(1).default(1),
     MAX_SLIPPAGE_BPS: z.coerce.number().int().min(0).max(10_000).default(50),
     APPROVAL_CAP_MULTIPLIER_BPS: z.coerce

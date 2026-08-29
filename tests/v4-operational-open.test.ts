@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { evaluateV4OperationalExecution, evaluateV4OperationalGates, type V4OperationalGate } from '../apps/cli/src/v4-operational-open.js';
 import { evaluateV4OperationalGasStage, permit2ApprovalRequired } from '../apps/cli/src/v4-operational-executor.js';
+import { runtimeEnvSchema } from '../apps/cli/src/runtime.js';
 
 const allowed=4663;
 const base={
@@ -91,6 +92,15 @@ describe('v4 operational open gate',()=>{
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,perTxUsd:0.26}}).reasons).toContain('V4_TX_GAS_CAP_EXCEEDED');
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,lifecycleUsd:1.01}}).reasons).toContain('V4_LIFECYCLE_GAS_BUDGET_EXCEEDED');
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,nativeBalance:0n}}).reasons).toContain('GAS_BALANCE_INSUFFICIENT');
+  });
+  it('enforces the public $0.50 operational gas boundary without weakening the schema ceiling',()=>{
+    const configured=runtimeEnvSchema.safeParse({...process.env,RH_CHAIN_ID:'4663',MAX_GAS_COST_USD:'0.50'});
+    expect(configured.success).toBe(true);
+    if(configured.success)expect(configured.data.MAX_GAS_COST_USD).toBe(.5);
+    expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.3192}}).reasons).not.toContain('V4_TX_GAS_CAP_EXCEEDED');
+    expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.5}}).reasons).not.toContain('V4_TX_GAS_CAP_EXCEEDED');
+    expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.5000001}}).reasons).toContain('V4_TX_GAS_CAP_EXCEEDED');
+    expect(runtimeEnvSchema.safeParse({...process.env,RH_CHAIN_ID:'4663',MAX_GAS_COST_USD:'1.01'}).success).toBe(false);
   });
   it('blocks when the range or single-sided invariant is not satisfied',()=>{
     expect(evaluateV4OperationalGates({...base,range:{valid:false}}).reasons).toContain('V4_RANGE_INVALID');

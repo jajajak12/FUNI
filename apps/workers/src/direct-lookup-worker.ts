@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { assertFuniCredentialIsolation } from '../../shared/credential-isolation.js';
 import { FallbackRpc, orderedRpcUrls, robinhoodMainnet } from '@funi/core';
-import { migrateSqlite, productionDatabasePaths, SQLITE_RUNTIME_BUSY_TIMEOUT_MS, SqliteLedgerRepository } from '@funi/ledger';
+import { EconomicForegroundDemandActiveError, migrateSqlite, productionDatabasePaths, SQLITE_RUNTIME_BUSY_TIMEOUT_MS, SqliteLedgerRepository, waitForEconomicForegroundDemandToClear } from '@funi/ledger';
 import { acquireRpcReadLease, releaseRpcReadLease } from '../../cli/src/active-position-reconciliation.js';
 import { executeDirectTokenLookup, leaseDirectTokenLookup, releaseDirectTokenLookupLease } from '../../cli/src/direct-token-lookup.js';
 
@@ -40,7 +40,7 @@ async function main(){
  let stopping=false,idleProven=false,currentOperation='startup';
  process.on('SIGTERM',()=>{stopping=true;});process.on('SIGINT',()=>{stopping=true;});
  const emit=(event:string,data:Record<string,unknown>={})=>process.stdout.write(JSON.stringify({event,process:'funi-v4-direct-lookup-worker',...data,at:new Date().toISOString()},(_,value)=>typeof value==='bigint'?value.toString():value)+'\n');
- const busy:BusyRunner=async(operation,work)=>{const started=Date.now();let failure:unknown;for(let attempt=0;attempt<3;attempt++)try{return work();}catch(error){failure=error;if(!/SQLITE_BUSY|database is locked/i.test(error instanceof Error?error.message:String(error)))throw error;const wait=50*2**attempt+Math.floor(Math.random()*50);emit('sqlite_busy_retry',{operation,attempt:attempt+1,waitMs:wait});await sleep(wait);}emit('sqlite_busy_terminal',{operation,dbWaitMs:Date.now()-started,error:failure instanceof Error?failure.message:String(failure)});throw failure;};
+ const busy:BusyRunner=async(operation,work)=>{const priority=await waitForEconomicForegroundDemandToClear({databasePath:paths.databasePath,component:'funi-v4-direct-lookup-worker',operation,maxWaitMs:500,onTelemetry:event=>emit('sqlite_write_window',event)});if(!priority.cleared)throw new EconomicForegroundDemandActiveError(paths.databasePath);const started=Date.now();let failure:unknown;for(let attempt=0;attempt<3;attempt++)try{const windowStarted=Date.now(),value=work();emit('sqlite_write_window',{component:'funi-v4-direct-lookup-worker',operation,persistenceClass:'background',economicDemandPresent:priority.demandPresent,waitYieldDurationMs:priority.waitedMs,writerWindowDurationMs:Date.now()-windowStarted,rowChangeCount:value&&typeof value==='object'&&typeof (value as {changes?:unknown}).changes==='number'?Number((value as unknown as {changes:number}).changes):null,retryCount:attempt,outcome:'SUCCEEDED'});return value;}catch(error){failure=error;if(!/SQLITE_BUSY|database is locked/i.test(error instanceof Error?error.message:String(error)))throw error;const wait=50*2**attempt+Math.floor(Math.random()*50);emit('sqlite_busy_retry',{operation,attempt:attempt+1,waitMs:wait});await sleep(wait);}emit('sqlite_busy_terminal',{operation,dbWaitMs:Date.now()-started,error:failure instanceof Error?failure.message:String(failure)});throw failure;};
  emit('direct_lookup_worker_started',{databasePath:paths.databasePath,pollMs:loopMs,candidateBudget,maxRpcBatches,ethCallBudget,requestDeadlineMs:15_000,executionEnabled:false,signerConstructed:false,mainnetTransactionsSent:0});
  const repo=new SqliteLedgerRepository(paths.databasePath,{busyTimeoutMs:SQLITE_RUNTIME_BUSY_TIMEOUT_MS});
  while(!stopping){

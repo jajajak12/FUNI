@@ -1,6 +1,14 @@
 import type { TransactionReceipt } from "viem";
 import { robinhoodMainnet } from "@funi/core";
+import { createHash } from "node:crypto";
 import type { SqliteLedgerRepository } from "@funi/ledger";
+import {
+  V4_MAX_TICK,
+  V4_MIN_TICK,
+  poolId,
+  sqrtPriceAtTick,
+  type V4PoolKey,
+} from "@funi/v4";
 
 const USD_SCALE = 1_000_000n;
 const same=(a:unknown,b:unknown)=>String(a).toLowerCase()===String(b).toLowerCase();
@@ -23,15 +31,91 @@ export function valueGenericV4Returns(input:{token0:string;token1:string;decimal
   return {status:"AVAILABLE" as const,token0UsdMicros:usd0,token1UsdMicros:usd1,totalUsdMicros:usd0+usd1,evidence:{contract:"DIRECT_V4_POOL_PRICE_CAPTURE_V1",price1Per0:input.price1Per0,token0:input.token0,token1:input.token1,decimals0:input.decimals0,decimals1:input.decimals1,token0Raw:input.amount0.toString(),token1Raw:input.amount1.toString(),token0Usd:usdMicrosToText(usd0),token1Usd:usdMicrosToText(usd1)}};
 }
 
-/** Exact V4 raw-unit valuation from the immutable pool sqrt price. */
-export function valueV4ReturnsFromSqrtPriceX96(input:{token0:string;token1:string;decimals0:number;decimals1:number;amount0:bigint;amount1:bigint;sqrtPriceX96:bigint}){
+export type V4RealizedPoolValuationSource={
+  poolId:string;
+  poolKey:V4PoolKey;
+  sqrtPriceX96:bigint;
+  tick:number;
+  activeLiquidity:bigint;
+  initialized:boolean;
+  blockNumber:bigint;
+  token0Decimals:number;
+  token1Decimals:number;
+};
+export type V4PoolValuationSanityFailure=
+  |"POOL_VALUATION_SOURCE_IDENTITY_MISMATCH"
+  |"POOL_UNINITIALIZED"
+  |"POOL_PRICE_OUTSIDE_PROTOCOL_DOMAIN"
+  |"POOL_PRICE_TICK_INCONSISTENT"
+  |"POOL_PRICE_AT_PROTOCOL_BOUNDARY"
+  |"POOL_ACTIVE_LIQUIDITY_UNAVAILABLE";
+
+function incomplete(reason:V4PoolValuationSanityFailure,source:V4RealizedPoolValuationSource){return {status:"INCOMPLETE" as const,reason,evidence:{contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V2",sanityStatus:"FAILED",reason,poolId:source.poolId,poolKey:source.poolKey,sqrtPriceX96:source.sqrtPriceX96.toString(),tick:source.tick,activeLiquidity:source.activeLiquidity.toString(),initialized:source.initialized,blockNumber:source.blockNumber.toString(),token0Decimals:source.token0Decimals,token1Decimals:source.token1Decimals}};}
+
+/** Structural source validation only. It deliberately makes no external-oracle
+ * or arbitrary USD-magnitude judgement. The boundary band is derived from the
+ * pool's own tick spacing: a usable price must sit strictly between its first
+ * and last protocol-aligned ticks. */
+export function validateV4RealizedPoolValuationSource(input:{token0:string;token1:string;decimals0:number;decimals1:number;sqrtPriceX96:bigint;source:V4RealizedPoolValuationSource}){
+  const {source}=input,key=source.poolKey,spacing=key.tickSpacing;
+  if(!same(input.token0,key.currency0)||!same(input.token1,key.currency1)||!same(source.poolId,poolId(key))||input.sqrtPriceX96!==source.sqrtPriceX96||input.decimals0!==source.token0Decimals||input.decimals1!==source.token1Decimals||!Number.isInteger(spacing)||spacing<=0||!Number.isInteger(source.tick)||source.tick<V4_MIN_TICK||source.tick>V4_MAX_TICK)return incomplete("POOL_VALUATION_SOURCE_IDENTITY_MISMATCH",source);
+  if(!source.initialized)return incomplete("POOL_UNINITIALIZED",source);
+  const minimumSqrt=sqrtPriceAtTick(V4_MIN_TICK),maximumSqrt=sqrtPriceAtTick(V4_MAX_TICK);
+  if(source.sqrtPriceX96<minimumSqrt||source.sqrtPriceX96>maximumSqrt)return incomplete("POOL_PRICE_OUTSIDE_PROTOCOL_DOMAIN",source);
+  const tickFloor=sqrtPriceAtTick(source.tick),tickCeiling=source.tick===V4_MAX_TICK?tickFloor:sqrtPriceAtTick(source.tick+1),tickConsistent=source.tick===V4_MAX_TICK?source.sqrtPriceX96===tickFloor:source.sqrtPriceX96>=tickFloor&&source.sqrtPriceX96<tickCeiling;
+  if(!tickConsistent)return incomplete("POOL_PRICE_TICK_INCONSISTENT",source);
+  const usableMinimumTick=Math.ceil(V4_MIN_TICK/spacing)*spacing,usableMaximumTick=Math.floor(V4_MAX_TICK/spacing)*spacing;
+  if(source.tick<=usableMinimumTick||source.tick>=usableMaximumTick)return incomplete("POOL_PRICE_AT_PROTOCOL_BOUNDARY",source);
+  if(source.activeLiquidity<=0n||source.activeLiquidity>2n**128n-1n)return incomplete("POOL_ACTIVE_LIQUIDITY_UNAVAILABLE",source);
+  return {status:"AVAILABLE" as const,evidence:{contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V2",sanityStatus:"AVAILABLE",poolId:source.poolId,poolKey:key,sqrtPriceX96:source.sqrtPriceX96.toString(),tick:source.tick,activeLiquidity:source.activeLiquidity.toString(),initialized:source.initialized,blockNumber:source.blockNumber.toString(),usableMinimumTick,usableMaximumTick,token0Decimals:source.token0Decimals,token1Decimals:source.token1Decimals}};
+}
+
+function deriveV4ReturnValuationCandidate(input:{token0:string;token1:string;decimals0:number;decimals1:number;amount0:bigint;amount1:bigint;sqrtPriceX96:bigint}){
   const zeroUsd=same(input.token0,robinhoodMainnet.assets.USDG),oneUsd=same(input.token1,robinhoodMainnet.assets.USDG);
   if(zeroUsd===oneUsd||input.sqrtPriceX96<=0n)return {status:"INCOMPLETE" as const,reason:"DIRECT_USDG_PAIR_PRICE_UNAVAILABLE"};
+  if(input.amount0<0n||input.amount1<0n)throw new Error("V4_REALIZED_RETURN_AMOUNT_INVALID");
   pow10(input.decimals0);pow10(input.decimals1);
   const q192=2n**192n,priceSquared=input.sqrtPriceX96*input.sqrtPriceX96;
   const usd0=zeroUsd?rawUsdMicros(input.amount0,input.decimals0,"1"):rounded(input.amount0*priceSquared*USD_SCALE,q192*pow10(input.decimals1));
   const usd1=oneUsd?rawUsdMicros(input.amount1,input.decimals1,"1"):rounded(input.amount1*q192*USD_SCALE,priceSquared*pow10(input.decimals0));
-  return {status:"AVAILABLE" as const,token0UsdMicros:usd0,token1UsdMicros:usd1,totalUsdMicros:usd0+usd1,evidence:{contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",sqrtPriceX96:input.sqrtPriceX96.toString(),token0:input.token0,token1:input.token1,decimals0:input.decimals0,decimals1:input.decimals1,token0Raw:input.amount0.toString(),token1Raw:input.amount1.toString(),token0Usd:usdMicrosToText(usd0),token1Usd:usdMicrosToText(usd1)}};
+  return {status:"CANDIDATE" as const,token0UsdMicros:usd0,token1UsdMicros:usd1,totalUsdMicros:usd0+usd1};
+}
+
+/** Two-stage contract: exact fixed-point math derives a non-canonical
+ * candidate, then structural source validation decides whether it may become
+ * AVAILABLE evidence. Callers persist only this final result. */
+export function valueV4ReturnsFromSqrtPriceX96(input:{token0:string;token1:string;decimals0:number;decimals1:number;amount0:bigint;amount1:bigint;sqrtPriceX96:bigint;source:V4RealizedPoolValuationSource}){
+  const candidate=deriveV4ReturnValuationCandidate(input);if(candidate.status==="INCOMPLETE")return candidate;
+  const sanity=validateV4RealizedPoolValuationSource(input);if(sanity.status==="INCOMPLETE")return sanity;
+  return {status:"AVAILABLE" as const,token0UsdMicros:candidate.token0UsdMicros,token1UsdMicros:candidate.token1UsdMicros,totalUsdMicros:candidate.totalUsdMicros,evidence:{...sanity.evidence,token0:input.token0,token1:input.token1,decimals0:input.decimals0,decimals1:input.decimals1,token0Raw:input.amount0.toString(),token1Raw:input.amount1.toString(),token0Usd:usdMicrosToText(candidate.token0UsdMicros),token1Usd:usdMicrosToText(candidate.token1UsdMicros)}};
+}
+
+const rawEvidenceIdentity=(row:Record<string,unknown>)=>`${row.token0_raw??""}|${row.token1_raw??""}|${row.token0_decimals??""}|${row.token1_decimals??""}|${String(row.transaction_hash??"").toLowerCase()}|${row.block_number??""}`;
+const sha256=(value:string)=>createHash("sha256").update(value).digest("hex");
+export function realizedPnlRawEvidenceChecksum(row:Record<string,unknown>){return sha256(rawEvidenceIdentity(row));}
+
+/** Canonical, CAS-guarded demotion for conclusively invalid historical price
+ * evidence. Economic identity and raw token evidence are immutable; only the
+ * unsupported USD projection is removed. */
+export function repairInvalidV4RealizedPnlValuation(input:{repo:SqliteLedgerRepository;eventId:string;reason:V4PoolValuationSanityFailure;source:V4RealizedPoolValuationSource}){
+  const {repo}=input;
+  return repo.db.transaction(()=>{
+    const row=repo.db.prepare("SELECT * FROM realized_pnl_events WHERE event_id=?").get(input.eventId) as Record<string,unknown>|undefined;
+    if(!row||String(row.protocol)!=="v4")throw new Error("V4_REALIZED_PRICE_SANITY_REPAIR_EVENT_INVALID");
+    const rawEvidenceSha256=realizedPnlRawEvidenceChecksum(row),priorEvidence=String(row.valuation_evidence_json),priorValuationEvidenceSha256=sha256(priorEvidence),repairEvidence={contract:"V4_REALIZED_PNL_PRICE_SANITY_REPAIR_V1",status:"INCOMPLETE",reason:input.reason,rawEvidencePreserved:true,rawEvidenceSha256,priorValuationEvidenceSha256,source:{poolId:input.source.poolId,poolKey:input.source.poolKey,sqrtPriceX96:input.source.sqrtPriceX96.toString(),tick:input.source.tick,activeLiquidity:input.source.activeLiquidity.toString(),initialized:input.source.initialized,blockNumber:input.source.blockNumber.toString(),token0Decimals:input.source.token0Decimals,token1Decimals:input.source.token1Decimals}},evidence=JSON.stringify(repairEvidence),metadata=(()=>{try{return JSON.parse(String(row.presentation_metadata_json??"{}"));}catch{return {};}})();
+    if(String(row.valuation_status)==="INCOMPLETE"){
+      let existing:Record<string,unknown>={};try{existing=JSON.parse(priorEvidence);}catch{}
+      if(existing.contract==="V4_REALIZED_PNL_PRICE_SANITY_REPAIR_V1"&&existing.reason===input.reason&&existing.rawEvidenceSha256===rawEvidenceSha256)return {changed:0,before:row,after:row,rawEvidenceSha256};
+      throw new Error("V4_REALIZED_PRICE_SANITY_REPAIR_STATE_CONFLICT");
+    }
+    if(String(row.valuation_status)!=="AVAILABLE")throw new Error("V4_REALIZED_PRICE_SANITY_REPAIR_STATE_CONFLICT");
+    metadata.returnedValueUsd=null;metadata.valuationUnavailableReason=input.reason;
+    const changed=repo.db.prepare("UPDATE realized_pnl_events SET returned_principal_usd=NULL,newly_realized_fees_usd=NULL,realized_pnl_usd=NULL,valuation_status='INCOMPLETE',valuation_evidence_json=?,presentation_metadata_json=? WHERE event_id=? AND valuation_status='AVAILABLE' AND valuation_evidence_json=?").run(evidence,JSON.stringify(metadata),input.eventId,priorEvidence).changes;
+    if(changed!==1)throw new Error("V4_REALIZED_PRICE_SANITY_REPAIR_CAS_CONFLICT");
+    const after=repo.db.prepare("SELECT * FROM realized_pnl_events WHERE event_id=?").get(input.eventId) as Record<string,unknown>;
+    if(realizedPnlRawEvidenceChecksum(after)!==rawEvidenceSha256)throw new Error("V4_REALIZED_PRICE_SANITY_REPAIR_RAW_EVIDENCE_CONFLICT");
+    return {changed,before:row,after,rawEvidenceSha256};
+  })();
 }
 
 function exactInitialBasis(repo:SqliteLedgerRepository,positionId:string,liquidityBefore:bigint,currentTxHash:string){

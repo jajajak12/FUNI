@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import { keccak256, parseTransaction, recoverTransactionAddress, size, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt, type WalletClient } from 'viem';
 import { sanitizeRpcError, type FallbackRpc } from '@funi/core';
-import type { SqliteLedgerRepository } from '@funi/ledger';
+import { isSqliteTransientLock, withEconomicForegroundPersistenceSync, type EconomicForegroundTelemetry, type SqliteLedgerRepository } from '@funi/ledger';
+
+const json=(value:unknown)=>JSON.stringify(value,(_,item)=>typeof item==='bigint'?item.toString():item);
 
 type PreparedRequest={account:Address;chainId:number;to:Address;data:Hex;value:bigint;gas:bigint;gasPrice:bigint;nonce:number};
 export type DurablePreparedTransaction={workflowId:string;semanticStage:string;attempt:number;expectedHash:Hash;requestFingerprint:string;request:PreparedRequest};
-export type DurableTransactionJournal={load:()=>DurablePreparedTransaction|undefined;persistPrepared:(prepared:DurablePreparedTransaction)=>void;markSubmitted:(hash:Hash)=>void};
+export type DurableTransactionJournal={load:()=>DurablePreparedTransaction|undefined;persistPrepared:(prepared:DurablePreparedTransaction)=>void;markSubmitted:(hash:Hash)=>void;handoffRecovery?:(prepared:DurablePreparedTransaction)=>void};
 export type DurableBroadcastHooks={beforePreparedCommit?:(prepared:DurablePreparedTransaction)=>void|Promise<void>;afterPreparedCommit?:(prepared:DurablePreparedTransaction)=>void|Promise<void>;afterProviderAcceptance?:(hash:Hash)=>void|Promise<void>};
 export type ExactHashEvidence=
  |{kind:'RECEIPT';receipt:TransactionReceipt}
@@ -38,6 +40,15 @@ export async function exactHashEvidence(rpc:FallbackRpc,wallet:Address,hash:Hash
  const direct=(rpc as unknown as {clients?:PublicClient[]}).clients,observations=direct?.length?await Promise.all(direct.map(client=>providerEvidence(client,wallet,hash,expectedNonce))):[await rpc.withClient(client=>providerEvidence(client,wallet,hash,expectedNonce),{stage:'transaction_recovery',method:'eth_getTransactionReceipt+eth_getTransaction+eth_getTransactionCount'})];
  const malformed=observations.find(item=>item.kind==='INCONCLUSIVE');if(malformed?.kind==='INCONCLUSIVE')return malformed;const identity=evidenceIdentity(observations[0]!);if(observations.some(item=>evidenceIdentity(item)!==identity))return {kind:'INCONCLUSIVE',reason:'PROVIDER_DISAGREEMENT'};return observations[0]!;
 }
+const POST_BROADCAST_PROBE_DELAYS_MS=process.env.NODE_ENV==='test'?[0,1,2,4] as const:[0,100,250,500] as const;
+/** A just-accepted hash can trail the send response briefly. Probe only the
+ * authoritative expected hash and stop as soon as it is pending, terminal, or
+ * its nonce is provably consumed. */
+export async function boundedPostBroadcastExactHashProbe(rpc:FallbackRpc,wallet:Address,hash:Hash,nonce:number,sleep:(delayMs:number)=>Promise<void>=(delayMs)=>new Promise(resolve=>setTimeout(resolve,delayMs))):Promise<ExactHashEvidence>{
+ let evidence:ExactHashEvidence={kind:'INCONCLUSIVE',reason:'PROVIDER_ERROR'};
+ for(const delayMs of POST_BROADCAST_PROBE_DELAYS_MS){if(delayMs)await sleep(delayMs);evidence=await exactHashEvidence(rpc,wallet,hash,nonce);if(evidence.kind==='RECEIPT'||evidence.kind==='PENDING'||(evidence.kind==='ABSENT'&&(evidence.latestNonce>nonce||evidence.pendingNonce>nonce)))return evidence;}
+ return evidence;
+}
 const stable=(value:unknown):string=>{if(typeof value==='bigint')return JSON.stringify(value.toString());if(value===null||typeof value!=='object')return JSON.stringify(value);if(Array.isArray(value))return `[${value.map(stable).join(',')}]`;const row=value as Record<string,unknown>;return `{${Object.keys(row).sort().map(key=>`${JSON.stringify(key)}:${stable(row[key])}`).join(',')}}`;};
 export const canonicalRequestFingerprint=(value:unknown)=>createHash('sha256').update(stable(value)).digest('hex');
 export async function signWithConfiguredAccount(walletClient:WalletClient,request:Record<string,unknown>){const signer=walletClient as unknown as {account?:{signTransaction?:unknown};signTransaction(request:Record<string,unknown>):Promise<Hex>};if(!signer.account||typeof signer.account.signTransaction!=='function')throw new Error('LOCAL_SIGNER_REQUIRED');return signer.signTransaction({...request,account:signer.account});}
@@ -65,7 +76,7 @@ function validatePreparedIdentity(input:{workflowId:string;semanticStage:string;
  const request=prepared.request,identity={workflowId:prepared.workflowId,semanticStage:prepared.semanticStage,attempt:prepared.attempt,request};
  if(prepared.workflowId!==input.workflowId||prepared.semanticStage!==input.semanticStage||!Number.isSafeInteger(prepared.attempt)||prepared.attempt<0||request.account.toLowerCase()!==input.wallet.toLowerCase()||request.chainId!==input.chainId||request.to.toLowerCase()!==input.to.toLowerCase()||prepared.requestFingerprint!==canonicalRequestFingerprint(identity))throw new Error('DURABLE_PREPARED_TRANSACTION_METADATA_MISMATCH');
 }
-/** Shared journal-before-broadcast boundary for live paths. The
+/** Shared journal-before-broadcast boundary for non-rebalance live paths. The
  * journal callback must synchronously commit PREPARED or throw; no provider
  * write is attempted until it returns successfully. */
 export async function broadcastDurableTransaction(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;walletClient:WalletClient;wallet:Address;workflowId:string;semanticStage:string;to:Address;data:Hex;estimatedGas:bigint;attempt?:number;journal:DurableTransactionJournal;beforeSigning?:(context:{estimatedGas:bigint;gasLimit:bigint;gasPrice:bigint})=>void|Promise<void>;hooks?:DurableBroadcastHooks}){
@@ -74,35 +85,43 @@ export async function broadcastDurableTransaction(input:{repo:SqliteLedgerReposi
  if(!input.repo.acquireNonceMutex(input.wallet,BigInt(leaseNonce)))throw new Error('DURABLE_TRANSACTION_NONCE_MUTEX_HELD');
  try{
   let prepared=loaded,serialized:Hex,evidence:ExactHashEvidence|undefined;
+  const pending=(value:DurablePreparedTransaction,reason:string)=>new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,value.expectedHash,value.request.nonce,reason);
+  const emitPersistence=(event:EconomicForegroundTelemetry)=>{try{process.stdout.write(json({event:'sqlite_write_window',...event,at:new Date().toISOString()})+'\n');}catch{}};
+  const persistDb=<T>(operation:string,run:()=>T)=>withEconomicForegroundPersistenceSync({databasePath:input.repo.path,component:'durable-economic-transaction',operation,workflow:input.workflowId,semanticStage:input.semanticStage,run,onTelemetry:emitPersistence});
+  const handoff=(value:DurablePreparedTransaction)=>{try{persistDb(`${input.semanticStage.toLowerCase()}_exact_hash_recovery_handoff`,()=>input.journal.handoffRecovery?.(value));}catch{/* The PREPARED journal itself remains the recovery source of truth. */}};
+  const persist=(value:DurablePreparedTransaction,operation:string,run:()=>void)=>{try{return persistDb(operation,run);}catch(error){if(!isSqliteTransientLock(error))throw error;handoff(value);throw pending(value,'SQLITE_BUSY_AFTER_POSSIBLE_BROADCAST');}};
+  const persistEvidence=(value:DurablePreparedTransaction,observed:Extract<ExactHashEvidence,{kind:'RECEIPT'}>|{kind:'NONCE_UNAVAILABLE';latestNonce:number;pendingNonce:number})=>persist(value,`${input.semanticStage.toLowerCase()}_exact_hash_terminal_commit`,()=>{input.repo.reconcileDurableChainTransaction({chainId:input.rpc.config.chainId,wallet:input.wallet,workflowIdentity:input.workflowId,semanticStage:input.semanticStage,attempt:value.attempt,expectedHash:value.expectedHash,evidence:observed.kind==='RECEIPT'?{kind:'RECEIPT',receipt:observed.receipt as unknown as Record<string,unknown>}:{kind:'NONCE_UNAVAILABLE',latestNonce:observed.latestNonce,pendingNonce:observed.pendingNonce}});});
+  const persistSubmitted=(value:DurablePreparedTransaction)=>persist(value,`${input.semanticStage.toLowerCase()}_submitted_commit`,()=>input.journal.markSubmitted(value.expectedHash));
+  const classify=async(value:DurablePreparedTransaction,observed:ExactHashEvidence,providerAccepted:boolean)=>{
+   if(observed.kind==='RECEIPT'){persistEvidence(value,observed);if(observed.receipt.status==='success')persistSubmitted(value);return {hash:value.expectedHash,recovered:Boolean(loaded),receipt:observed.receipt};}
+   if(observed.kind==='PENDING'){persistSubmitted(value);if(!providerAccepted)throw pending(value,'EXACT_HASH_PENDING');return {hash:value.expectedHash,recovered:Boolean(loaded)};}
+   // An exact provider acceptance is positive evidence for this payload. A
+   // lagging hash endpoint plus an advanced pending/latest count cannot yet
+   // distinguish this transaction from a conflicting consumer, so retain
+   // SUBMITTED and let exact-hash recovery decide; never misclassify it failed.
+   if(providerAccepted){persistSubmitted(value);return {hash:value.expectedHash,recovered:Boolean(loaded)};}
+   if(observed.kind==='ABSENT'&&(observed.latestNonce>value.request.nonce||observed.pendingNonce>value.request.nonce)){persistEvidence(value,{kind:'NONCE_UNAVAILABLE',latestNonce:observed.latestNonce,pendingNonce:observed.pendingNonce});throw new Error('DURABLE_TRANSACTION_EXACT_HASH_ABSENT_NONCE_UNAVAILABLE');}
+   handoff(value);throw pending(value,observed.kind==='INCONCLUSIVE'?observed.reason:'EXACT_HASH_ABSENT_NONCE_AVAILABLE');
+  };
   if(prepared){
    validatePreparedIdentity({...input,chainId:input.rpc.config.chainId},prepared);
-   evidence=await exactHashEvidence(input.rpc,input.wallet,prepared.expectedHash,prepared.request.nonce);
-   if(evidence.kind==='INCONCLUSIVE')throw new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,prepared.expectedHash,prepared.request.nonce,evidence.reason);
-   if(evidence.kind==='RECEIPT'){input.repo.reconcileDurableChainTransaction({chainId:input.rpc.config.chainId,wallet:input.wallet,workflowIdentity:input.workflowId,semanticStage:input.semanticStage,attempt:prepared.attempt,expectedHash:prepared.expectedHash,evidence:{kind:'RECEIPT',receipt:evidence.receipt as unknown as Record<string,unknown>}});if(evidence.receipt.status==='success')input.journal.markSubmitted(prepared.expectedHash);return {hash:prepared.expectedHash,recovered:true,receipt:evidence.receipt};}
-   if(evidence.kind==='PENDING'){input.journal.markSubmitted(prepared.expectedHash);throw new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,prepared.expectedHash,prepared.request.nonce,'EXACT_HASH_PENDING');}
-   if(evidence.latestNonce>prepared.request.nonce){input.repo.reconcileDurableChainTransaction({chainId:input.rpc.config.chainId,wallet:input.wallet,workflowIdentity:input.workflowId,semanticStage:input.semanticStage,attempt:prepared.attempt,expectedHash:prepared.expectedHash,evidence:{kind:'NONCE_UNAVAILABLE',latestNonce:evidence.latestNonce,pendingNonce:evidence.pendingNonce}});throw new Error('DURABLE_TRANSACTION_EXACT_HASH_ABSENT_NONCE_UNAVAILABLE');}
-   if(evidence.pendingNonce>prepared.request.nonce)throw new Error('DURABLE_TRANSACTION_EXACT_HASH_ABSENT_NONCE_UNAVAILABLE');
+   evidence=await boundedPostBroadcastExactHashProbe(input.rpc,input.wallet,prepared.expectedHash,prepared.request.nonce);
+   if(evidence.kind==='RECEIPT'||evidence.kind==='PENDING'||(evidence.kind==='ABSENT'&&(evidence.latestNonce>prepared.request.nonce||evidence.pendingNonce>prepared.request.nonce)))return await classify(prepared,evidence,false);
    if(prepared.request.data.toLowerCase()!==input.data.toLowerCase())throw new Error('DURABLE_PREPARED_TRANSACTION_METADATA_MISMATCH');
-   throw new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,prepared.expectedHash,prepared.request.nonce,'EXACT_HASH_ABSENT_NONCE_AVAILABLE');
+   handoff(prepared);throw pending(prepared,evidence.kind==='INCONCLUSIVE'?evidence.reason:'EXACT_HASH_ABSENT_NONCE_AVAILABLE');
   }else{
    const [observedGasPrice,nonce]=await input.rpc.withClient(client=>Promise.all([client.getGasPrice(),client.getTransactionCount({address:input.wallet,blockTag:'pending'})]),{stage:'durable_transaction_prebroadcast',method:'eth_gasPrice+eth_getTransactionCount'}),gasPrice=bufferedBroadcastGasPrice(observedGasPrice),gasLimit=input.estimatedGas*12n/10n;
    await input.beforeSigning?.({estimatedGas:input.estimatedGas,gasLimit,gasPrice});
    const request:PreparedRequest={account:input.wallet,chainId:input.rpc.config.chainId,to:input.to,data:input.data,value:0n,gas:gasLimit,gasPrice,nonce},attempt=input.attempt??0;
    serialized=await signWithConfiguredAccount(input.walletClient,request);const expectedHash=keccak256(serialized),identity={workflowId:input.workflowId,semanticStage:input.semanticStage,attempt,request};prepared={...identity,expectedHash,requestFingerprint:canonicalRequestFingerprint(identity)};
    await input.hooks?.beforePreparedCommit?.(prepared);
-   input.journal.persistPrepared(prepared);
+   persistDb(`${input.semanticStage.toLowerCase()}_prepared_commit`,()=>input.journal.persistPrepared(prepared!));
    await input.hooks?.afterPreparedCommit?.(prepared);
   }
-  try{await broadcastSignedTransaction({walletClient:input.walletClient,serializedTransaction:serialized,expectedHash:prepared.expectedHash,expectedSender:input.wallet,expectedChainId:input.rpc.config.chainId,expectedNonce:prepared.request.nonce});}
-  catch{
-   evidence=await exactHashEvidence(input.rpc,input.wallet,prepared.expectedHash,prepared.request.nonce);
-   if(evidence.kind==='RECEIPT'){input.repo.reconcileDurableChainTransaction({chainId:input.rpc.config.chainId,wallet:input.wallet,workflowIdentity:input.workflowId,semanticStage:input.semanticStage,attempt:prepared.attempt,expectedHash:prepared.expectedHash,evidence:{kind:'RECEIPT',receipt:evidence.receipt as unknown as Record<string,unknown>}});if(evidence.receipt.status==='success')input.journal.markSubmitted(prepared.expectedHash);return {hash:prepared.expectedHash,recovered:true,receipt:evidence.receipt};}
-   if(evidence.kind==='PENDING'){input.journal.markSubmitted(prepared.expectedHash);throw new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,prepared.expectedHash,prepared.request.nonce,'EXACT_HASH_PENDING');}
-   if(evidence.kind==='ABSENT'&&evidence.latestNonce>prepared.request.nonce){input.repo.reconcileDurableChainTransaction({chainId:input.rpc.config.chainId,wallet:input.wallet,workflowIdentity:input.workflowId,semanticStage:input.semanticStage,attempt:prepared.attempt,expectedHash:prepared.expectedHash,evidence:{kind:'NONCE_UNAVAILABLE',latestNonce:evidence.latestNonce,pendingNonce:evidence.pendingNonce}});throw new Error('DURABLE_TRANSACTION_EXACT_HASH_ABSENT_NONCE_UNAVAILABLE');}
-   throw new DurableTransactionReconciliationPendingError(input.workflowId,input.semanticStage,prepared.expectedHash,prepared.request.nonce,evidence.kind==='INCONCLUSIVE'?evidence.reason:'EXACT_HASH_ABSENT_NONCE_AVAILABLE');
-  }
-  await input.hooks?.afterProviderAcceptance?.(prepared.expectedHash);
-  input.journal.markSubmitted(prepared.expectedHash);
-  return {hash:prepared.expectedHash,recovered:Boolean(loaded)};
+  let accepted=false;try{await broadcastSignedTransaction({walletClient:input.walletClient,serializedTransaction:serialized,expectedHash:prepared.expectedHash,expectedSender:input.wallet,expectedChainId:input.rpc.config.chainId,expectedNonce:prepared.request.nonce});accepted=true;}catch{/* Exact-hash evidence, never a second send, decides the outcome below. */}
+  evidence=await boundedPostBroadcastExactHashProbe(input.rpc,input.wallet,prepared.expectedHash,prepared.request.nonce);
+  const result=await classify(prepared,evidence,accepted);
+  if(accepted)await input.hooks?.afterProviderAcceptance?.(prepared.expectedHash);
+  return result;
  }finally{input.repo.releaseNonceMutex(input.wallet);}
 }

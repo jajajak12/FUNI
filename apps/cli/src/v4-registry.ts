@@ -1,6 +1,6 @@
 import { getAddress, type Address } from 'viem';
 import { inspectErc20, priceFromSqrtX96, robinhoodMainnet, type FallbackRpc } from '@funi/core';
-import type { SqliteLedgerRepository } from '@funi/ledger';
+import { EconomicForegroundDemandActiveError, waitForEconomicForegroundDemandToClear, withSqliteTransientRetrySync, type SqliteLedgerRepository } from '@funi/ledger';
 import { trustedV4PoolUsdMetric } from './v4-liquidity-display.js';
 import {
   auditRobinhoodV4Deployments, buildGenericV4SingleSidedDownsidePlan, classifyV4Hooks, decodeV4Fee,
@@ -11,6 +11,9 @@ export const V4_REGISTRY_CHAIN_ID=4663;
 export const DEFAULT_V4_REGISTRY_WINDOW=50_000;
 export const DEFAULT_V4_REGISTRY_OVERLAP=12;
 export const DEFAULT_V4_CONFIRMATIONS=2;
+export const V4_REGISTRY_WRITER_ROWS_PER_WINDOW=1;
+const V4_REGISTRY_BACKGROUND_BUSY_TIMEOUT_MS=25;
+const V4_REGISTRY_BACKGROUND_RETRY_BUDGET_MS=750;
 export type V4RegistryReader=(fromBlock:bigint,toBlock:bigint)=>Promise<V4InitializeEvent[]>;
 export type V4Valuation={status:'available';estimatedTvlUsd:number;provenance:string}|{status:'unavailable';reason:string;provenance:string};
 export type V4Candidate={
@@ -47,27 +50,40 @@ async function defaultReader(rpc:FallbackRpc,from:bigint,to:bigint){
  }
  throw failure;
 }
+async function yieldToPriorityPersistence(repo:SqliteLedgerRepository,operation:string,onEvent?:(name:string,data:Record<string,unknown>)=>void){
+ const result=await waitForEconomicForegroundDemandToClear({databasePath:repo.path,component:'funi-v4-registry-worker',operation,onTelemetry:event=>onEvent?.('sqlite_write_window',event)});
+ if(!result.cleared)throw new EconomicForegroundDemandActiveError(repo.path);
+}
+function registryBackgroundWrite<T>(repo:SqliteLedgerRepository,operation:string,run:()=>T,onEvent?:(name:string,data:Record<string,unknown>)=>void){
+ const prior=Number(repo.db.pragma('busy_timeout',{simple:true})),started=Date.now();let retryCount=0,value:T|undefined,completed=false;
+ repo.db.pragma(`busy_timeout=${V4_REGISTRY_BACKGROUND_BUSY_TIMEOUT_MS}`);
+ try{value=withSqliteTransientRetrySync({operation,run,maxAttempts:5,maxTotalRetryMs:V4_REGISTRY_BACKGROUND_RETRY_BUDGET_MS,onEvent:event=>{if(event.finalDisposition==='RETRYING')retryCount++;onEvent?.('v4_registry_sqlite_transient_lock',event);}});completed=true;return value;}
+ finally{repo.db.pragma(`busy_timeout=${prior}`);const changes=typeof value==='number'?value:value&&typeof value==='object'&&typeof (value as {changes?:unknown}).changes==='number'?Number((value as unknown as {changes:number}).changes):typeof value==='boolean'?Number(value):null;const durationMs=Date.now()-started;if(operation.includes('cursor')||changes!==0||retryCount>0||durationMs>=100)onEvent?.('sqlite_write_window',{process:String(process.pid),component:'funi-v4-registry-worker',operation,persistenceClass:'background',economicDemandPresent:false,priorityAcquisitionLatencyMs:0,waitYieldDurationMs:0,writerWindowDurationMs:durationMs,rowChangeCount:changes,retryCount,outcome:completed?'SUCCEEDED':'FAILED'});}
+}
 
 /** Restart-safe incremental sync. The overlap is applied once per run and each RPC request is bounded. */
 export async function syncV4PoolRegistry(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;toBlock?:bigint;confirmations?:number;reader?:V4RegistryReader;onEvent?:(name:string,data:Record<string,unknown>)=>void}){
  const started=Date.now(),fallbackBefore=input.rpc.metrics?.fallbackUses??0,cursor=input.repo.v4RegistryCursor();
  if(!cursor)throw new Error('V4_REGISTRY_CURSOR_NOT_INITIALIZED: run v4-pool-registry-bootstrap with explicit bounds');
  const latest=input.toBlock??await input.rpc.withClient(c=>c.getBlockNumber()),confirmations=BigInt(input.confirmations??DEFAULT_V4_CONFIRMATIONS),target=latest>confirmations?latest-confirmations:0n,next=BigInt(String(cursor.next_block)),overlap=BigInt(Number(cursor.overlap_blocks)),window=BigInt(Number(cursor.window_size));
- let from=next>overlap?next-overlap:0n,inserted=0,updated=0,windows=0;
- input.repo.startV4RegistrySync(latest);input.onEvent?.('v4_registry_sync_start',{cursor:next.toString(),fromBlock:from.toString(),targetBlock:target.toString(),windowSize:window.toString()});
+ let from=next>overlap?next-overlap:0n,inserted=0,updated=0,skipped=0,windows=0,writerWindows=0,maxWriterWindowMs=0,fallbackRecorded=0;
+ input.onEvent?.('v4_registry_sync_start',{cursor:next.toString(),fromBlock:from.toString(),targetBlock:target.toString(),windowSize:window.toString(),writerRowsPerWindow:V4_REGISTRY_WRITER_ROWS_PER_WINDOW});
  try{
   while(from<=target){
    const to=from+window-1n<target?from+window-1n:target;input.onEvent?.('v4_registry_window',{fromBlock:from.toString(),toBlock:to.toString()});
    const events=await (input.reader?input.reader(from,to):defaultReader(input.rpc,from,to));
-   // Each pool upsert is independently atomic and the cursor advances only after
-   // the whole window succeeds. A crash therefore replays the idempotent window
-   // without holding SQLite's single WAL writer for the entire event batch.
-   for(const event of events){const existed=!!input.repo.v4RegistryPool(event.id);input.repo.upsertV4RegistryPool(eventRecord(event));existed?updated++:inserted++;}
-   input.repo.advanceV4RegistryCursor(to+1n);windows++;from=to+1n;
+   // A single registry row is the measured writer budget. RPC is complete before
+   // persistence, and every autocommit releases SQLite's writer before the next
+   // event. Crash replay is idempotent because unchanged canonical rows do not write.
+   for(const event of events){
+    const existed=!!input.repo.v4RegistryPool(event.id);await yieldToPriorityPersistence(input.repo,'v4_registry_pool_persist',input.onEvent);const writeStarted=Date.now(),changed=registryBackgroundWrite(input.repo,'v4_registry_pool_persist',()=>input.repo.persistV4RegistryPool(eventRecord(event)),input.onEvent),heldMs=Date.now()-writeStarted;if(!changed)skipped++;else{writerWindows++;maxWriterWindowMs=Math.max(maxWriterWindowMs,heldMs);if(existed)updated++;else inserted++;}await sleep(0);
+   }
+   await yieldToPriorityPersistence(input.repo,'v4_registry_cursor_commit',input.onEvent);const cursorStarted=Date.now(),fallbackUses=(input.rpc.metrics?.fallbackUses??fallbackBefore)-fallbackBefore;
+   registryBackgroundWrite(input.repo,'v4_registry_cursor_commit',()=>input.repo.commitV4RegistryWindow({nextBlock:to+1n,chainBlock:latest,syncStartedAtMs:started,syncDurationMs:Date.now()-started,fallbackUses:fallbackUses-fallbackRecorded}),input.onEvent);fallbackRecorded=fallbackUses;writerWindows++;maxWriterWindowMs=Math.max(maxWriterWindowMs,Date.now()-cursorStarted);windows++;from=to+1n;
   }
-  const fallbackUses=(input.rpc.metrics?.fallbackUses??fallbackBefore)-fallbackBefore;input.repo.finishV4RegistrySync({durationMs:Date.now()-started,fallbackUses});input.onEvent?.('v4_registry_sync_end',{windows,inserted,updated,durationMs:Date.now()-started,rpcProvider:fallbackUses?'fallback_used':'primary',fallbackUses});
-  return {chainId:V4_REGISTRY_CHAIN_ID,fromBlock:(next>overlap?next-overlap:0n),toBlock:target,nextBlock:target+1n,windows,inserted,updated,durationMs:Date.now()-started,fallbackUses,mainnetTransactionsSent:0};
- }catch(error){const fallbackUses=(input.rpc.metrics?.fallbackUses??fallbackBefore)-fallbackBefore;input.repo.finishV4RegistrySync({durationMs:Date.now()-started,error:errorText(error),fallbackUses});input.onEvent?.('v4_registry_sync_end',{error:errorText(error),durationMs:Date.now()-started,fallbackUses});throw error;}
+  const fallbackUses=(input.rpc.metrics?.fallbackUses??fallbackBefore)-fallbackBefore;input.onEvent?.('v4_registry_sync_end',{windows,inserted,updated,skipped,writerWindows,maxWriterWindowMs,writerRowsPerWindow:V4_REGISTRY_WRITER_ROWS_PER_WINDOW,durationMs:Date.now()-started,rpcProvider:fallbackUses?'fallback_used':'primary',fallbackUses});
+  return {chainId:V4_REGISTRY_CHAIN_ID,fromBlock:(next>overlap?next-overlap:0n),toBlock:target,nextBlock:target+1n,windows,inserted,updated,skipped,writerWindows,maxWriterWindowMs,writerRowsPerWindow:V4_REGISTRY_WRITER_ROWS_PER_WINDOW,durationMs:Date.now()-started,fallbackUses,mainnetTransactionsSent:0};
+ }catch(error){const fallbackUses=(input.rpc.metrics?.fallbackUses??fallbackBefore)-fallbackBefore;if(!/SQLITE_BUSY|database is locked/i.test(errorText(error)))registryBackgroundWrite(input.repo,'v4_registry_failure_status',()=>input.repo.finishV4RegistrySync({durationMs:Date.now()-started,error:errorText(error),fallbackUses:fallbackUses-fallbackRecorded}),input.onEvent);input.onEvent?.('v4_registry_sync_end',{error:errorText(error),durationMs:Date.now()-started,fallbackUses});throw error;}
 }
 
 /** Explicit one-time bootstrap. Both bounds are mandatory; startup never calls this. */
@@ -109,7 +125,7 @@ export function persistV4RegistryPoolBatch(input:{repo:SqliteLedgerRepository;re
  return {refreshed,failed:input.result.failed,multicallPoolCount:input.result.multicallPoolCount};
 }
 export async function refreshV4RegistryPoolBatch(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;poolIds:string[]}){
- const plan=planV4RegistryPoolBatch(input),result=await fetchV4RegistryPoolBatch({rpc:input.rpc,plan});return persistV4RegistryPoolBatch({repo:input.repo,result});
+ const plan=planV4RegistryPoolBatch(input),result=await fetchV4RegistryPoolBatch({rpc:input.rpc,plan});await yieldToPriorityPersistence(input.repo,'v4_registry_refresh_batch_persist');return persistV4RegistryPoolBatch({repo:input.repo,result});
 }
 function feeLabel(fee:ReturnType<typeof decodeV4Fee>){return fee.dynamicFee?'dynamic fee':fee.displayedFeePercent===null?'unknown fee':`${fee.displayedFeePercent.toFixed(4).replace(/0+$/,'').replace(/\.$/,'')}%`;}
 

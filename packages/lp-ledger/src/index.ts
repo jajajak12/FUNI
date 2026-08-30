@@ -462,6 +462,361 @@ const DIRECTORY_MODE = 0o700,
 export const SQLITE_DEFAULT_BUSY_TIMEOUT_MS = 10_000;
 export const SQLITE_RUNTIME_BUSY_TIMEOUT_MS = 250;
 export const SQLITE_TRANSIENT_RETRY_BUDGET_MS = 1_500;
+export const ECONOMIC_FOREGROUND_RETRY_BUDGET_MS = 3_000;
+export const ECONOMIC_FOREGROUND_MARKER_TTL_MS = 5_000;
+const ECONOMIC_FOREGROUND_MARKER_VERSION = 1,
+  ECONOMIC_FOREGROUND_MARKER_LIMIT = 128,
+  ECONOMIC_FOREGROUND_MARKER_NAME = /^fg-(\d+)-([0-9a-f-]{36})\.json$/,
+  ECONOMIC_FOREGROUND_TEMP_NAME = /^\.fg-(\d+)-([0-9a-f-]{36})\.tmp$/;
+export type EconomicForegroundTelemetry = {
+  process: string;
+  component: string;
+  operation: string;
+  persistenceClass: "foreground" | "background";
+  workflow?: string;
+  semanticStage?: string;
+  economicDemandPresent: boolean;
+  priorityAcquisitionLatencyMs: number;
+  waitYieldDurationMs: number;
+  writerWindowDurationMs: number;
+  rowChangeCount: number | null;
+  retryCount: number;
+  outcome: "SUCCEEDED" | "FAILED" | "DEFERRED";
+};
+type EconomicForegroundMarker = {
+  version: 1;
+  databaseIdentity: string;
+  ownerId: string;
+  processId: number;
+  component: string;
+  operation: string;
+  workflow?: string;
+  semanticStage?: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  monotonicStartedNs: string;
+};
+export type EconomicForegroundDemandInspection = {
+  demandPresent: boolean;
+  liveOwnerCount: number;
+  nextExpiryAtMs: number | null;
+  staleOwnerCount: number;
+};
+export class EconomicForegroundDemandActiveError extends Error {
+  constructor(public readonly databasePath: string) {
+    super("ECONOMIC_FOREGROUND_DEMAND_ACTIVE");
+    this.name = "EconomicForegroundDemandActiveError";
+  }
+}
+const economicForegroundScopes = new Map<
+  string,
+  { depth: number; release: () => void }
+>();
+const economicForegroundDatabaseIdentity = (databasePath: string) =>
+  createHash("sha256").update(resolve(databasePath)).digest("hex").slice(0, 24);
+export const economicForegroundMarkerDirectory = (databasePath: string) =>
+  join(
+    dirname(resolve(databasePath)),
+    ".sqlite-economic-foreground",
+    economicForegroundDatabaseIdentity(databasePath),
+  );
+function validEconomicForegroundMarker(
+  value: unknown,
+  databaseIdentity: string,
+): value is EconomicForegroundMarker {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Partial<EconomicForegroundMarker>;
+  return (
+    row.version === ECONOMIC_FOREGROUND_MARKER_VERSION &&
+    row.databaseIdentity === databaseIdentity &&
+    typeof row.ownerId === "string" &&
+    row.ownerId.length > 0 &&
+    row.ownerId.length <= 160 &&
+    Number.isSafeInteger(row.processId) &&
+    typeof row.component === "string" &&
+    Number.isFinite(row.createdAtMs) &&
+    Number.isFinite(row.expiresAtMs) &&
+    row.expiresAtMs! > row.createdAtMs! &&
+    row.expiresAtMs! - row.createdAtMs! <= 10_000 &&
+    typeof row.monotonicStartedNs === "string" &&
+    /^\d+$/.test(row.monotonicStartedNs)
+  );
+}
+function economicForegroundMarkerRows(databasePath: string, nowMs: number) {
+  const directory = economicForegroundMarkerDirectory(databasePath),
+    databaseIdentity = economicForegroundDatabaseIdentity(databasePath),
+    rows: Array<{
+      path: string;
+      marker?: EconomicForegroundMarker;
+      live: boolean;
+    }> = [];
+  let names: string[];
+  try {
+    names = readdirSync(directory).slice(0, ECONOMIC_FOREGROUND_MARKER_LIMIT);
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return rows;
+    throw error;
+  }
+  for (const name of names) {
+    if (!ECONOMIC_FOREGROUND_MARKER_NAME.test(name)) continue;
+    const path = join(directory, name);
+    try {
+      const raw = readFileSync(path, "utf8");
+      if (raw.length > 4096) {
+        rows.push({ path, live: false });
+        continue;
+      }
+      const marker = JSON.parse(raw) as unknown;
+      if (!validEconomicForegroundMarker(marker, databaseIdentity)) {
+        rows.push({ path, live: false });
+        continue;
+      }
+      rows.push({ path, marker, live: marker.expiresAtMs > nowMs });
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT")
+        rows.push({ path, live: false });
+    }
+  }
+  return rows;
+}
+/** Read-only, bounded cross-process foreground-demand inspection. */
+export function inspectEconomicForegroundDemand(
+  databasePath: string,
+  nowMs = Date.now(),
+): EconomicForegroundDemandInspection {
+  const rows = economicForegroundMarkerRows(databasePath, nowMs),
+    live = rows.filter((row) => row.live && row.marker);
+  return {
+    demandPresent: live.length > 0,
+    liveOwnerCount: live.length,
+    nextExpiryAtMs: live.length
+      ? Math.min(...live.map((row) => row.marker!.expiresAtMs))
+      : null,
+    staleOwnerCount: rows.length - live.length,
+  };
+}
+function cleanupStaleEconomicForegroundMarkers(
+  databasePath: string,
+  nowMs = Date.now(),
+) {
+  const directory = economicForegroundMarkerDirectory(databasePath);
+  for (const row of economicForegroundMarkerRows(databasePath, nowMs)) {
+    if (row.live) continue;
+    try {
+      unlinkSync(row.path);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+    }
+  }
+  // An owner can crash between writing its private temp file and atomic rename.
+  let names: string[] = [];
+  try {
+    names = readdirSync(directory).slice(0, ECONOMIC_FOREGROUND_MARKER_LIMIT);
+  } catch (error) {
+    if ((error as { code?: string }).code !== "ENOENT") throw error;
+  }
+  for (const name of names) {
+    if (!ECONOMIC_FOREGROUND_TEMP_NAME.test(name)) continue;
+    const path = join(directory, name);
+    try {
+      if (nowMs - statSync(path).mtimeMs > 10_000) unlinkSync(path);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+    }
+  }
+}
+export function acquireEconomicForegroundDemand(input: {
+  databasePath: string;
+  component: string;
+  operation: string;
+  workflow?: string;
+  semanticStage?: string;
+  ttlMs?: number;
+  nowMs?: number;
+}) {
+  const databasePath = resolve(input.databasePath),
+    directory = economicForegroundMarkerDirectory(databasePath),
+    databaseIdentity = economicForegroundDatabaseIdentity(databasePath),
+    nowMs = input.nowMs ?? Date.now(),
+    ttlMs = Math.max(100, Math.min(10_000, input.ttlMs ?? ECONOMIC_FOREGROUND_MARKER_TTL_MS)),
+    id = randomUUID(),
+    ownerId = `${process.pid}:${id}`,
+    finalPath = join(directory, `fg-${process.pid}-${id}.json`),
+    tempPath = join(directory, `.fg-${process.pid}-${id}.tmp`),
+    marker: EconomicForegroundMarker = {
+      version: ECONOMIC_FOREGROUND_MARKER_VERSION,
+      databaseIdentity,
+      ownerId,
+      processId: process.pid,
+      component: input.component.slice(0, 128),
+      operation: input.operation.slice(0, 160),
+      ...(input.workflow ? { workflow: input.workflow.slice(0, 160) } : {}),
+      ...(input.semanticStage
+        ? { semanticStage: input.semanticStage.slice(0, 160) }
+        : {}),
+      createdAtMs: nowMs,
+      expiresAtMs: nowMs + ttlMs,
+      monotonicStartedNs: process.hrtime.bigint().toString(),
+    };
+  secureDirectory(directory);
+  writeFileSync(tempPath, deterministicTelemetryJson(marker), {
+    encoding: "utf8",
+    mode: FILE_MODE,
+    flag: "wx",
+  });
+  renameSync(tempPath, finalPath);
+  cleanupStaleEconomicForegroundMarkers(databasePath, nowMs);
+  let released = false;
+  return {
+    ownerId,
+    path: finalPath,
+    expiresAtMs: marker.expiresAtMs,
+    release: () => {
+      if (released) return;
+      released = true;
+      try {
+        unlinkSync(finalPath);
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
+      }
+    },
+  };
+}
+function inferredRowChangeCount(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const changes = (value as { changes?: unknown }).changes;
+  return typeof changes === "number" && Number.isFinite(changes) ? changes : null;
+}
+/** Canonical economic DB boundary: publish demand without SQLite, retry only
+ * the short persistence callback, then release before any RPC or receipt wait. */
+export function withEconomicForegroundPersistenceSync<T>(input: {
+  databasePath: string;
+  component: string;
+  operation: string;
+  workflow?: string;
+  semanticStage?: string;
+  run: () => T;
+  onTelemetry?: (event: EconomicForegroundTelemetry) => void;
+}): T {
+  const databasePath = resolve(input.databasePath),
+    nested = economicForegroundScopes.get(databasePath);
+  if (nested) {
+    nested.depth++;
+    try {
+      return input.run();
+    } finally {
+      nested.depth--;
+    }
+  }
+  const priorityStarted = Date.now(),
+    marker = acquireEconomicForegroundDemand(input),
+    acquiredAt = Date.now(),
+    scope = { depth: 1, release: marker.release };
+  economicForegroundScopes.set(databasePath, scope);
+  let retries = 0,
+    outcome: EconomicForegroundTelemetry["outcome"] = "FAILED",
+    value: T | undefined,
+    writerStarted = Date.now();
+  try {
+    value = withSqliteTransientRetrySync({
+      operation: input.operation,
+      maxAttempts: 7,
+      maxTotalRetryMs: ECONOMIC_FOREGROUND_RETRY_BUDGET_MS,
+      run: input.run,
+      onEvent: (event) => {
+        if (event.finalDisposition === "RETRYING") retries++;
+      },
+    });
+    outcome = "SUCCEEDED";
+    return value;
+  } finally {
+    const writerWindowDurationMs = Date.now() - writerStarted;
+    economicForegroundScopes.delete(databasePath);
+    marker.release();
+    const telemetry: EconomicForegroundTelemetry = {
+      process: String(process.pid),
+      component: input.component,
+      operation: input.operation,
+      persistenceClass: "foreground",
+      ...(input.workflow ? { workflow: input.workflow } : {}),
+      ...(input.semanticStage ? { semanticStage: input.semanticStage } : {}),
+      economicDemandPresent: true,
+      priorityAcquisitionLatencyMs: acquiredAt - priorityStarted,
+      waitYieldDurationMs: 0,
+      writerWindowDurationMs,
+      rowChangeCount: inferredRowChangeCount(value),
+      retryCount: retries,
+      outcome,
+    };
+    if (input.onTelemetry) input.onTelemetry(telemetry);
+    else try { process.stdout.write(deterministicTelemetryJson({event:"sqlite_write_window",...telemetry,at:new Date().toISOString()})+"\n"); } catch {}
+  }
+}
+export async function waitForEconomicForegroundDemandToClear(input: {
+  databasePath: string;
+  component: string;
+  operation: string;
+  maxWaitMs?: number;
+  pollMs?: number;
+  sleep?: (delayMs: number) => Promise<void>;
+  onTelemetry?: (event: EconomicForegroundTelemetry) => void;
+}) {
+  const started = Date.now(),
+    maxWaitMs = Math.max(0, Math.min(10_000, input.maxWaitMs ?? 5_250)),
+    pollMs = Math.max(5, Math.min(250, input.pollMs ?? 25)),
+    sleep = input.sleep ?? ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  let first = true,
+    demandPresent = false;
+  for (;;) {
+    const inspection = inspectEconomicForegroundDemand(input.databasePath);
+    demandPresent ||= inspection.demandPresent;
+    if (!inspection.demandPresent) {
+      const waited = Date.now() - started;
+      if (demandPresent)
+        input.onTelemetry?.({process:String(process.pid),component:input.component,operation:input.operation,persistenceClass:"background",economicDemandPresent:true,priorityAcquisitionLatencyMs:0,waitYieldDurationMs:waited,writerWindowDurationMs:0,rowChangeCount:null,retryCount:Math.max(0,Math.ceil(waited/pollMs)-1),outcome:"SUCCEEDED"});
+      return { cleared: true, demandPresent, waitedMs: waited };
+    }
+    const elapsed = Date.now() - started;
+    if (!first && elapsed >= maxWaitMs) {
+      input.onTelemetry?.({process:String(process.pid),component:input.component,operation:input.operation,persistenceClass:"background",economicDemandPresent:true,priorityAcquisitionLatencyMs:0,waitYieldDurationMs:elapsed,writerWindowDurationMs:0,rowChangeCount:null,retryCount:Math.max(0,Math.ceil(elapsed/pollMs)-1),outcome:"DEFERRED"});
+      return { cleared: false, demandPresent: true, waitedMs: elapsed };
+    }
+    first = false;
+    await sleep(Math.min(pollMs, Math.max(1, maxWaitMs - elapsed)));
+  }
+}
+export function waitForEconomicForegroundDemandToClearSync(input: {
+  databasePath: string;
+  component: string;
+  operation: string;
+  maxWaitMs?: number;
+  pollMs?: number;
+  onTelemetry?: (event: EconomicForegroundTelemetry) => void;
+}) {
+  const sleepArray = new Int32Array(new SharedArrayBuffer(4)),
+    started = Date.now(),
+    maxWaitMs = Math.max(0, Math.min(10_000, input.maxWaitMs ?? 5_250)),
+    pollMs = Math.max(5, Math.min(250, input.pollMs ?? 25));
+  let first = true,
+    demandPresent = false;
+  for (;;) {
+    const inspection = inspectEconomicForegroundDemand(input.databasePath);
+    demandPresent ||= inspection.demandPresent;
+    if (!inspection.demandPresent) {
+      const waited = Date.now() - started;
+      if (demandPresent)
+        input.onTelemetry?.({process:String(process.pid),component:input.component,operation:input.operation,persistenceClass:"background",economicDemandPresent:true,priorityAcquisitionLatencyMs:0,waitYieldDurationMs:waited,writerWindowDurationMs:0,rowChangeCount:null,retryCount:Math.max(0,Math.ceil(waited/pollMs)-1),outcome:"SUCCEEDED"});
+      return { cleared: true, demandPresent, waitedMs: waited };
+    }
+    const elapsed = Date.now() - started;
+    if (!first && elapsed >= maxWaitMs) {
+      input.onTelemetry?.({process:String(process.pid),component:input.component,operation:input.operation,persistenceClass:"background",economicDemandPresent:true,priorityAcquisitionLatencyMs:0,waitYieldDurationMs:elapsed,writerWindowDurationMs:0,rowChangeCount:null,retryCount:Math.max(0,Math.ceil(elapsed/pollMs)-1),outcome:"DEFERRED"});
+      return { cleared: false, demandPresent: true, waitedMs: elapsed };
+    }
+    first = false;
+    Atomics.wait(sleepArray, 0, 0, Math.min(pollMs, Math.max(1, maxWaitMs - elapsed)));
+  }
+}
 export type SqliteTransientDisposition = "RETRYING" | "RECOVERED" | "DEFERRED";
 export type SqliteTransientEvent = {
   operation: string;
@@ -674,9 +1029,15 @@ function configure(
   db: Database.Database,
   busyTimeoutMs = SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
 ) {
-  db.pragma("foreign_keys = ON");
-  db.pragma("journal_mode = WAL");
+  // Every short-lived repository connection passes through this function. Set
+  // the bounded wait policy before any pragma that can need a lock, and avoid
+  // re-requesting WAL mode once the database is already in WAL. Reissuing the
+  // mutating journal_mode pragma made Telegram foreground opens wait behind a
+  // long-lived recovery connection before the 250 ms runtime timeout applied.
   db.pragma(`busy_timeout = ${busyTimeoutMs}`);
+  db.pragma("foreign_keys = ON");
+  const journalMode = String(db.pragma("journal_mode", { simple: true })).toLowerCase();
+  if (journalMode !== "wal") db.pragma("journal_mode = WAL");
 }
 /** Durable JSON boundary: exact BigInt decimal strings, including nested arrays/objects. */
 export function jsonStringify(value: unknown) {
@@ -3437,7 +3798,7 @@ export class SqliteLedgerRepository {
     projectedGasUsd?: number;
   }) {
     const at = new Date().toISOString();
-    return this.db.transaction(() => {
+    return withEconomicForegroundPersistenceSync({databasePath:this.path,component:"chain-transaction-journal",operation:`${input.semanticStage.toLowerCase()}_prepared_commit`,workflow:input.workflowIdentity,semanticStage:input.semanticStage,run:()=>this.db.transaction(() => {
       const existing = this.db
         .prepare(
           "SELECT * FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage=? AND attempt=?",
@@ -3498,7 +3859,7 @@ export class SqliteLedgerRepository {
           "SELECT * FROM chain_transaction_journal WHERE chain_id=? AND journal_id=?",
         )
         .get(input.chainId, input.journalId) as Record<string, unknown>;
-    })();
+    })()});
   }
   transitionChainTransaction(input: {
     chainId: number;
@@ -3512,7 +3873,8 @@ export class SqliteLedgerRepository {
     actualGasUsd?: number;
     failureReason?: string;
   }) {
-    const at = new Date().toISOString(),
+    const identity=this.db.prepare("SELECT workflow_identity,semantic_stage FROM chain_transaction_journal WHERE chain_id=? AND journal_id=?").get(input.chainId,input.journalId) as {workflow_identity:string;semantic_stage:string}|undefined;
+    return withEconomicForegroundPersistenceSync({databasePath:this.path,component:"chain-transaction-journal",operation:`chain_transaction_${input.to.toLowerCase()}_commit`,workflow:identity?.workflow_identity,semanticStage:identity?.semantic_stage,run:()=>{const at = new Date().toISOString(),
       submitted = input.to === "SUBMITTED" ? at : null,
       confirmed = input.to === "CONFIRMED" ? at : null,
       changed = this.db
@@ -3542,7 +3904,7 @@ export class SqliteLedgerRepository {
       .prepare(
         "SELECT * FROM chain_transaction_journal WHERE chain_id=? AND journal_id=?",
       )
-      .get(input.chainId, input.journalId) as Record<string, unknown>;
+      .get(input.chainId, input.journalId) as Record<string, unknown>;}});
   }
   reconcileDurableChainTransaction(input: {
     chainId: number;
@@ -3555,7 +3917,7 @@ export class SqliteLedgerRepository {
       | { kind: "RECEIPT"; receipt: Record<string, unknown> }
       | { kind: "NONCE_UNAVAILABLE"; latestNonce: number; pendingNonce: number };
   }) {
-    return this.db.transaction(() => {
+    return withEconomicForegroundPersistenceSync({databasePath:this.path,component:"chain-transaction-journal",operation:`${input.semanticStage.toLowerCase()}_exact_hash_terminal_commit`,workflow:input.workflowIdentity,semanticStage:input.semanticStage,run:()=>this.db.transaction(() => {
       let row = this.db
         .prepare(
           "SELECT * FROM chain_transaction_journal WHERE chain_id=? AND lower(wallet_address)=? AND workflow_identity=? AND semantic_stage=? AND attempt=?",
@@ -3629,7 +3991,7 @@ export class SqliteLedgerRepository {
         actualGasNative: gasUsed * effectiveGasPrice,
         failureReason: success ? undefined : "TRANSACTION_REVERTED",
       });
-    })();
+    })()});
   }
   authorizeChainCallback(input: {
     authorizationId: string;
@@ -5538,15 +5900,15 @@ export class SqliteLedgerRepository {
       );
     return this.v4PoolSelection(id);
   }
-  upsertV4RegistryPool(input: V4RegistryPoolRecord) {
+  persistV4RegistryPool(input: V4RegistryPoolRecord) {
     const at = new Date().toISOString(),
       blockers: string[] = [];
     if (input.dynamicFee) blockers.push("DYNAMIC_FEE_UNSUPPORTED");
     if (input.hookClassification !== "ZERO_HOOK")
       blockers.push("NONZERO_HOOK_UNSUPPORTED");
-    this.db
+    return this.db
       .prepare(
-        "INSERT INTO v4_pool_registry(pool_id,chain_id,currency0,currency1,initialize_fee_raw,tick_spacing,hooks,initialization_block,initialization_tx_hash,initialization_tx_index,initialization_log_index,first_seen_at,hook_classification,dynamic_fee,static_fee_pips,validation_status,blockers_json,updated_at) VALUES(?,4663,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pool_id) DO UPDATE SET currency0=excluded.currency0,currency1=excluded.currency1,initialize_fee_raw=excluded.initialize_fee_raw,tick_spacing=excluded.tick_spacing,hooks=excluded.hooks,initialization_block=excluded.initialization_block,initialization_tx_hash=COALESCE(excluded.initialization_tx_hash,v4_pool_registry.initialization_tx_hash),initialization_tx_index=COALESCE(excluded.initialization_tx_index,v4_pool_registry.initialization_tx_index),initialization_log_index=COALESCE(excluded.initialization_log_index,v4_pool_registry.initialization_log_index),hook_classification=excluded.hook_classification,dynamic_fee=excluded.dynamic_fee,static_fee_pips=excluded.static_fee_pips,updated_at=excluded.updated_at",
+        "INSERT INTO v4_pool_registry(pool_id,chain_id,currency0,currency1,initialize_fee_raw,tick_spacing,hooks,initialization_block,initialization_tx_hash,initialization_tx_index,initialization_log_index,first_seen_at,hook_classification,dynamic_fee,static_fee_pips,validation_status,blockers_json,updated_at) VALUES(?,4663,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(pool_id) DO UPDATE SET currency0=excluded.currency0,currency1=excluded.currency1,initialize_fee_raw=excluded.initialize_fee_raw,tick_spacing=excluded.tick_spacing,hooks=excluded.hooks,initialization_block=excluded.initialization_block,initialization_tx_hash=COALESCE(excluded.initialization_tx_hash,v4_pool_registry.initialization_tx_hash),initialization_tx_index=COALESCE(excluded.initialization_tx_index,v4_pool_registry.initialization_tx_index),initialization_log_index=COALESCE(excluded.initialization_log_index,v4_pool_registry.initialization_log_index),hook_classification=excluded.hook_classification,dynamic_fee=excluded.dynamic_fee,static_fee_pips=excluded.static_fee_pips,updated_at=excluded.updated_at WHERE v4_pool_registry.currency0 IS NOT excluded.currency0 OR v4_pool_registry.currency1 IS NOT excluded.currency1 OR v4_pool_registry.initialize_fee_raw IS NOT excluded.initialize_fee_raw OR v4_pool_registry.tick_spacing IS NOT excluded.tick_spacing OR v4_pool_registry.hooks IS NOT excluded.hooks OR v4_pool_registry.initialization_block IS NOT excluded.initialization_block OR v4_pool_registry.initialization_tx_hash IS NOT COALESCE(excluded.initialization_tx_hash,v4_pool_registry.initialization_tx_hash) OR v4_pool_registry.initialization_tx_index IS NOT COALESCE(excluded.initialization_tx_index,v4_pool_registry.initialization_tx_index) OR v4_pool_registry.initialization_log_index IS NOT COALESCE(excluded.initialization_log_index,v4_pool_registry.initialization_log_index) OR v4_pool_registry.hook_classification IS NOT excluded.hook_classification OR v4_pool_registry.dynamic_fee IS NOT excluded.dynamic_fee OR v4_pool_registry.static_fee_pips IS NOT excluded.static_fee_pips",
       )
       .run(
         input.poolId,
@@ -5566,7 +5928,10 @@ export class SqliteLedgerRepository {
         blockers.length ? "BLOCKED" : "DISCOVERED",
         JSON.stringify(blockers),
         at,
-      );
+      ).changes;
+  }
+  upsertV4RegistryPool(input: V4RegistryPoolRecord) {
+    this.persistV4RegistryPool(input);
     return this.v4RegistryPool(input.poolId);
   }
   v4RegistryPool(poolId: string) {
@@ -5873,6 +6238,28 @@ export class SqliteLedgerRepository {
         "UPDATE v4_pool_discovery_cursor SET next_block=?,updated_at=? WHERE chain_id=4663",
       )
       .run(nextBlock.toString(), new Date().toISOString());
+  }
+  commitV4RegistryWindow(input: {
+    nextBlock: bigint;
+    chainBlock: bigint;
+    syncStartedAtMs: number;
+    syncDurationMs: number;
+    fallbackUses?: number;
+  }) {
+    const completedAt = new Date().toISOString();
+    return this.db
+      .prepare(
+        "UPDATE v4_pool_discovery_cursor SET next_block=?,last_chain_block=?,last_sync_started_at=?,last_sync_completed_at=?,last_sync_duration_ms=?,last_error=NULL,fallback_uses=fallback_uses+?,updated_at=? WHERE chain_id=4663",
+      )
+      .run(
+        input.nextBlock.toString(),
+        input.chainBlock.toString(),
+        new Date(input.syncStartedAtMs).toISOString(),
+        completedAt,
+        input.syncDurationMs,
+        input.fallbackUses ?? 0,
+        completedAt,
+      ).changes;
   }
   finishV4RegistrySync(input: {
     durationMs: number;

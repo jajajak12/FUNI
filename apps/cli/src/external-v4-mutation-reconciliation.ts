@@ -612,6 +612,17 @@ export async function collectExternalV4MutationEvidence(input: {
             amount0: transfers.token0,
             amount1: transfers.token1,
             sqrtPriceX96: historical.value.sqrtPriceX96,
+            source: {
+              poolId: historical.value.id,
+              poolKey: historical.value.key,
+              sqrtPriceX96: historical.value.sqrtPriceX96,
+              tick: historical.value.tick,
+              activeLiquidity: historical.value.liquidity,
+              initialized: historical.value.initialized,
+              blockNumber: historical.value.blockNumber,
+              token0Decimals: decimals0,
+              token1Decimals: decimals1,
+            },
           });
           if (valued.status === "AVAILABLE") returnUsdMicros = valued.totalUsdMicros;
           valuation = {

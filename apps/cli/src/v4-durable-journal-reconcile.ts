@@ -7,7 +7,7 @@ import {
   type TransactionReceipt,
 } from "viem";
 import { robinhoodMainnet, type FallbackRpc } from "@funi/core";
-import type { SqliteLedgerRepository } from "@funi/ledger";
+import { withEconomicForegroundPersistenceSync, type SqliteLedgerRepository } from "@funi/ledger";
 import { V4_ROBINHOOD_DEPLOYMENTS } from "@funi/v4";
 import {
   canonicalRequestFingerprint,
@@ -38,6 +38,7 @@ type Candidate = {
   provider_evidence_json: string;
   receipt_json: string | null;
 };
+const persistRecoveryEvidence=(repo:SqliteLedgerRepository,candidate:Candidate,operation:string,run:()=>unknown)=>withEconomicForegroundPersistenceSync({databasePath:repo.path,component:'v4-durable-exact-hash-recovery',operation,workflow:candidate.workflow_identity,semanticStage:candidate.semantic_stage,run,onTelemetry:event=>{try{process.stdout.write(JSON.stringify({event:'sqlite_write_window',...event,at:new Date().toISOString()})+'\n');}catch{}}});
 
 const erc20ApproveAbi = [{
   type: "function",
@@ -302,7 +303,7 @@ export async function reconcileDurableV4Journals(input: {
         );
         if (evidence.kind === "RECEIPT") {
           assertReceiptIdentity(candidate, evidence.receipt);
-          input.repo.reconcileDurableChainTransaction({
+          persistRecoveryEvidence(input.repo,candidate,`v4_durable_${candidate.semantic_stage.toLowerCase()}_receipt_commit`,()=>input.repo.reconcileDurableChainTransaction({
             chainId: CHAIN_ID,
             wallet: candidateWallet,
             workflowIdentity: candidate.workflow_identity,
@@ -313,7 +314,7 @@ export async function reconcileDurableV4Journals(input: {
               kind: "RECEIPT",
               receipt: evidence.receipt as unknown as Record<string, unknown>,
             },
-          });
+          }));
           if (evidence.receipt.status === "reverted") {
             results.push({
               journalId: candidate.journal_id,
@@ -327,7 +328,7 @@ export async function reconcileDurableV4Journals(input: {
           evidence.kind === "ABSENT" &&
           evidence.latestNonce > candidate.nonce
         ) {
-          input.repo.reconcileDurableChainTransaction({
+          persistRecoveryEvidence(input.repo,candidate,`v4_durable_${candidate.semantic_stage.toLowerCase()}_terminal_commit`,()=>input.repo.reconcileDurableChainTransaction({
             chainId: CHAIN_ID,
             wallet: candidateWallet,
             workflowIdentity: candidate.workflow_identity,
@@ -339,7 +340,7 @@ export async function reconcileDurableV4Journals(input: {
               latestNonce: evidence.latestNonce,
               pendingNonce: evidence.pendingNonce,
             },
-          });
+          }));
           results.push({
             journalId: candidate.journal_id,
             outcome: "FAILED",

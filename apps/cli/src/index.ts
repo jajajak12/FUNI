@@ -47,6 +47,11 @@ import {
 import { drainClosePnlCardDeliveries } from "../../telegram-lp-bot/src/pnl-card-delivery.js";
 import { enqueueTargetedPositionReconciliation } from "./active-position-reconciliation.js";
 import { importKnownV4Position } from "./position-adoption.js";
+import {
+  resumeV4BidLadderReposition,
+  v4BidLadderRepositionResumeEligibility,
+} from "./v4-bid-ladder-usdg-reset.js";
+import type { LadderLiveContext } from "./v4-bid-ladder-live.js";
 
 const migrations = "infra/migrations";
 const command = process.argv[2] ?? "help";
@@ -72,6 +77,7 @@ async function main() {
         "v4-pool-registry-sync", "v4-pools-for-token", "v4-pool-refresh",
         "v4-position-inspect", "v4-position-reconcile", "v4-pnl-audit",
         "v4-position-lifecycle-audit",
+        "resume-reposition-status", "resume-reposition",
       ],
       transactionAuthority: "none in this CLI entrypoint",
     });
@@ -252,6 +258,38 @@ async function main() {
         ? enqueueTargetedPositionReconciliation(repository, { positionId: result.positionId, tokenId: tokenInput, protocol: "v4", reason: "OPERATOR_KNOWN_EXTERNAL_V4_IMPORT" })
         : "NOT_QUEUED";
       return output({ command, ...result, queueStatus });
+    } finally { repository.close(); }
+  }
+  if (command === "resume-reposition-status" || command === "resume-reposition") {
+    if (!argument || process.argv.length !== 4)
+      throw new Error(`usage: ${command} <source-ladder-id>`);
+    const wallet = dedicatedWallet();
+    if (!wallet.address) throw new Error("DEDICATED_WALLET_REQUIRED");
+    const repository = openRepository();
+    try {
+      const context = async (): Promise<LadderLiveContext> => ({
+        repo: repository,
+        rpc,
+        ladderId: argument,
+        wallet: wallet.address!,
+        fundingUsd: 1,
+        nativeUsd: env.GAS_USD_PER_NATIVE,
+        runtime: {
+          executionEnabled: env.EXECUTION_ENABLED,
+          dryRun: env.DRY_RUN,
+          emergencyPause: env.EMERGENCY_PAUSE,
+          signerConfigured: wallet.signerConfigured,
+          allowlisted: true,
+          maxPositionUsd: env.MAX_POSITION_VALUE_USD,
+          maxApprovalUsd: env.MAX_APPROVAL_VALUE_USD,
+          maxGasUsd: env.MAX_GAS_COST_USD,
+          slippageBps: env.MAX_SLIPPAGE_BPS,
+        },
+      });
+      const input = { repo: repository, rpc, ladderId: argument, wallet: wallet.address, context };
+      return output(command === "resume-reposition-status"
+        ? await v4BidLadderRepositionResumeEligibility(input)
+        : await resumeV4BidLadderReposition(input));
     } finally { repository.close(); }
   }
   if (command === "v4-pool-registry-status") {

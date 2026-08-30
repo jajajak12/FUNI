@@ -25,6 +25,7 @@ import {
   parseAbiItem,
   toHex,
   zeroAddress,
+  type Address,
   type Hex,
 } from "viem";
 import {
@@ -111,30 +112,38 @@ function fixture(totalFundingAmount = 10_000_000n) {
       now,
       now,
     );
-  let positionsClosed = false,currentTick=0,erc20Allowance=1_000_000_000n,permitAllowance=1_000_000_000n,laterPoolSwap=false,historicalStateUnavailable=false;
+  let positionsClosed = false,currentTick=0,erc20Allowance=1_000_000_000n,permitAllowance=1_000_000_000n,balance=1_000_000_000n,laterPoolSwap=false,historicalStateUnavailable=false,failedFinalRead:string|null=null,estimateGasFailureAt=Number.POSITIVE_INFINITY,afterInitialEstimate:(()=>void)|undefined,blockSequence=[123n];
+  const blockValues=new Map<bigint,{tick?:number;liquidity?:bigint;balance?:bigint;erc20Allowance?:bigint;permitAllowance?:bigint}>(),multicallBlocks:bigint[]=[],calls={getBlockNumber:0,getSlot0:0,getLiquidity:0,balanceOf:0,erc20Allowance:0,permit2Allowance:0,estimateGas:0,multicall:0,transportRpc:0,tokenMetadata:0};
   const client = {
-      getBlockNumber: async () => 123n,
+      getBlockNumber: async () => {calls.getBlockNumber++;calls.transportRpc++;return blockSequence.length>1?blockSequence.shift()!:blockSequence[0]!;},
       getBlock: async () => ({ timestamp: 123n }),
+      getGasPrice: async () => 1n,
+      getTransactionCount: async () => 0,
       getLogs: async () => laterPoolSwap?[{transactionIndex:1}]:[],
       getBytecode: async () => "0x01",
       readContract: async (input: any) => {
-        if (input.functionName === "decimals")
+        calls.transportRpc++;
+        const at=blockValues.get(BigInt(input.blockNumber??-1));
+        if (input.functionName === "decimals") {calls.tokenMetadata++;
           return input.address.toLowerCase() === c1.toLowerCase() ? 6 : 18;
-        if (input.functionName === "symbol")
+        }
+        if (input.functionName === "symbol") {calls.tokenMetadata++;
           return input.address.toLowerCase() === c1.toLowerCase()
             ? "USDG"
             : "TOKEN";
-        if (input.functionName === "name")
+        }
+        if (input.functionName === "name") {calls.tokenMetadata++;
           return input.address.toLowerCase() === c1.toLowerCase()
             ? "USDG"
             : "Token";
-        if (input.functionName === "getSlot0") {if(historicalStateUnavailable&&input.blockNumber!==undefined)throw new Error("archival state unavailable");return [sqrtPriceAtTick(currentTick), currentTick, 0, 3000];}
-        if (input.functionName === "getLiquidity") return 1_000_000_000_000n;
-        if (input.functionName === "balanceOf") return 1_000_000_000n;
-        if (input.functionName === "allowance")
-          return input.args?.length === 3
-            ? [permitAllowance, Math.floor(Date.now() / 1000) + 3600, 0]
-            : erc20Allowance;
+        }
+        if (input.functionName === "getSlot0") {calls.getSlot0++;if(historicalStateUnavailable&&input.blockNumber!==undefined)throw new Error("archival state unavailable");const tick=at?.tick??currentTick;return [sqrtPriceAtTick(tick), tick, 0, 3000];}
+        if (input.functionName === "getLiquidity") {calls.getLiquidity++;return at?.liquidity??1_000_000_000_000n;}
+        if (input.functionName === "balanceOf") {calls.balanceOf++;return at?.balance??balance;}
+        if (input.functionName === "allowance") {
+          if(input.args?.length===3){calls.permit2Allowance++;return [at?.permitAllowance??permitAllowance,Math.floor(Date.now()/1000)+3600,0];}
+          calls.erc20Allowance++;return at?.erc20Allowance??erc20Allowance;
+        }
         if (
           [
             "ownerOf",
@@ -156,13 +165,19 @@ function fixture(totalFundingAmount = 10_000_000n) {
         }
         throw new Error(`unexpected read ${input.functionName}`);
       },
-      estimateGas: async () => 1_000_000n,
-      multicall: async (input: any) =>
-        input.contracts.map((contract: any) => {
-          if (contract.functionName === "getSlot0")
-            return { status: "success", result: [2n ** 96n, 0, 0, 3000] };
-          if (contract.functionName === "getLiquidity")
-            return { status: "success", result: 1_000_000_000_000n };
+      estimateGas: async () => {calls.estimateGas++;calls.transportRpc++;if(calls.estimateGas>=estimateGasFailureAt)throw new Error('estimate unavailable');if(calls.estimateGas===1){const mutate=afterInitialEstimate;afterInitialEstimate=undefined;mutate?.();}return 1_000_000n;},
+      multicall: async (input: any) => {
+        calls.multicall++;calls.transportRpc++;if(input.blockNumber!==undefined)multicallBlocks.push(BigInt(input.blockNumber));
+        const at=blockValues.get(BigInt(input.blockNumber??-1));
+        return input.contracts.map((contract: any) => {
+          if(failedFinalRead===contract.functionName)return {status:'failure',error:new Error('unavailable')};
+          if (contract.functionName === "getSlot0") {calls.getSlot0++;const tick=at?.tick??currentTick;
+            return { status: "success", result: [sqrtPriceAtTick(tick), tick, 0, 3000] };}
+          if (contract.functionName === "getLiquidity") {calls.getLiquidity++;
+            return { status: "success", result: at?.liquidity??1_000_000_000_000n };}
+          if (contract.functionName === "balanceOf") {calls.balanceOf++;return {status:"success",result:at?.balance??balance};}
+          if (contract.functionName === "allowance"&&contract.args?.length===3) {calls.permit2Allowance++;return {status:"success",result:[at?.permitAllowance??permitAllowance,Math.floor(Date.now()/1000)+3600,0]};}
+          if (contract.functionName === "allowance") {calls.erc20Allowance++;return {status:"success",result:at?.erc20Allowance??erc20Allowance};}
           if (contract.functionName === "getPoolAndPositionInfo") {
             const tokenId = contract.args[0] as bigint,
               leg = fPreviewLeg(preview, Number(tokenId - 101n)),
@@ -187,7 +202,8 @@ function fixture(totalFundingAmount = 10_000_000n) {
           if (contract.functionName === "getFeeGrowthInside")
             return { status: "success", result: [0n, 0n] };
           throw new Error(`unexpected multicall ${contract.functionName}`);
-        }),
+        });
+      },
     } as any,
     rpc = new FallbackRpc(
       { ...robinhoodMainnet, rpcUrls: ["https://example.invalid"] },
@@ -206,7 +222,16 @@ function fixture(totalFundingAmount = 10_000_000n) {
     setPoolTick:(tick:number)=>{currentTick=tick;},
     setLaterPoolSwap:(present:boolean)=>{laterPoolSwap=present;},
     setHistoricalStateUnavailable:(present:boolean)=>{historicalStateUnavailable=present;},
+    setFinalReadFailure:(functionName:string|null)=>{failedFinalRead=functionName;},
+    setEstimateGasFailureAt:(attempt:number)=>{estimateGasFailureAt=attempt;},
+    afterInitialEstimate:(mutate:()=>void)=>{afterInitialEstimate=mutate;},
     requireApprovals:()=>{erc20Allowance=0n;permitAllowance=0n;},
+    setApprovals:(erc20:bigint,permit2:bigint)=>{erc20Allowance=erc20;permitAllowance=permit2;},
+    setBalance:(value:bigint)=>{balance=value;},
+    setBlockSequence:(...values:bigint[])=>{blockSequence=[...values];},
+    setBlockValues:(block:bigint,values:{tick?:number;liquidity?:bigint;balance?:bigint;erc20Allowance?:bigint;permitAllowance?:bigint})=>{blockValues.set(block,values);},
+    multicallBlocks,
+    calls,
   };
 }
 function fPreviewLeg(
@@ -229,10 +254,125 @@ const runtime = {
   slippageBps: 100,
 };
 
+function seedConfirmedOpenApproval(
+  f: ReturnType<typeof fixture>,
+  stage: "OPEN_ERC20_APPROVAL" | "OPEN_PERMIT2_APPROVAL",
+  blockNumber: bigint,
+  nonce: number,
+) {
+  const hash = `0x${nonce.toString(16).padStart(2, "0").repeat(32)}` as Hex,
+    journalId = `${f.ladderId}:${stage}:0`,
+    receipt = {
+      status: "success" as const,
+      transactionHash: hash,
+      blockNumber,
+      blockHash: `0x${"aa".repeat(32)}` as Hex,
+      transactionIndex: 0,
+      from: owner,
+      to: stage === "OPEN_ERC20_APPROVAL" ? c1 : V4_ROBINHOOD_DEPLOYMENTS.permit2,
+      contractAddress: null,
+      cumulativeGasUsed: 1n,
+      effectiveGasPrice: 1n,
+      gasUsed: 1n,
+      logs: [],
+      logsBloom: `0x${"00".repeat(256)}` as Hex,
+      type: "legacy" as const,
+    };
+  f.repo.persistChainPreparedTransaction({
+    chainId: 4663,
+    chainKey: "robinhood",
+    protocol: "uniswap_v4",
+    journalId,
+    wallet: owner,
+    workflowIdentity: f.ladderId,
+    semanticStage: stage,
+    attempt: 0,
+    nonce,
+    transactionType: stage,
+    expectedHash: hash,
+    to: receipt.to,
+    requestFingerprint: journalId,
+    feeModel: "legacy",
+  });
+  f.repo.transitionChainTransaction({chainId:4663,journalId,from:"PREPARED",to:"SUBMITTED"});
+  f.repo.transitionChainTransaction({chainId:4663,journalId,from:"SUBMITTED",to:"CONFIRMED",receipt});
+}
+
+function freshEntryEvidence(target: Address) {
+  const fetchedAtMs = Date.now();
+  return {
+    token: target,
+    priceUsd: "1",
+    source: "gmgn-token-info-price.price" as const,
+    fetchedAtMs,
+    freshUntilMs: fetchedAtMs + 30_000,
+  };
+}
+
 describe("V4 BID ladder Phase 2B operator boundary", () => {
   it("rejects a non-funding-only live state before any approval or OPEN signing",async()=>{const f=fixture();f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.requireApprovals();const leg=f.preview.plan.legs[0]!,inside=Math.trunc((leg.tickLower+leg.tickUpper)/2);f.setPoolTick(inside);let walletCalls=0;const walletClient=new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}});await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async()=>({priceUsd:1,source:'fixture',observedAtMs:Date.now()}),walletClient} as any)).rejects.toThrow('V4_BID_LADDER_LEG_NOT_FUNDING_ONLY');expect(walletCalls).toBe(0);expect(f.repo.db.prepare('SELECT COUNT(*) count FROM chain_transaction_journal').get()).toEqual({count:0});});
   it("forbids approval transactions on the post-Confirm replacement OPEN boundary",async()=>{const f=fixture();try{f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.requireApprovals();let walletCalls=0;const walletClient=new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}});await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async()=>({priceUsd:1,source:'fixture',observedAtMs:Date.now()}),walletClient,requirePreapprovedFunding:true} as any)).rejects.toThrow('REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED');expect(walletCalls).toBe(0);expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage IN ('OPEN_ERC20_APPROVAL','OPEN_PERMIT2_APPROVAL')").get()).toEqual({count:0});}finally{f.repo.close();}});
-  it("keeps pre-approval and immediate pre-OPEN funding-only validation as defense in depth",()=>{const source=readFileSync('apps/cli/src/v4-bid-ladder-live.ts','utf8'),body=source.slice(source.indexOf('export async function executeV4BidLadderLiveOpen'),source.indexOf('async function closeState')),checks=[...body.matchAll(/await openState\(input, true\)/g)].map(match=>match.index!);expect(checks).toHaveLength(3);expect(checks[0]).toBeLessThan(body.indexOf('OPEN_ERC20_APPROVAL'));expect(checks[1]).toBeLessThan(body.indexOf('OPEN_PERMIT2_APPROVAL'));expect(checks[2]).toBeLessThan(body.indexOf('stage: "OPEN_BATCH"'));});
+  it("uses one initial full state, receipt-scoped approval deltas, and a dedicated minimal final validator",()=>{const source=readFileSync('apps/cli/src/v4-bid-ladder-live.ts','utf8'),body=source.slice(source.indexOf('export async function executeV4BidLadderLiveOpen'),source.indexOf('async function closeState')),validator=source.slice(source.indexOf('async function validateFinalOpenAuthority'),source.indexOf('export async function v4BidLadderFundingAllowanceReadiness'));expect(body.match(/await openState\(input, true, priceMemo\)/g)).toHaveLength(1);expect(body.match(/await refreshOpenApprovalDelta\(/g)).toHaveLength(2);expect(body.match(/await validateFinalOpenAuthority\(input, preview, priceMemo\)/g)).toHaveLength(1);expect(validator).not.toContain('readOpenChainState(');expect(validator).not.toContain('materializeOpenState(');expect(validator).not.toContain('tokenDecimals(');expect(validator).not.toContain('multicallAddress');expect(robinhoodMainnet.contracts?.multicall3?.address).toBeDefined();expect(body.indexOf('await validateFinalOpenAuthority')).toBeLessThan(body.indexOf('stage: "OPEN_BATCH"'));});
+  it.each([
+    ["no approval", false, false, {balanceOf:2,erc20Allowance:2,permit2Allowance:2,estimateGas:2}],
+    ["ERC20 approval", true, false, {balanceOf:3,erc20Allowance:3,permit2Allowance:3,estimateGas:3}],
+    ["Permit2 approval", false, true, {balanceOf:3,erc20Allowance:2,permit2Allowance:3,estimateGas:3}],
+    ["both approvals", true, true, {balanceOf:4,erc20Allowance:3,permit2Allowance:4,estimateGas:4}],
+  ] as const)("%s uses one full initial state and one pinned minimal final economic refresh",async(_label,erc20Required,permitRequired,expected)=>{
+    const f=fixture();
+    try{
+      f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);
+      const high=1_000_000_000n;
+      f.setApprovals(erc20Required?0n:high,permitRequired?0n:high);
+      const finalBlock=erc20Required&&permitRequired?126n:erc20Required||permitRequired?125n:124n;
+      f.setBlockSequence(123n,finalBlock);
+      if(erc20Required){seedConfirmedOpenApproval(f,"OPEN_ERC20_APPROVAL",124n,11);f.setBlockValues(124n,{erc20Allowance:high,permitAllowance:permitRequired?0n:high});}
+      if(permitRequired){seedConfirmedOpenApproval(f,"OPEN_PERMIT2_APPROVAL",erc20Required?125n:124n,12);f.setBlockValues(erc20Required?125n:124n,{balance:high,permitAllowance:high});}
+      f.setBlockValues(finalBlock,{balance:high,erc20Allowance:high,permitAllowance:high});
+      const gmgn=vi.fn(async(target:Address)=>freshEntryEvidence(target)),walletClient={account:{}} as any;
+      await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:gmgn,walletClient})).rejects.toThrow("LOCAL_SIGNER_REQUIRED");
+      expect(gmgn).toHaveBeenCalledTimes(1);
+      const expectedTransport=erc20Required&&permitRequired?17:erc20Required?14:permitRequired?13:10;
+      expect(f.calls).toMatchObject({getBlockNumber:2,getSlot0:2,getLiquidity:2,multicall:1,transportRpc:expectedTransport,tokenMetadata:0,...expected});
+      expect(f.multicallBlocks).toEqual([finalBlock]);
+      expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});
+    }finally{f.repo.close();}
+  });
+  it("refreshes stale GMGN evidence and never shares memoized evidence across OPEN attempts",async()=>{
+    const f=fixture();
+    try{
+      f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);
+      let staleCalls=0;
+      const stale=vi.fn(async(target:Address)=>{staleCalls++;const evidence=freshEntryEvidence(target);return staleCalls===1?{...evidence,freshUntilMs:evidence.fetchedAtMs}:evidence;}),walletClient={account:{}} as any,context={repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,walletClient};
+      await expect(executeV4BidLadderLiveOpen({...context,entryPriceFetch:stale})).rejects.toThrow("LOCAL_SIGNER_REQUIRED");
+      expect(stale).toHaveBeenCalledTimes(2);
+      const distinct=vi.fn(async(target:Address)=>freshEntryEvidence(target));
+      await expect(executeV4BidLadderLiveOpen({...context,entryPriceFetch:distinct})).rejects.toThrow("LOCAL_SIGNER_REQUIRED");
+      await expect(executeV4BidLadderLiveOpen({...context,entryPriceFetch:distinct})).rejects.toThrow("LOCAL_SIGNER_REQUIRED");
+      expect(distinct).toHaveBeenCalledTimes(2);
+    }finally{f.repo.close();}
+  });
+  it("fails closed when approval-time balance changes or final JIT pool drift breaks funding-only",async()=>{
+    const balanceFixture=fixture();
+    try{
+      balanceFixture.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(balanceFixture.ladderId);
+      balanceFixture.setApprovals(0n,1_000_000_000n);seedConfirmedOpenApproval(balanceFixture,"OPEN_ERC20_APPROVAL",124n,13);balanceFixture.setBlockValues(124n,{balance:0n,erc20Allowance:1_000_000_000n,permitAllowance:1_000_000_000n});
+      await expect(executeV4BidLadderLiveOpen({repo:balanceFixture.repo,rpc:balanceFixture.rpc,ladderId:balanceFixture.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async(target)=>freshEntryEvidence(target as typeof c0),walletClient:{account:{}} as any})).rejects.toThrow("V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT");
+    }finally{balanceFixture.repo.close();}
+    const driftFixture=fixture();
+    try{
+      driftFixture.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(driftFixture.ladderId);driftFixture.setBlockSequence(123n,124n);const leg=driftFixture.preview.plan.legs[0]!;driftFixture.setBlockValues(124n,{tick:Math.trunc((leg.tickLower+leg.tickUpper)/2)});
+      await expect(executeV4BidLadderLiveOpen({repo:driftFixture.repo,rpc:driftFixture.rpc,ladderId:driftFixture.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async(target)=>freshEntryEvidence(target as typeof c0),walletClient:{account:{}} as any})).rejects.toThrow("V4_BID_LADDER_LEG_NOT_FUNDING_ONLY");
+    }finally{driftFixture.repo.close();}
+  });
+  it("fails closed when the persisted pool/token identity changes before the final pinned snapshot",async()=>{const f=fixture();try{f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.setBlockSequence(123n,124n);f.afterInitialEstimate(()=>f.repo.db.prepare("UPDATE v4_bid_ladders SET funding_token=?,target_token=? WHERE ladder_id=?").run(c0,c1,f.ladderId));let walletCalls=0;await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}})})).rejects.toThrow('V4_BID_LADDER_OPEN_IDENTITY_CHANGED');expect(walletCalls).toBe(0);expect(f.multicallBlocks).toEqual([124n]);expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{f.repo.close();}});
+  it.each([
+    ["balance",{balance:0n},"V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT"],
+    ["ERC20 allowance",{erc20Allowance:0n},"V4_BID_LADDER_ERC20_ALLOWANCE_INSUFFICIENT"],
+    ["Permit2 allowance",{permitAllowance:0n},"V4_BID_LADDER_PERMIT2_ALLOWANCE_INSUFFICIENT"],
+    ["active liquidity",{liquidity:0n},"V4_BID_LADDER_POOL_UNINITIALIZED"],
+  ] as const)("blocks final %s drift from the pinned multicall before signing",async(label,values,blocker)=>{const f=fixture();try{f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.setBlockSequence(123n,124n);f.setBlockValues(124n,values);let walletCalls=0;const telemetry:any[]=[];await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}}),telemetry:(event,data)=>telemetry.push({event,...data})})).rejects.toThrow(blocker);expect(walletCalls).toBe(0);expect(f.multicallBlocks).toEqual([124n]);const finalValidation=telemetry.find(item=>item.event==='v4_bid_ladder_open_final_validation');expect(finalValidation).toMatchObject({outcome:'BLOCKED',transportRpcCount:3,multicallMembers:5,genericMaterialization:false});console.log(JSON.stringify({event:'public_v4_final_validation_performance',case:label,durationMs:finalValidation.durationMs,transportRpcCount:finalValidation.transportRpcCount,multicallMembers:finalValidation.multicallMembers,genericMaterialization:finalValidation.genericMaterialization}));expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{f.repo.close();}});
+  it("fails closed on unavailable final liquidity or the one exact final calldata estimate",async()=>{const unavailable=fixture();try{unavailable.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(unavailable.ladderId);unavailable.setBlockSequence(123n,124n);unavailable.setFinalReadFailure('getLiquidity');await expect(executeV4BidLadderLiveOpen({repo:unavailable.repo,rpc:unavailable.rpc,ladderId:unavailable.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:{account:{}} as any})).rejects.toThrow('V4_BID_LADDER_FINAL_LIQUIDITY_UNAVAILABLE');expect(unavailable.calls.estimateGas).toBe(1);expect(unavailable.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{unavailable.repo.close();}const gas=fixture();try{gas.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(gas.ladderId);gas.setBlockSequence(123n,124n);gas.setEstimateGasFailureAt(2);await expect(executeV4BidLadderLiveOpen({repo:gas.repo,rpc:gas.rpc,ladderId:gas.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:{account:{}} as any})).rejects.toThrow('V4_BID_LADDER_MINT_ESTIMATE_FAILED');expect(gas.calls.estimateGas).toBe(2);expect(gas.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{gas.repo.close();}});
   it("values recurring claim fees with canonical token orientation and decimals", () => {
     expect(
       v4BidLadderFeeUsdFromPrice({
@@ -657,9 +797,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
   it("keeps CLOSE independent from price, swap, router, burn, and cleanup paths", () => {
     const source = readFileSync("apps/cli/src/v4-bid-ladder-live.ts", "utf8"),
       close = source.slice(source.indexOf("async function closeState"));
-    expect(close).not.toMatch(
-      /freshLpEntryPriceGuard|buildV4ExactInputSingle|universalRouter|BURN_POSITION|cleanup/i,
-    );
+    expect(close).not.toMatch(/freshLpEntryPriceGuard|BURN_POSITION|cleanup/i);
     const text = formatV4BidLadderClosePreview({
       state: { parent: { ladder_id: "x" } } as any,
       active: [],
@@ -1219,7 +1357,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         ),
       ).toEqual({ token0: 130n, token1: 240n, principal0: 0n, principal1: 0n });
       const claimEvents=f.repo.db.prepare("SELECT valuation_status,realized_pnl_usd,newly_realized_fees_usd,valuation_evidence_json FROM realized_pnl_events WHERE event_kind='CLAIM' ORDER BY economic_final_at_ms,event_id").all() as Record<string,unknown>[];
-      expect(claimEvents).toHaveLength(2);expect(claimEvents.every(row=>row.valuation_status==="AVAILABLE"&&row.realized_pnl_usd===row.newly_realized_fees_usd)).toBe(true);expect(claimEvents.map(row=>JSON.parse(String(row.valuation_evidence_json)))).toEqual(expect.arrayContaining([expect.objectContaining({contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",sameBlockLaterPoolSwaps:0,evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP"})]));
+      expect(claimEvents).toHaveLength(2);expect(claimEvents.every(row=>row.valuation_status==="AVAILABLE"&&row.realized_pnl_usd===row.newly_realized_fees_usd)).toBe(true);expect(claimEvents.map(row=>JSON.parse(String(row.valuation_evidence_json)))).toEqual(expect.arrayContaining([expect.objectContaining({contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V2",sanityStatus:"AVAILABLE",sameBlockLaterPoolSwaps:0,evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP"})]));
       const economicSnapshot=()=>({collections:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(fee0_raw AS INTEGER)) fee0,SUM(CAST(fee1_raw AS INTEGER)) fee1 FROM collections").get(),feeClaims:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(token0_raw AS INTEGER)) token0,SUM(CAST(token1_raw AS INTEGER)) token1 FROM fee_claims").get(),positions:f.repo.db.prepare("SELECT SUM(CAST(claimed_fee0_raw AS INTEGER)) fee0,SUM(CAST(claimed_fee1_raw AS INTEGER)) fee1 FROM v4_positions").get(),events:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(realized_pnl_usd AS REAL)) pnl FROM realized_pnl_events WHERE event_kind='CLAIM'").get()}),beforeReplay=economicSnapshot();
       await reconcileConfirmedV4BidLadderJournal({...context,semanticStage:collectReplays[0]!.stage,receipt:collectReplays[0]!.receipt});
       expect(economicSnapshot()).toEqual(beforeReplay);
@@ -1276,7 +1414,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         receipt(closeHash, closeLogs),
         plan.calldata,
         false,
-        {contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:poolId(f.key),poolKey:f.key,sqrtPriceX96:f.preview.plan.pool.sqrtPriceX96.toString(),observationBlock:f.preview.plan.pool.blockNumber.toString(),observedAtMs:1_000,token0Decimals:18,token1Decimals:6},
+        {contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:poolId(f.key),poolKey:f.key,sqrtPriceX96:f.preview.plan.pool.sqrtPriceX96.toString(),tick:f.preview.plan.pool.tick,activeLiquidity:f.preview.plan.pool.liquidity.toString(),initialized:f.preview.plan.pool.initialized,observationBlock:f.preview.plan.pool.blockNumber.toString(),observedAtMs:1_000,token0Decimals:18,token1Decimals:6},
       );
       f.repo.db
         .prepare(
@@ -1327,7 +1465,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         f.repo.db.prepare("SELECT COUNT(*) count FROM position_deposits").get(),
       ).toEqual({ count: 5 });
       const realized=f.repo.db.prepare("SELECT valuation_status,realized_pnl_usd,valuation_evidence_json,presentation_metadata_json FROM realized_pnl_events WHERE event_kind='CLOSE'").get() as Record<string,unknown>;
-      expect(realized.valuation_status).toBe("AVAILABLE");expect(realized.realized_pnl_usd).toBe("-10");expect(JSON.parse(String(realized.valuation_evidence_json))).toMatchObject({contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:poolId(f.key)});expect(JSON.parse(String(realized.presentation_metadata_json))).toMatchObject({pair:"TOKEN/USDG",openedAtSource:"OPEN_RECEIPT_BLOCK_TIMESTAMP"});
+      expect(realized.valuation_status).toBe("AVAILABLE");expect(realized.realized_pnl_usd).toBe("-10");expect(JSON.parse(String(realized.valuation_evidence_json))).toMatchObject({contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V2",sanityStatus:"AVAILABLE",poolId:poolId(f.key)});expect(JSON.parse(String(realized.presentation_metadata_json))).toMatchObject({pair:"TOKEN/USDG",openedAtSource:"OPEN_RECEIPT_BLOCK_TIMESTAMP"});
       const busy = Object.assign(new Error("database is locked"), {
           code: "SQLITE_BUSY",
         }),

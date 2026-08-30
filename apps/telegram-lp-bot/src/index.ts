@@ -263,7 +263,6 @@ import {
   saveDirectLookupOutboxRender,
 } from "../../cli/src/direct-token-lookup.js";
 import { attributedRpc } from "../../cli/src/rpc-attribution.js";
-
 const { token } = assertFuniTelegramCredentials();
 const allowed = new Set(
   (process.env.TELEGRAM_ALLOWED_USER_IDS ?? "")
@@ -271,7 +270,8 @@ const allowed = new Set(
     .map((x) => x.trim())
     .filter(Boolean),
 );
-const bidLadderDirectLiveInFlight = new Map<string, Promise<unknown>>();
+type BidLadderInteractiveWork = { updateId:string; generation:number; progressMessageId?:number; promise?:Promise<unknown> };
+const bidLadderDirectLiveInFlight = new Map<string, BidLadderInteractiveWork>();
 const bidLadderLiveOpenInFlight = new Map<string, Promise<unknown>>();
 if (!allowed.size)
   throw new Error(
@@ -1175,40 +1175,36 @@ async function dexV4PoolLiquidityLine(poolId: string, key: V4PoolKey) {
 function directLookupTokenDisplay(db:SqliteLedgerRepository,token:Address){const cached=db.tokenMetadata(token);if(cached?.symbol)return cached;return db.db.prepare("SELECT symbol,name FROM gmgn_robinhood_observations WHERE lower(token_address)=lower(?) AND symbol IS NOT NULL ORDER BY observed_at_ms DESC LIMIT 1").get(token) as {symbol:string;name:string|null}|undefined;}
 function directLookupTargetSymbol<T extends {target:{symbol:string}}>(candidates:readonly T[],symbol:string){return candidates.map(candidate=>({...candidate,target:{...candidate.target,symbol}}));}
 async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now()) {
-  const tokenAddress = getAddress(address),
-    existing = loadFlow(ctx);
-  const started = Date.now(),
-    lookupDb = repo(),
-    v4Lookup = cachedV4PoolsForToken({ repo: lookupDb, token: tokenAddress }),
-    presentedV4 = applyDirectLookupCandidatePresentation(lookupDb,tokenAddress,v4Lookup.candidates),
-    v3Rows = lookupDb.v3CachedPoolsForToken(tokenAddress, [
-      robinhoodMainnet.assets.USDG,
-      robinhoodMainnet.assets.WETH,
-    ]),
-    meta = directLookupTokenDisplay(lookupDb,tokenAddress),
-    tokenSymbol = String(meta?.symbol ?? `${tokenAddress.slice(0, 6)}…`),
-    allV4 = directLookupTargetSymbol(presentedV4,tokenSymbol),
-    eligibleV4Candidates = allV4.filter((candidate) => candidate.executionEligible),
-    otherQuoteActive = Number(
-      (
-        lookupDb.db
-          .prepare(
-            "SELECT COUNT(*) AS count FROM v4_pool_registry WHERE initialized=1 AND CAST(active_liquidity_raw AS INTEGER)>0 AND ((lower(currency0)=lower(?) AND lower(currency1) NOT IN (lower(?),lower(?))) OR (lower(currency1)=lower(?) AND lower(currency0) NOT IN (lower(?),lower(?))))",
-          )
-          .get(
-            tokenAddress,
-            robinhoodMainnet.assets.USDG,
-            robinhoodMainnet.assets.WETH,
-            tokenAddress,
-            robinhoodMainnet.assets.USDG,
-            robinhoodMainnet.assets.WETH,
-          ) as { count: number }
-      ).count,
-    );
-  lookupDb.close();
-  const v4Candidates = [...await rankV4CandidatesForTelegram(eligibleV4Candidates),...allV4.filter(candidate=>!candidate.executionEligible)],
-    acceleration = needsDirectLookupAcceleration(allV4),
-    sameTokenSession = existing?.status === "active" && existing.state.kind === "pool" && String(existing.state.token).toLowerCase() === tokenAddress.toLowerCase();
+  const tokenAddress = getAddress(address), interactionId = randomUUID(), started = Date.now(),
+    existing = loadFlow(ctx),
+    created = newTokenFlow(ctx, {
+      kind: "pool",
+      token: tokenAddress,
+      poolSelections: [],
+      v4PoolSelections: [],
+      poolHydrationPending: true,
+      directLookupInteractionId: interactionId,
+    }, existing),
+    sessionAcceptedAtMs = Date.now(),
+    firstResponseStartedAtMs = Date.now(),
+    message = await ctx.reply(`${tokenAddress}\nChecking cached eligible pools…`),
+    firstUiResponseAtMs = Date.now(),
+    flow = bindInteractiveFlowMessage(ctx, created, Number(message.message_id), created.state);
+  log("telegram_interactive_stage", {interactionId,interactionType:"TOKEN_LOOKUP",requestId:interactionId,stage:"SESSION_ACCEPTED_AND_FIRST_PAINT",startedAtMs:started,endedAtMs:firstUiResponseAtMs,elapsedMs:firstUiResponseAtMs-started,dbWaitMs:sessionAcceptedAtMs-started,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"PENDING",outcome:"PAINTED",messageId:Number(message.message_id)});
+  log('telegram_direct_lookup_first_response',{interactionId,token:tokenAddress,pasteReceivedAtMs,firstResponseStartedAtMs,firstUiResponseAtMs,firstUiResponseMs:firstUiResponseAtMs-pasteReceivedAtMs,messageId:Number(message.message_id),mainnetTransactionsSent:0});
+  const cacheStartedAtMs = Date.now(), lookupDb = repo();
+  let v4Lookup:ReturnType<typeof cachedV4PoolsForToken>, allV4:ReturnType<typeof cachedV4PoolsForToken>["candidates"], v3Rows:ReturnType<SqliteLedgerRepository["v3CachedPoolsForToken"]>, tokenSymbol:string, otherQuoteActive:number;
+  try {
+    v4Lookup = cachedV4PoolsForToken({ repo: lookupDb, token: tokenAddress });
+    const presentedV4 = applyDirectLookupCandidatePresentation(lookupDb,tokenAddress,v4Lookup.candidates),
+      meta = directLookupTokenDisplay(lookupDb,tokenAddress);
+    v3Rows = lookupDb.v3CachedPoolsForToken(tokenAddress, [robinhoodMainnet.assets.USDG,robinhoodMainnet.assets.WETH]);
+    tokenSymbol = String(meta?.symbol ?? `${tokenAddress.slice(0, 6)}…`);
+    allV4 = directLookupTargetSymbol(presentedV4,tokenSymbol);
+    otherQuoteActive = Number((lookupDb.db.prepare("SELECT COUNT(*) AS count FROM v4_pool_registry WHERE initialized=1 AND CAST(active_liquidity_raw AS INTEGER)>0 AND ((lower(currency0)=lower(?) AND lower(currency1) NOT IN (lower(?),lower(?))) OR (lower(currency1)=lower(?) AND lower(currency0) NOT IN (lower(?),lower(?))))").get(tokenAddress,robinhoodMainnet.assets.USDG,robinhoodMainnet.assets.WETH,tokenAddress,robinhoodMainnet.assets.USDG,robinhoodMainnet.assets.WETH) as { count: number }).count);
+  } finally { lookupDb.close(); }
+  const cacheEndedAtMs=Date.now(), v4Candidates=[...allV4], acceleration=needsDirectLookupAcceleration(allV4);
+  log("telegram_interactive_stage", {interactionId,interactionType:"TOKEN_LOOKUP",requestId:interactionId,stage:"CACHED_CANDIDATE_CLASSIFICATION",startedAtMs:cacheStartedAtMs,endedAtMs:cacheEndedAtMs,elapsedMs:cacheEndedAtMs-cacheStartedAtMs,dbWaitMs:cacheEndedAtMs-cacheStartedAtMs,rpcWaitMs:0,provider:"sqlite-wal",queueWaitMs:0,cache:v4Candidates.length||v3Rows.length?"HIT":"MISS",outcome:"COMPLETE",candidatePoolCount:v4Candidates.length});
   log("telegram_lookup", {
     explicitTokenLookup: true,
     telegramLookupMs: Date.now() - started,
@@ -1219,26 +1215,8 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
     v4: v4Candidates.length,
     ...acceleration,
   });
-  if (sameTokenSession && !acceleration.accelerationNeeded) {
-    log("telegram_pool_lookup_reused", {
-      sessionId: existing.sessionId,
-      requestId: existing.state.directLookupRequestId ?? null,
-      requestRevision: existing.state.directLookupRevision ?? null,
-      token: tokenAddress,
-      deduplicated: true,
-      queueJobsCreated: 0,
-      ...acceleration,
-    });
-    return renderPoolListing(ctx, existing, 0);
-  }
   if (!acceleration.accelerationNeeded && (v3Rows.length || v4Candidates.length)) {
-    const flow = newTokenFlow(ctx, {
-        kind: "pool",
-        token: tokenAddress,
-        poolSelections: [],
-        v4PoolSelections: [],
-      },existing),
-      persisted = telegramFlowWrite("persistPoolListing", (db) => {
+    const persisted = telegramFlowWrite("persistPoolListing", (db) => {
         return persistPoolListing({
           db,
           userId: owner(ctx),
@@ -1251,11 +1229,9 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
         });
       }),
       listed = advanceFlow(ctx, flow, persisted.state, "pool listing persisted");
-    if (!listed) return unavailableFlow(ctx, "stale");
-    const message=await ctx.reply(persisted.render.text, {
-      reply_markup: keyboard(persisted.render.rows),
-    });
-    bindInteractiveFlowMessage(ctx,listed,Number(message.message_id),persisted.state);
+    if (!listed) return message;
+    try { await bot.api.editMessageText(Number(chat(ctx)),Number(message.message_id),persisted.render.text,{reply_markup:keyboard(persisted.render.rows)}); } catch(error) { if(!messageNotModified(error)) throw error; }
+    log("telegram_interactive_stage", {interactionId,interactionType:"TOKEN_LOOKUP",requestId:interactionId,stage:"CACHED_POOL_LIST_FIRST_PAINT",startedAtMs:cacheEndedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-cacheEndedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"HIT",outcome:"COMPLETE",messageId:Number(message.message_id)});
     return message;
   }
   if (!acceleration.accelerationNeeded) {
@@ -1269,7 +1245,9 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
       registeredSupportedPairs: allV4.length,
       terminalStatus: "NO_ACTIVE_LIQUIDITY_POOL",
     });
-    const render=terminalLookupRender('NO_ACTIVE_LIQUIDITY_POOL',tokenSymbol,tokenAddress,reason,{structuralCandidateCount:allV4.filter(candidate=>!String(candidate.uiState).startsWith('UNSUPPORTED:')).length,zeroLiquidityCandidateCount:allV4.filter(candidate=>candidate.uiState==='SUPPORTED_NO_ACTIVE_LIQUIDITY').length,notInitializedCandidateCount:allV4.filter(candidate=>String(candidate.uiState)==='NOT_INITIALIZED').length,unavailableCandidateCount:allV4.filter(candidate=>candidate.uiState==='EVIDENCE_UNAVAILABLE').length}),flow=newTokenFlow(ctx,{kind:'pool',token:tokenAddress,poolSelections:[],v4PoolSelections:[]},existing),message=await ctx.reply(render.text,{reply_markup:keyboard(render.rows)});bindInteractiveFlowMessage(ctx,flow,Number(message.message_id));return message;
+    const render=terminalLookupRender('NO_ACTIVE_LIQUIDITY_POOL',tokenSymbol,tokenAddress,reason,{structuralCandidateCount:allV4.filter(candidate=>!String(candidate.uiState).startsWith('UNSUPPORTED:')).length,zeroLiquidityCandidateCount:allV4.filter(candidate=>candidate.uiState==='SUPPORTED_NO_ACTIVE_LIQUIDITY').length,notInitializedCandidateCount:allV4.filter(candidate=>String(candidate.uiState)==='NOT_INITIALIZED').length,unavailableCandidateCount:allV4.filter(candidate=>candidate.uiState==='EVIDENCE_UNAVAILABLE').length});
+    try { await bot.api.editMessageText(Number(chat(ctx)),Number(message.message_id),render.text,{reply_markup:keyboard(render.rows)}); } catch(error) { if(!messageNotModified(error)) throw error; }
+    return message;
   }
   const acknowledgementCounts:PoolListing['counts']={
       v4Eligible:allV4.filter(candidate=>candidate.executionEligible).length,
@@ -1280,10 +1258,9 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
       unsupported:allV4.filter(candidate=>String(candidate.uiState).startsWith('UNSUPPORTED:')).length,
       evidenceUnavailable:allV4.filter(candidate=>candidate.uiState==='EVIDENCE_UNAVAILABLE').length,
       notInitialized:allV4.filter(candidate=>String(candidate.uiState)==='NOT_INITIALIZED').length,
-    },firstResponseStartedAtMs=Date.now(),message=await ctx.reply(directLookupAcknowledgementText(tokenSymbol,tokenAddress,acknowledgementCounts)),firstUiResponseAtMs=Date.now();
-  log('telegram_direct_lookup_first_response',{token:tokenAddress,pasteReceivedAtMs,firstResponseStartedAtMs,firstUiResponseAtMs,firstUiResponseMs:firstUiResponseAtMs-pasteReceivedAtMs,messageId:Number(message.message_id),mainnetTransactionsSent:0});
-  const interactionId = randomUUID(),
-    requestDb = repo();
+    };
+  try { await bot.api.editMessageText(Number(chat(ctx)),Number(message.message_id),directLookupAcknowledgementText(tokenSymbol,tokenAddress,acknowledgementCounts)); } catch(error) { if(!messageNotModified(error)) throw error; }
+  const requestStartedAtMs=Date.now(), requestDb = repo();
   let lookup;
   try {
     lookup = retrySqliteBusySync({
@@ -1305,6 +1282,7 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
     requestDb.close();
   }
   const requestPersistedAtMs=Date.now();
+  log("telegram_interactive_stage", {interactionId,interactionType:"TOKEN_LOOKUP",requestId:lookup.request.id,requestRevision:lookup.request.revision,stage:"REQUEST_PERSISTED",startedAtMs:requestStartedAtMs,endedAtMs:requestPersistedAtMs,elapsedMs:requestPersistedAtMs-requestStartedAtMs,dbWaitMs:requestPersistedAtMs-requestStartedAtMs,rpcWaitMs:0,provider:"sqlite-wal",queueWaitMs:0,cache:lookup.cacheHit?"HIT":"MISS",outcome:"COMPLETE"});
   log('telegram_direct_lookup_request_persisted',{interactionId,requestId:lookup.request.id,requestRevision:lookup.request.revision,token:tokenAddress,pasteReceivedAtMs,firstUiResponseAtMs,requestPersistedAtMs,persistenceMs:requestPersistedAtMs-firstUiResponseAtMs,deadlineAtMs:Number(lookup.request.deadline_at_ms),mainnetTransactionsSent:0});
   if (lookup.cacheHit && lookup.request.status !== "SUPPORTED_POOLS_FOUND") {
     if (v3Rows.length || v4Candidates.length) {
@@ -1317,17 +1295,10 @@ async function beginToken(ctx: any, address: string, pasteReceivedAtMs=Date.now(
       String(lookup.request.reason_code ?? ""),
       directLookupEvidenceSummary(JSON.parse(String(lookup.request.rpc_attribution_json??'{}'))),
     );
-    const flow=newTokenFlow(ctx,{kind:'pool',token:tokenAddress,poolSelections:[],v4PoolSelections:[]},existing),terminalMessage=await ctx.reply(render.text,{reply_markup:keyboard(render.rows)});bindInteractiveFlowMessage(ctx,flow,Number(terminalMessage.message_id));return terminalMessage;
+    try { await bot.api.editMessageText(Number(chat(ctx)),Number(message.message_id),render.text,{reply_markup:keyboard(render.rows)}); } catch(error) { if(!messageNotModified(error)) throw error; }
+    return message;
     }
   }
-  const flow = newTokenFlow(ctx, {
-    kind: "pool",
-    token: tokenAddress,
-    poolSelections: [],
-    v4PoolSelections: [],
-    poolHydrationPending: true,
-    interactiveMessageIds:[Number(message.message_id)],
-  },existing);
   const active =
       advanceFlow(
         ctx,
@@ -1510,14 +1481,7 @@ async function pageUnavailablePoolListing(ctx: any, sessionId: string, pageText:
 }
 let telegramStopping = false;
 async function deliverDirectLookupOutbox() {
-  const leaseDb = repo();
-  let event: Record<string, unknown> | undefined;
-  try {
-    expireDueDirectTokenLookups(leaseDb);
-    event = leaseDirectLookupOutbox(leaseDb, 15_000);
-  } finally {
-    leaseDb.close();
-  }
+  const event = retrySqliteBusySync({operation:"telegram_direct_lookup_outbox_lease",log,run:()=>{const leaseDb=repo();try{expireDueDirectTokenLookups(leaseDb);return leaseDirectLookupOutbox(leaseDb,15_000);}finally{leaseDb.close();}}}) as Record<string,unknown>|undefined;
   if (!event) return false;
   const deliveryStarted = Date.now();
   let render: {
@@ -1572,7 +1536,7 @@ async function deliverDirectLookupOutbox() {
             });
             return;
           }
-          const result = renderDb.transitionTelegramFlowCAS({
+          const result = retrySqliteBusySync({operation:"telegram_direct_lookup_flow_transition",log,run:()=>renderDb.transitionTelegramFlowCAS({
             userId: String(event.user_id),
             chatId: String(event.chat_id),
             sessionId: flow.sessionId,
@@ -1581,7 +1545,7 @@ async function deliverDirectLookupOutbox() {
             nextState,
             now: nowMs(),
             ttlMs: sessionTtlMs,
-          });
+          })});
           log("telegram_flow_cas", {
             sessionId: flow.sessionId,
             source: "direct_lookup_outbox",
@@ -1634,7 +1598,7 @@ async function deliverDirectLookupOutbox() {
               );
           const v4 = [...await rankV4CandidatesForTelegram(eligibleV4),...presented.filter(item=>!eligible.has(item.poolId.toLowerCase())||!item.executionEligible).map(item=>item.executionEligible?{...item,executionEligible:false,uiState:'EVIDENCE_UNAVAILABLE' as const,uiReason:'NOT_ELIGIBLE_IN_REQUEST_REVISION'}:item)];
           if (v4.length || v3.length) {
-            const persisted = persistPoolListing({
+            const persisted = retrySqliteBusySync({operation:"telegram_direct_lookup_listing_persist",log,run:()=>persistPoolListing({
               db: renderDb,
               userId: String(event.user_id),
               chatId: String(event.chat_id),
@@ -1643,7 +1607,7 @@ async function deliverDirectLookupOutbox() {
               tokenSymbol: symbol,
               v4Candidates: v4,
               v3Rows: v3,
-            });
+            })});
             render = persisted.render;
             applyOutboxFlowState(persisted.state);
           } else
@@ -1657,17 +1621,17 @@ async function deliverDirectLookupOutbox() {
             freshExecutable = presented.filter(candidate=>candidate.executionEligible);
           if (freshExecutable.length) {
             const v4 = [...await rankV4CandidatesForTelegram(freshExecutable),...presented.filter(candidate=>!candidate.executionEligible)],
-              persisted = persistPoolListing({db:renderDb,userId:String(event.user_id),chatId:String(event.chat_id),flow,tokenAddress:getAddress(payload.token),tokenSymbol:symbol,v4Candidates:v4,v3Rows:renderDb.v3CachedPoolsForToken(payload.token,[robinhoodMainnet.assets.USDG,robinhoodMainnet.assets.WETH])});
+              persisted = retrySqliteBusySync({operation:"telegram_direct_lookup_listing_persist",log,run:()=>persistPoolListing({db:renderDb,userId:String(event.user_id),chatId:String(event.chat_id),flow,tokenAddress:getAddress(payload.token),tokenSymbol:symbol,v4Candidates:v4,v3Rows:renderDb.v3CachedPoolsForToken(payload.token,[robinhoodMainnet.assets.USDG,robinhoodMainnet.assets.WETH])})});
             render = persisted.render;
             applyOutboxFlowState(persisted.state);
           } else render = terminalLookupRender(payload.terminalStatus,symbol,payload.token,payload.reasonCode,directLookupEvidenceSummary(payload.rpcAttribution));
         }
-        saveDirectLookupOutboxRender(
+        retrySqliteBusySync({operation:"telegram_direct_lookup_render_persist",log,run:()=>saveDirectLookupOutboxRender(
           renderDb,
           String(event.id),
           render,
           render.hash,
-        );
+        )});
       } finally {
         renderDb.close();
       }
@@ -1685,7 +1649,7 @@ async function deliverDirectLookupOutbox() {
     }
     const completeDb = repo();
     try {
-      completeDirectLookupOutbox(completeDb, String(event.id));
+      retrySqliteBusySync({operation:"telegram_direct_lookup_outbox_complete",log,run:()=>completeDirectLookupOutbox(completeDb,String(event.id))});
     } finally {
       completeDb.close();
     }
@@ -1720,6 +1684,8 @@ async function deliverDirectLookupOutbox() {
       firstRpcAtMs: rpc.firstRpcAtMs ?? null,
       hydrationCompletedAtMs: rpc.hydrationCompletedAtMs ?? null,
       outboxCreatedAtMs: rpc.outboxCreatedAtMs ?? null,
+      queueLeaseWaitMs: Number(rpc.workerLeasedAtMs??0)-Number(rpc.requestPersistedAtMs??0),
+      rpcWaitMs: Number(rpc.hydrationCompletedAtMs??0)-Number(rpc.firstRpcAtMs??0),
       telegramEditMs: Date.now() - editStarted,
       totalMs: Date.now() - deliveryStarted,
       telegramListingCompleteAtMs: Date.now(),
@@ -1733,12 +1699,12 @@ async function deliverDirectLookupOutbox() {
     const retryDb = repo();
     let result;
     try {
-      result = retryDirectLookupOutbox(
+      result = retrySqliteBusySync({operation:"telegram_direct_lookup_outbox_retry",log,run:()=>retryDirectLookupOutbox(
         retryDb,
         String(event.id),
         textError(error),
         outboxRetryCount,
-      );
+      )});
     } finally {
       retryDb.close();
     }
@@ -1764,7 +1730,7 @@ async function directLookupOutboxConsumer() {
       log("telegram_direct_lookup_outbox_cycle_error", {
         error: textError(error),
       });
-      await sleep(Math.max(1_000, outboxCadenceMs));
+      await sleep(outboxCadenceMs);
     }
   }
 }
@@ -2027,7 +1993,7 @@ async function bidLadderDryRunPreview(ctx: any, enteredAmount?: string) {
     return ctx.reply(`V4_BID_LADDER_PREVIEW_REJECTED\n${textError(error)}`);
   }
 }
-async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string) {
+async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interactive?:{requestId:string;isCurrent:()=>boolean;setProgressMessageId:(messageId:number)=>void}) {
   const flow = loadFlow(ctx), raw = enteredAmount ?? ctx.match?.trim();
   if (!flow || flow.status !== "active" || flow.state.kind !== "v4_bid_ladder_amount")
     return unavailableFlow(ctx, "missing");
@@ -2040,10 +2006,20 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string) {
     return ctx.reply("V4_BID_LADDER_SELECTION_METADATA_INCOMPLETE");
   let total: bigint;
   try { total = parseHumanAmount(raw, funding.decimals); } catch (error) { return ctx.reply(textError(error)); }
+  const interactionStartedAtMs=Date.now(),progressStartedAtMs=Date.now(),progress=await ctx.reply("Preparing fresh LIVE preview…"),progressPaintedAtMs=Date.now(),progressMessageId=Number(progress.message_id);
+  interactive?.setProgressMessageId(progressMessageId);
+  log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"PROGRESS_FIRST_PAINT",startedAtMs:progressStartedAtMs,endedAtMs:progressPaintedAtMs,elapsedMs:progressPaintedAtMs-progressStartedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"MISS",outcome:"PAINTED",messageId:progressMessageId});
+  const discardProgress=async()=>{try{await bot.api.deleteMessage(Number(chat(ctx)),progressMessageId);}catch{}};
+  const editProgress=async(text:string,rows?:Array<Array<{label:string;data:string}>>)=>bot.api.editMessageText(Number(chat(ctx)),progressMessageId,text,rows?{reply_markup:keyboard(rows)}:undefined);
+  if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
+  const poolStartedAtMs=Date.now();
   const current = await inspectV4Pool(rpc, key);
-  if (current.status === "unavailable") return ctx.reply("V4_BID_LADDER_PREVIEW_UNAVAILABLE");
+  const poolEndedAtMs=Date.now();
+  log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"SELECTED_POOL_RESOLUTION",startedAtMs:poolStartedAtMs,endedAtMs:poolEndedAtMs,elapsedMs:poolEndedAtMs-poolStartedAtMs,dbWaitMs:0,rpcWaitMs:poolEndedAtMs-poolStartedAtMs,provider:"robinhood-rpc",queueWaitMs:0,cache:"MISS",outcome:current.status.toUpperCase()});
+  if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
+  if (current.status === "unavailable") return editProgress("V4_BID_LADDER_PREVIEW_UNAVAILABLE");
   if (current.value.initialized && exactV4PoolState(current.value, key, String(flow.state.poolId ?? "")) && current.value.liquidity === 0n)
-    return ctx.reply(
+    return editProgress(
       "V4 BID Ladder LIVE preview unavailable\nPool state: NO ACTIVE LIQUIDITY\nThe pool lost active liquidity before creation.\nRetry when liquidity returns.",
     );
   try {
@@ -2063,7 +2039,8 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string) {
         { ...flow.state, kind: "v4_bid_ladder_preview", bidLadderPreview: snapshotV4BidLadderPreview(preview) },
         "direct LIVE BID ladder created",
       );
-    if (!next) return unavailableFlow(ctx, "stale");
+    if (!next || (interactive&&!interactive.isCurrent())) { await discardProgress(); return; }
+    const persistenceStartedAtMs=Date.now();
     const db = repo();
     try {
       const native = sameAddress(funding.address, robinhoodMainnet.assets.USDG)
@@ -2075,28 +2052,36 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string) {
         (Number(total) / 10 ** funding.decimals) * native,
       );
     } finally { db.close(); }
-    return bidLadderLivePreview(ctx, preview.plan.ladderId);
+    const persistenceEndedAtMs=Date.now();
+    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"PREVIEW_PLAN_PERSISTED",startedAtMs:persistenceStartedAtMs,endedAtMs:persistenceEndedAtMs,elapsedMs:persistenceEndedAtMs-persistenceStartedAtMs,dbWaitMs:persistenceEndedAtMs-persistenceStartedAtMs,rpcWaitMs:0,provider:"sqlite-wal",queueWaitMs:0,cache:"MISS",outcome:"COMPLETE",ladderId:preview.plan.ladderId});
+    return bidLadderLivePreview(ctx, preview.plan.ladderId,{messageId:progressMessageId,requestId:interactive?.requestId??randomUUID(),sessionId:next.sessionId,isCurrent:interactive?.isCurrent,interactionStartedAtMs});
   } catch (error) {
     if (textError(error).includes("V4_BID_LADDER_DEPTH_NOT_REPRESENTABLE")) {
       const retry = advanceFlow(ctx, flow, { ...flow.state, kind: "v4_bid_ladder_depth" }, "BID ladder depth no longer representable");
-      if (!retry) return unavailableFlow(ctx, "stale");
-      return ctx.reply(
+      if (!retry || (interactive&&!interactive.isCurrent())) { await discardProgress(); return; }
+      return editProgress(
         `BID Ladder ${Number(flow.state.maxDownsideBps ?? 0) / 100}% is not representable as 5 distinct V4 ranges for this pool's tick spacing. Choose another max downside.`,
-        { reply_markup: keyboard([bidLadderDepthRows(retry), [{ label: "Custom", data: `bid-ladder-depth:${retry.sessionId}:custom` }], flowControls(retry)]) },
+        [bidLadderDepthRows(retry), [{ label: "Custom", data: `bid-ladder-depth:${retry.sessionId}:custom` }], flowControls(retry)],
       );
     }
-    return ctx.reply(`V4_BID_LADDER_CREATE_REJECTED\n${textError(error)}`);
+    if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
+    return editProgress(`V4_BID_LADDER_CREATE_REJECTED\n${textError(error)}`);
   }
 }
 async function bidLadderDirectLive(ctx: any, enteredAmount?: string) {
   const flow = loadFlow(ctx);
   if (!flow || flow.status !== "active") return unavailableFlow(ctx, "missing");
   const key = `${owner(ctx)}:${chat(ctx)}:${flow.sessionId}`,
+    updateId=String(ctx.update?.update_id??ctx.message?.message_id??"unknown"),
     existing = bidLadderDirectLiveInFlight.get(key);
-  if (existing) return existing;
-  const work = bidLadderDirectLiveOnce(ctx, enteredAmount);
-  bidLadderDirectLiveInFlight.set(key, work);
-  try { return await work; } finally { bidLadderDirectLiveInFlight.delete(key); }
+  if (existing?.updateId===updateId&&existing.promise) return existing.promise;
+  const request:BidLadderInteractiveWork={updateId,generation:(existing?.generation??0)+1};
+  bidLadderDirectLiveInFlight.set(key,request);
+  if(existing?.progressMessageId)void bot.api.deleteMessage(Number(chat(ctx)),existing.progressMessageId).catch(()=>{});
+  const requestId=`${flow.sessionId}:${flow.flowRevision}:${updateId}`,
+    work=bidLadderDirectLiveOnce(ctx,enteredAmount,{requestId,isCurrent:()=>bidLadderDirectLiveInFlight.get(key)===request,setProgressMessageId:(messageId)=>{request.progressMessageId=messageId;if(bidLadderDirectLiveInFlight.get(key)!==request)void bot.api.deleteMessage(Number(chat(ctx)),messageId).catch(()=>{});}});
+  request.promise=work;
+  try { return await work; } finally { if(bidLadderDirectLiveInFlight.get(key)===request)bidLadderDirectLiveInFlight.delete(key); }
 }
 async function bidLadderStart(ctx: any, selectionId: string) {
   const flow = loadFlow(ctx);
@@ -2485,6 +2470,8 @@ async function ladderLiveContext(
     wallet: wallet.address,
     fundingUsd,
     nativeUsd: native.nativeUsd,
+    nativeUsdSource: "nativeUsdSource" in native ? native.nativeUsdSource : "confirmed open projection",
+    nativeUsdObservedAtMs: "nativeUsdObservedAtMs" in native ? native.nativeUsdObservedAtMs : undefined,
     telemetry: (event, data) => log(event, data),
     runtime: {
       executionEnabled: env.EXECUTION_ENABLED,
@@ -2525,17 +2512,20 @@ async function ladderLiveContext(
   };
   return context;
 }
-async function bidLadderLivePreview(ctx: any, ladderId: string) {
+async function bidLadderLivePreview(ctx: any, ladderId: string, interactive?:{messageId:number;requestId:string;sessionId:string;isCurrent?:()=>boolean;interactionStartedAtMs:number}) {
   const db = repo();
   try {
-    const context = await ladderLiveContext(
+    const parentForLiquidity=db.loadBidLadder(ladderId),liquidityStartedAtMs=Date.now(),liquidityPromise=parentForLiquidity?dexV4PoolLiquidityLine(String(parentForLiquidity.pool_id),{
+        currency0:getAddress(String(parentForLiquidity.currency0)),currency1:getAddress(String(parentForLiquidity.currency1)),fee:Number(parentForLiquidity.fee),tickSpacing:Number(parentForLiquidity.tick_spacing),hooks:getAddress(String(parentForLiquidity.hooks)),
+      }).then(value=>({value,elapsedMs:Date.now()-liquidityStartedAtMs})):Promise.resolve({value:"Pool liquidity: Unavailable",elapsedMs:0}),
+      contextStartedAtMs=Date.now(),context = await ladderLiveContext(
         ctx,
         ladderId,
         db,
         allowed.has(owner(ctx)),
         true,
       ),
-      preview = await previewV4BidLadderLive(context),
+      contextEndedAtMs=Date.now(),previewStartedAtMs=Date.now(),preview = await previewV4BidLadderLive(context),previewEndedAtMs=Date.now(),liquidity=await liquidityPromise,
       buttons = preview.blockers.length
         ? [[{ label: "Retry LIVE Preview", data: bidLadderCallback("livePreview", ladderId) }]]
         : [
@@ -2546,24 +2536,20 @@ async function bidLadderLivePreview(ctx: any, ladderId: string) {
               },
             ],
           ];
-    const parent = preview.state.parent,
-      key: V4PoolKey = {
-        currency0: getAddress(String(parent.currency0)),
-        currency1: getAddress(String(parent.currency1)),
-        fee: Number(parent.fee),
-        tickSpacing: Number(parent.tick_spacing),
-        hooks: getAddress(String(parent.hooks)),
-      };
-    return ctx.reply(
-      formatV4BidLadderLivePreview(preview, {
-        poolLiquidityLine: await dexV4PoolLiquidityLine(String(parent.pool_id), key),
-      }),
-      buttons.length ? { reply_markup: keyboard(buttons) } : undefined,
-    );
+    const text=formatV4BidLadderLivePreview(preview,{poolLiquidityLine:liquidity.value}),currentFlow=interactive?loadFlow(ctx):undefined,
+      current=!interactive||(interactive.isCurrent?.()!==false&&currentFlow?.status==="active"&&currentFlow.sessionId===interactive.sessionId);
+    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"AUTHORITATIVE_PREVIEW_READY",startedAtMs:previewStartedAtMs,endedAtMs:previewEndedAtMs,elapsedMs:previewEndedAtMs-previewStartedAtMs,dbWaitMs:contextEndedAtMs-contextStartedAtMs,rpcWaitMs:previewEndedAtMs-previewStartedAtMs,provider:"robinhood-rpc+gmgn",queueWaitMs:0,cache:"CANONICAL_FRESH",outcome:preview.blockers.length?"BLOCKED":"READY",ladderId,liquidityMs:liquidity.elapsedMs,totalMs:Date.now()-(interactive?.interactionStartedAtMs??previewStartedAtMs)});
+    if(!current){if(interactive)try{await bot.api.deleteMessage(Number(chat(ctx)),interactive.messageId);}catch{}return;}
+    const sendStartedAtMs=Date.now();
+    const result=interactive
+      ? await bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,text,buttons.length?{reply_markup:keyboard(buttons)}:undefined)
+      : await ctx.reply(text,buttons.length?{reply_markup:keyboard(buttons)}:undefined);
+    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"FINAL_PREVIEW_TELEGRAM_DELIVERY",startedAtMs:sendStartedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-sendStartedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"N/A",outcome:"DELIVERED",ladderId});
+    return result;
   } catch (error) {
-    return ctx.reply(`V4_BID_LADDER_LIVE_PREVIEW_BLOCKED\n${textError(error)}`, {
-      reply_markup: keyboard([[{ label: "Retry LIVE Preview", data: bidLadderCallback("livePreview", ladderId) }]]),
-    });
+    if(interactive&&(interactive.isCurrent?.()===false||loadFlow(ctx)?.sessionId!==interactive.sessionId)){try{await bot.api.deleteMessage(Number(chat(ctx)),interactive.messageId);}catch{}return;}
+    const text=`V4_BID_LADDER_LIVE_PREVIEW_BLOCKED\n${textError(error)}`,options={reply_markup:keyboard([[{ label: "Retry LIVE Preview", data: bidLadderCallback("livePreview", ladderId) }]])};
+    return interactive?bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,text,options):ctx.reply(text,options);
   } finally {
     db.close();
   }

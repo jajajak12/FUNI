@@ -108,7 +108,7 @@ describe("Telegram SQLite busy handling", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-  it("exhausts direct-lookup create BUSY cleanly before creating a request or session", () => {
+  it("exhausts direct-lookup create BUSY cleanly without creating a request", () => {
     const dir = mkdtempSync(join(tmpdir(), "funi-direct-create-exhausted-")),
       path = join(dir, "db.sqlite");
     migrateSqlite(path, "infra/migrations");
@@ -139,11 +139,14 @@ describe("Telegram SQLite busy handling", () => {
       ).toEqual({ count: 0 });
       const source = readFileSync("apps/telegram-lp-bot/src/index.ts", "utf8"),
         section = source.slice(
-          source.indexOf("const interactionId = randomUUID()"),
+          source.indexOf("async function beginToken"),
           source.indexOf("function renderPoolListing"),
         );
+      expect(section.indexOf("message = await ctx.reply")).toBeLessThan(
+        section.indexOf("retrySqliteBusySync"),
+      );
       expect(section.indexOf("retrySqliteBusySync")).toBeLessThan(
-        section.indexOf("const flow = newTokenFlow"),
+        section.indexOf("attachDirectLookupSubscriber"),
       );
     } finally {
       repo.close();

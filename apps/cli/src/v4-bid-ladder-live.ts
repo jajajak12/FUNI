@@ -18,6 +18,7 @@ import {
 } from "@funi/core";
 import {
   sqliteTransientCode,
+  withEconomicForegroundPersistenceSync,
   withSqliteTransientRetrySync,
   type SqliteLedgerRepository,
 } from "@funi/ledger";
@@ -35,25 +36,31 @@ import {
   inspectV4Pool,
   inspectV4Position,
   inspectV4ClaimableFeesBatch,
+  permit2Abi,
   permit2Allowance,
   poolId,
   reconcileV4BatchFullDecreaseReceipt,
   reconcileV4BatchCollectReceipt,
   reconcileV4BatchMintReceipt,
   V4_ROBINHOOD_DEPLOYMENTS,
+  v4StateViewAbi,
   v4ExecutionBlockers,
   type V4PoolKey,
+  type V4PoolState,
 } from "@funi/v4";
 import {
   broadcastDurableTransaction,
+  bufferedBroadcastGasPrice,
   DurableTransactionReconciliationPendingError,
   type DurablePreparedTransaction,
 } from "./transaction-boundary.js";
 import { expireAbandonedPlannedV4BidLadders } from "./v4-bid-ladder-cancellation.js";
 import {
+  fetchCanonicalGmgnEntryPrice,
   freshLpEntryPriceGuard,
+  LP_ENTRY_PRICE_PREVIEW_TTL_MS,
   orientPoolPriceFundingPerTarget,
-  type LpEntryPriceGuardResult,
+  type GmgnEntryPriceEvidence,
 } from "./lp-entry-price-guard.js";
 import { enqueuePortfolioRefresh, enqueueTargetedPositionReconciliation, markOperationalPositionOpenConfirming, persistPortfolioSnapshot } from "./active-position-reconciliation.js";
 import { trustedV4WethUsdReference } from "./portfolio.js";
@@ -65,7 +72,7 @@ import {
 import { rawUsdMicros, usdMicrosToText, valueV4ReturnsFromSqrtPriceX96 } from "./v4-realized-accounting.js";
 import { ensureEconomicReconciliationWork, type EconomicWorkflowKind } from "./economic-reconciliation-work.js";
 import { convergeTerminalV4BidLadder } from "./v4-bid-ladder-terminal-convergence.js";
-import { assertDurableV4RecoveryStage } from "./v4-durable-journal-stages.js";
+import { assertDurableV4RecoveryStage, isDurableV4ApprovalStage } from "./v4-durable-journal-stages.js";
 
 const CHAIN_ID = 4663,
   CHAIN_KEY = "robinhood",
@@ -167,12 +174,36 @@ export type LadderLiveContext = {
   wallet: Address;
   fundingUsd: number;
   nativeUsd: number;
+  nativeUsdSource?: string;
+  nativeUsdObservedAtMs?: number;
   runtime: LadderLiveRuntime;
   entryPriceFetch?: Parameters<typeof freshLpEntryPriceGuard>[0]["fetch"];
   marketCapEvidence?: V4BidLadderMarketCapEvidence;
   nowMs?: () => number;
   telemetry?: (event: string, data: Record<string, unknown>) => void;
 };
+export type V4BidLadderGasProjection = {
+  estimatedGas: bigint;
+  signedGasLimit: bigint;
+  gasLimitInflationFactor: number;
+  gasPrice: bigint;
+  nativeUsd: number;
+  nativeUsdSource: string;
+  estimatedExecutionUsd: number;
+  maximumProjectedFeeUsd: number;
+  capUsd: number;
+  exceedsCap: boolean;
+};
+export function v4BidLadderGasProjection(input:{estimatedGas:bigint;signedGasLimit?:bigint;gasPrice:bigint;gasPriceAlreadyBuffered?:boolean;nativeUsd:number;nativeUsdSource?:string;capUsd:number}):V4BidLadderGasProjection {
+  if(input.estimatedGas<=0n||input.gasPrice<=0n||!Number.isFinite(input.nativeUsd)||input.nativeUsd<=0||!Number.isFinite(input.capUsd)||input.capUsd<0)throw new Error("V4_BID_LADDER_GAS_EVIDENCE_INVALID");
+  const signedGasLimit=input.signedGasLimit??input.estimatedGas*12n/10n,
+    gasPrice=input.gasPriceAlreadyBuffered?input.gasPrice:bufferedBroadcastGasPrice(input.gasPrice),
+    estimatedExecutionUsd=Number(input.estimatedGas*gasPrice)/1e18*input.nativeUsd,
+    maximumProjectedFeeUsd=Number(signedGasLimit*gasPrice)/1e18*input.nativeUsd;
+  return {estimatedGas:input.estimatedGas,signedGasLimit,gasLimitInflationFactor:Number(signedGasLimit)/Number(input.estimatedGas),gasPrice,nativeUsd:input.nativeUsd,nativeUsdSource:input.nativeUsdSource??"canonical V4 WETH/USDG",estimatedExecutionUsd,maximumProjectedFeeUsd,capUsd:input.capUsd,exceedsCap:!Number.isFinite(maximumProjectedFeeUsd)||maximumProjectedFeeUsd>input.capUsd};
+}
+const gasUsdText=(value:number)=>`$${value.toFixed(3)}`;
+export function formatV4BidLadderGasCapExceeded(value:V4BidLadderGasProjection){return ["V4_BID_LADDER_GAS_CAP_EXCEEDED",`Estimated execution: ${gasUsdText(value.estimatedExecutionUsd)}`,`Maximum projected fee: ${gasUsdText(value.maximumProjectedFeeUsd)}`,`Safety cap: $${value.capUsd.toFixed(2)}`,`Gas limit: ${value.signedGasLimit}`,`Gas price: ${(Number(value.gasPrice)/1e9).toFixed(3)} gwei`].join("\n");}
 type OpenPostReceiptContext = {
   priorReceiptReuse: boolean;
 };
@@ -477,13 +508,13 @@ function preparedFrom(
     throw new Error("V4_BID_LADDER_PREPARED_REQUEST_INVALID");
   }
 }
-type BoundCloseValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1";poolId:string;poolKey:V4PoolKey;sqrtPriceX96:string;observationBlock:string;observedAtMs:number;token0Decimals:number;token1Decimals:number};
-function closeValuationFromJournal(repo:SqliteLedgerRepository,ladderId:string):BoundCloseValuation|undefined{const row=journalRow(repo,ladderId,"CLOSE_BATCH");try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).closeValuation as BoundCloseValuation|undefined;if(!value||value.contract!=="DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1"||!/^\d+$/.test(value.sqrtPriceX96)||!/^\d+$/.test(value.observationBlock)||!Number.isSafeInteger(value.observedAtMs))return;return value;}catch{return;}}
-type BoundCollectValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1";status:"AVAILABLE"|"INCOMPLETE";poolId:string;poolKey:V4PoolKey;sqrtPriceX96:string|null;observationBlock:string;observedAtMs:number;token0Decimals:number;token1Decimals:number;evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP";receiptTransactionIndex:number|null;sameBlockLaterPoolSwaps:number;reason?:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"|"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"};
+type BoundCloseValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1";poolId:string;poolKey:V4PoolKey;sqrtPriceX96:string;tick:number;activeLiquidity:string;initialized:boolean;observationBlock:string;observedAtMs:number;token0Decimals:number;token1Decimals:number};
+function closeValuationFromJournal(repo:SqliteLedgerRepository,ladderId:string):BoundCloseValuation|undefined{const row=journalRow(repo,ladderId,"CLOSE_BATCH");try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).closeValuation as BoundCloseValuation|undefined;if(!value||value.contract!=="DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1"||!/^\d+$/.test(value.sqrtPriceX96)||!/^\d+$/.test(value.activeLiquidity)||!/^\d+$/.test(value.observationBlock)||!Number.isInteger(value.tick)||typeof value.initialized!=="boolean"||!Number.isSafeInteger(value.observedAtMs))return;return value;}catch{return;}}
+type BoundCollectValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1";status:"AVAILABLE"|"INCOMPLETE";poolId:string;poolKey:V4PoolKey;sqrtPriceX96:string|null;tick:number|null;activeLiquidity:string|null;initialized:boolean|null;observationBlock:string;observedAtMs:number;token0Decimals:number;token1Decimals:number;evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP";receiptTransactionIndex:number|null;sameBlockLaterPoolSwaps:number;reason?:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"|"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"};
 const v4SwapEvent=parseAbiItem("event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)");
-function collectValuationFromJournal(repo:SqliteLedgerRepository,ladderId:string,stage:string):BoundCollectValuation|undefined{const row=journalRow(repo,ladderId,stage);try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).collectValuation as BoundCollectValuation|undefined;if(!value||value.contract!=="DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1"||!/^\d+$/.test(value.observationBlock)||!Number.isSafeInteger(value.observedAtMs)||!same(value.poolId,String(poolId(value.poolKey))))return;if(value.status==="AVAILABLE"&&(!value.sqrtPriceX96||!/^\d+$/.test(value.sqrtPriceX96)))return;return value;}catch{return;}}
+function collectValuationFromJournal(repo:SqliteLedgerRepository,ladderId:string,stage:string):BoundCollectValuation|undefined{const row=journalRow(repo,ladderId,stage);try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).collectValuation as BoundCollectValuation|undefined;if(!value||value.contract!=="DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1"||!/^\d+$/.test(value.observationBlock)||!Number.isSafeInteger(value.observedAtMs)||!same(value.poolId,String(poolId(value.poolKey))))return;if(value.status==="AVAILABLE"&&(!value.sqrtPriceX96||!/^\d+$/.test(value.sqrtPriceX96)||!Number.isInteger(value.tick)||!value.activeLiquidity||!/^\d+$/.test(value.activeLiquidity)||typeof value.initialized!=="boolean"))return;return value;}catch{return;}}
 function persistCollectValuation(repo:SqliteLedgerRepository,ladderId:string,stage:string,value:BoundCollectValuation){const row=journalRow(repo,ladderId,stage);if(!row)throw new Error("V4_BID_LADDER_COLLECT_JOURNAL_MISSING");let prior:Record<string,unknown>={};try{prior=JSON.parse(String(row.provider_evidence_json??"{}"));}catch{}repo.db.prepare("UPDATE chain_transaction_journal SET provider_evidence_json=?,updated_at=? WHERE chain_id=? AND journal_id=? AND status='CONFIRMED'").run(json({...prior,collectValuation:value}),new Date().toISOString(),CHAIN_ID,String(row.journal_id));return value;}
-async function captureCollectValuation(input:LadderLiveContext,state:LadderRows,receipt:TransactionReceipt,stage:string):Promise<BoundCollectValuation>{const existing=collectValuationFromJournal(input.repo,input.ladderId,stage);if(existing?.status==="AVAILABLE")return existing;const observedAtMs=Date.now(),base={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1" as const,poolId:String(state.parent.pool_id),poolKey:state.key,observationBlock:receipt.blockNumber.toString(),observedAtMs,token0Decimals:tokenDecimals(input.repo,state.key.currency0),token1Decimals:tokenDecimals(input.repo,state.key.currency1),evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP" as const,receiptTransactionIndex:Number.isSafeInteger(receipt.transactionIndex)?receipt.transactionIndex:null};let laterPoolSwaps:number|null=null;try{if(base.receiptTransactionIndex===null)throw new Error("RECEIPT_TRANSACTION_INDEX_UNAVAILABLE");const swaps=await input.rpc.withClient(client=>client.getLogs({address:V4_ROBINHOOD_DEPLOYMENTS.poolManager,event:v4SwapEvent,args:{id:base.poolId as Hash},fromBlock:receipt.blockNumber,toBlock:receipt.blockNumber}),{stage:"v4_collect_historical_valuation",method:"PoolManager.Swap"});laterPoolSwaps=swaps.filter(log=>log.transactionIndex===null||Number(log.transactionIndex)>base.receiptTransactionIndex!).length;if(laterPoolSwaps>0)throw new Error("LATER_POOL_SWAP_PRESENT");}catch{return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"INCOMPLETE",sqrtPriceX96:null,sameBlockLaterPoolSwaps:laterPoolSwaps??-1,reason:"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"});}const pool=await inspectV4Pool(input.rpc,state.key,receipt.blockNumber);if(pool.status==="unavailable"||!same(pool.value.id,base.poolId)||pool.value.blockNumber!==receipt.blockNumber)return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"INCOMPLETE",sqrtPriceX96:null,sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"});return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"AVAILABLE",sqrtPriceX96:pool.value.sqrtPriceX96.toString(),sameBlockLaterPoolSwaps:0});}
+async function captureCollectValuation(input:LadderLiveContext,state:LadderRows,receipt:TransactionReceipt,stage:string):Promise<BoundCollectValuation>{const existing=collectValuationFromJournal(input.repo,input.ladderId,stage);if(existing?.status==="AVAILABLE")return existing;const observedAtMs=Date.now(),base={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1" as const,poolId:String(state.parent.pool_id),poolKey:state.key,observationBlock:receipt.blockNumber.toString(),observedAtMs,token0Decimals:tokenDecimals(input.repo,state.key.currency0),token1Decimals:tokenDecimals(input.repo,state.key.currency1),evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP" as const,receiptTransactionIndex:Number.isSafeInteger(receipt.transactionIndex)?receipt.transactionIndex:null};let laterPoolSwaps:number|null=null;try{if(base.receiptTransactionIndex===null)throw new Error("RECEIPT_TRANSACTION_INDEX_UNAVAILABLE");const swaps=await input.rpc.withClient(client=>client.getLogs({address:V4_ROBINHOOD_DEPLOYMENTS.poolManager,event:v4SwapEvent,args:{id:base.poolId as Hash},fromBlock:receipt.blockNumber,toBlock:receipt.blockNumber}),{stage:"v4_collect_historical_valuation",method:"PoolManager.Swap"});laterPoolSwaps=swaps.filter(log=>log.transactionIndex===null||Number(log.transactionIndex)>base.receiptTransactionIndex!).length;if(laterPoolSwaps>0)throw new Error("LATER_POOL_SWAP_PRESENT");}catch{return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"INCOMPLETE",sqrtPriceX96:null,tick:null,activeLiquidity:null,initialized:null,sameBlockLaterPoolSwaps:laterPoolSwaps??-1,reason:"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"});}const pool=await inspectV4Pool(input.rpc,state.key,receipt.blockNumber);if(pool.status==="unavailable"||!same(pool.value.id,base.poolId)||pool.value.blockNumber!==receipt.blockNumber)return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"INCOMPLETE",sqrtPriceX96:null,tick:null,activeLiquidity:null,initialized:null,sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"});return persistCollectValuation(input.repo,input.ladderId,stage,{...base,status:"AVAILABLE",sqrtPriceX96:pool.value.sqrtPriceX96.toString(),tick:pool.value.tick,activeLiquidity:pool.value.liquidity.toString(),initialized:pool.value.initialized,sameBlockLaterPoolSwaps:0});}
 export function captureV4BidLadderCollectValuation(input:LadderLiveContext,receipt:TransactionReceipt,stage:`COLLECT_BATCH:${string}`){return captureCollectValuation(input,rows(input.repo,input.ladderId),receipt,stage);}
 type CloseFeeLeg={tokenId:bigint;liquidity:bigint;tickLower:number;tickUpper:number};
 type BoundCloseFeeAttribution={
@@ -492,6 +523,9 @@ type BoundCloseFeeAttribution={
   poolId:string;
   poolKey:V4PoolKey;
   sqrtPriceX96:string|null;
+  tick:number|null;
+  activeLiquidity:string|null;
+  initialized:boolean|null;
   observationBlock:string;
   observedAtMs:number;
   token0Decimals:number;
@@ -511,7 +545,7 @@ type BoundCloseFeeAttribution={
   perNft:Array<{tokenId:string;liquidityRaw:string;tickLower:number;tickUpper:number;principal0Raw:string;principal1Raw:string}>;
   reason?:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"|"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"|"INCOMPLETE_UNSUPPORTED_POOL"|"INCOMPLETE_CLOSE_PRINCIPAL_EXCEEDS_RETURN";
 };
-function closeFeeAttributionFromJournal(repo:SqliteLedgerRepository,ladderId:string){const row=journalRow(repo,ladderId,"CLOSE_BATCH");try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).closeFeeAttribution as BoundCloseFeeAttribution|undefined;if(!value||value.contract!=="V4_BID_LADDER_CLOSE_FEE_ATTRIBUTION_V1"||!/^\d+$/.test(value.observationBlock)||!same(value.poolId,String(poolId(value.poolKey))))return;return value;}catch{return;}}
+function closeFeeAttributionFromJournal(repo:SqliteLedgerRepository,ladderId:string){const row=journalRow(repo,ladderId,"CLOSE_BATCH");try{const value=JSON.parse(String(row?.provider_evidence_json??"{}")).closeFeeAttribution as BoundCloseFeeAttribution|undefined;if(!value||value.contract!=="V4_BID_LADDER_CLOSE_FEE_ATTRIBUTION_V1"||!/^\d+$/.test(value.observationBlock)||!same(value.poolId,String(poolId(value.poolKey))))return;if(value.status==="AVAILABLE"&&(!value.sqrtPriceX96||!Number.isInteger(value.tick)||!value.activeLiquidity||!/^\d+$/.test(value.activeLiquidity)||typeof value.initialized!=="boolean"))return;return value;}catch{return;}}
 function persistCloseFeeAttribution(repo:SqliteLedgerRepository,ladderId:string,value:BoundCloseFeeAttribution){const row=journalRow(repo,ladderId,"CLOSE_BATCH");if(!row)throw new Error("V4_BID_LADDER_CLOSE_JOURNAL_MISSING");let prior:Record<string,unknown>={};try{prior=JSON.parse(String(row.provider_evidence_json??"{}"));}catch{}const next=json({...prior,closeFeeAttribution:value});if(String(row.provider_evidence_json)!==next)repo.db.prepare("UPDATE chain_transaction_journal SET provider_evidence_json=?,updated_at=? WHERE chain_id=? AND journal_id=? AND status='CONFIRMED'").run(next,new Date().toISOString(),CHAIN_ID,String(row.journal_id));return value;}
 export function exactV4BidLadderClosePrincipalFeeDecomposition(input:{sqrtPriceX96:bigint;aggregateReturned0Raw:bigint;aggregateReturned1Raw:bigint;legs:readonly CloseFeeLeg[]}){
   const perNft=input.legs.map(leg=>{const principal=amountsForLiquidity(input.sqrtPriceX96,leg.tickLower,leg.tickUpper,leg.liquidity);return {tokenId:leg.tokenId.toString(),liquidityRaw:leg.liquidity.toString(),tickLower:leg.tickLower,tickUpper:leg.tickUpper,principal0Raw:principal.token0.toString(),principal1Raw:principal.token1.toString()};}),principal=perNft.reduce((sum,leg)=>({token0:sum.token0+BigInt(leg.principal0Raw),token1:sum.token1+BigInt(leg.principal1Raw)}),{token0:0n,token1:0n});
@@ -524,11 +558,12 @@ async function captureCloseFeeAttribution(input:LadderLiveContext,state:LadderRo
   const existing=closeFeeAttributionFromJournal(input.repo,input.ladderId);if(existing){if(existing.receiptBlockNumber!==receipt.blockNumber.toString()||existing.receiptBlockHash.toLowerCase()!==String(receipt.blockHash).toLowerCase()||existing.aggregateReturned0Raw!==returned.token0.toString()||existing.aggregateReturned1Raw!==returned.token1.toString())throw new Error("V4_BID_LADDER_CLOSE_FEE_EVIDENCE_IDENTITY_CONFLICT");return existing;}
   const observedAtMs=Date.now(),base={contract:"V4_BID_LADDER_CLOSE_FEE_ATTRIBUTION_V1" as const,poolId:String(state.parent.pool_id),poolKey:state.key,observationBlock:receipt.blockNumber.toString(),observedAtMs,token0Decimals:tokenDecimals(input.repo,state.key.currency0),token1Decimals:tokenDecimals(input.repo,state.key.currency1),evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP" as const,receiptBlockNumber:receipt.blockNumber.toString(),receiptBlockHash:String(receipt.blockHash),receiptTransactionIndex:Number.isSafeInteger(receipt.transactionIndex)?receipt.transactionIndex:null,aggregateReturned0Raw:returned.token0.toString(),aggregateReturned1Raw:returned.token1.toString()},empty={aggregatePrincipal0Raw:null,aggregatePrincipal1Raw:null,closeFee0Raw:null,closeFee1Raw:null,rawInvariantExact:false,perNft:[] as BoundCloseFeeAttribution["perNft"]};
   let laterPoolSwaps:number|null=null;
-  try{if(base.receiptTransactionIndex===null)throw new Error("RECEIPT_TRANSACTION_INDEX_UNAVAILABLE");const swaps=await input.rpc.withClient(client=>client.getLogs({address:V4_ROBINHOOD_DEPLOYMENTS.poolManager,event:v4SwapEvent,args:{id:base.poolId as Hash},fromBlock:receipt.blockNumber,toBlock:receipt.blockNumber}),{stage:"v4_close_fee_historical_valuation",method:"PoolManager.Swap"});laterPoolSwaps=swaps.filter(log=>log.transactionIndex===null||Number(log.transactionIndex)>base.receiptTransactionIndex!).length;if(laterPoolSwaps>0)throw new Error("LATER_POOL_SWAP_PRESENT");}catch{return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",sqrtPriceX96:null,sameBlockLaterPoolSwaps:laterPoolSwaps??-1,reason:"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"});}
-  const pool=await inspectV4Pool(input.rpc,state.key,receipt.blockNumber);if(pool.status==="unavailable"||!same(pool.value.id,base.poolId)||pool.value.blockNumber!==receipt.blockNumber)return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",sqrtPriceX96:null,sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"});
-  if(v4ExecutionBlockers(pool.value).length)return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",sqrtPriceX96:pool.value.sqrtPriceX96.toString(),sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_UNSUPPORTED_POOL"});
-  const split=exactV4BidLadderClosePrincipalFeeDecomposition({sqrtPriceX96:pool.value.sqrtPriceX96,aggregateReturned0Raw:returned.token0,aggregateReturned1Raw:returned.token1,legs:expected});if(split.status==="INCOMPLETE")return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,status:"INCOMPLETE",sqrtPriceX96:pool.value.sqrtPriceX96.toString(),sameBlockLaterPoolSwaps:0,aggregatePrincipal0Raw:split.principal.token0.toString(),aggregatePrincipal1Raw:split.principal.token1.toString(),closeFee0Raw:null,closeFee1Raw:null,rawInvariantExact:false,perNft:split.perNft,reason:split.reason});
-  return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,status:"AVAILABLE",sqrtPriceX96:pool.value.sqrtPriceX96.toString(),sameBlockLaterPoolSwaps:0,aggregatePrincipal0Raw:split.principal.token0.toString(),aggregatePrincipal1Raw:split.principal.token1.toString(),closeFee0Raw:split.fees.token0.toString(),closeFee1Raw:split.fees.token1.toString(),rawInvariantExact:true,perNft:split.perNft});
+  try{if(base.receiptTransactionIndex===null)throw new Error("RECEIPT_TRANSACTION_INDEX_UNAVAILABLE");const swaps=await input.rpc.withClient(client=>client.getLogs({address:V4_ROBINHOOD_DEPLOYMENTS.poolManager,event:v4SwapEvent,args:{id:base.poolId as Hash},fromBlock:receipt.blockNumber,toBlock:receipt.blockNumber}),{stage:"v4_close_fee_historical_valuation",method:"PoolManager.Swap"});laterPoolSwaps=swaps.filter(log=>log.transactionIndex===null||Number(log.transactionIndex)>base.receiptTransactionIndex!).length;if(laterPoolSwaps>0)throw new Error("LATER_POOL_SWAP_PRESENT");}catch{return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",sqrtPriceX96:null,tick:null,activeLiquidity:null,initialized:null,sameBlockLaterPoolSwaps:laterPoolSwaps??-1,reason:"INCOMPLETE_SAME_BLOCK_PRICE_AMBIGUITY"});}
+  const pool=await inspectV4Pool(input.rpc,state.key,receipt.blockNumber);if(pool.status==="unavailable"||!same(pool.value.id,base.poolId)||pool.value.blockNumber!==receipt.blockNumber)return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",sqrtPriceX96:null,tick:null,activeLiquidity:null,initialized:null,sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"});
+  const poolState={sqrtPriceX96:pool.value.sqrtPriceX96.toString(),tick:pool.value.tick,activeLiquidity:pool.value.liquidity.toString(),initialized:pool.value.initialized};
+  if(v4ExecutionBlockers(pool.value).length)return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,...empty,status:"INCOMPLETE",...poolState,sameBlockLaterPoolSwaps:0,reason:"INCOMPLETE_UNSUPPORTED_POOL"});
+  const split=exactV4BidLadderClosePrincipalFeeDecomposition({sqrtPriceX96:pool.value.sqrtPriceX96,aggregateReturned0Raw:returned.token0,aggregateReturned1Raw:returned.token1,legs:expected});if(split.status==="INCOMPLETE")return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,status:"INCOMPLETE",...poolState,sameBlockLaterPoolSwaps:0,aggregatePrincipal0Raw:split.principal.token0.toString(),aggregatePrincipal1Raw:split.principal.token1.toString(),closeFee0Raw:null,closeFee1Raw:null,rawInvariantExact:false,perNft:split.perNft,reason:split.reason});
+  return persistCloseFeeAttribution(input.repo,input.ladderId,{...base,status:"AVAILABLE",...poolState,sameBlockLaterPoolSwaps:0,aggregatePrincipal0Raw:split.principal.token0.toString(),aggregatePrincipal1Raw:split.principal.token1.toString(),closeFee0Raw:split.fees.token0.toString(),closeFee1Raw:split.fees.token1.toString(),rawInvariantExact:true,perNft:split.perNft});
 }
 export function captureV4BidLadderCloseFeeAttribution(input:LadderLiveContext,receipt:TransactionReceipt,expected:readonly CloseFeeLeg[],returned:{token0:bigint;token1:bigint}){return captureCloseFeeAttribution(input,rows(input.repo,input.ladderId),receipt,expected,returned);}
 export function v4BidLadderClosePairLabel(input:{targetSymbol?:unknown;fundingSymbol?:unknown;targetAddress:unknown;fundingAddress:unknown}){const short=(value:unknown)=>{const text=String(value);return text.length>14?`${text.slice(0,6)}…${text.slice(-4)}`:text;};return `${String(input.targetSymbol??"").trim()||short(input.targetAddress)}/${String(input.fundingSymbol??"").trim()||short(input.fundingAddress)}`;}
@@ -747,10 +782,7 @@ async function submit(
         })(),
       persistPrepared: (prepared) => {
         const providerEvidence = json({ prepared, ...(input.closeValuation?{closeValuation:input.closeValuation}:{}) });
-        withSqliteTransientRetrySync({
-          operation: `v4_bid_ladder_${input.stage.toLowerCase()}_prepared_commit`,
-          run: () =>
-            input.repo.db.transaction(() => {
+        input.repo.db.transaction(() => {
               input.repo.persistChainPreparedTransaction({
                 chainId: CHAIN_ID,
                 chainKey: CHAIN_KEY,
@@ -846,71 +878,89 @@ async function submit(
                     "V4_BID_LADDER_USDG_RESET_CLOSE_PHASE_INVALID",
                   );
               }
-            })(),
-        });
+            })();
       },
       markSubmitted: () => {
-        const row = journalRow(input.repo, input.ladderId, input.stage);
-        if (!row) return;
-        withSqliteTransientRetrySync({
-          operation: `v4_bid_ladder_${input.stage.toLowerCase()}_submitted_commit`,
-          run: () =>
-            input.repo.db.transaction(() => {
-              if (String(row.status) === "PREPARED")
-                input.repo.transitionChainTransaction({
-                  chainId: CHAIN_ID,
-                  journalId: id,
-                  from: "PREPARED",
-                  to: "SUBMITTED",
-                });
-              if (
-                input.batchBinding === "close" &&
-                input.closeReason === "USDG_RESET_REPOSITION"
-              ) {
-                const reset = input.repo.loadBidLadderUsdReset(input.ladderId);
-                if (String(reset?.phase) === "CLOSE_PREPARED")
-                  input.repo.transitionBidLadderUsdReset({
-                    ladderId: input.ladderId,
-                    from: "CLOSE_PREPARED",
-                    to: "CLOSE_SUBMITTED",
-                  });
-              }
-              if (input.batchBinding === "open") {
-                const child = input.repo.loadBidLadderUsdReset(input.ladderId),
-                  previous = child?.previous_ladder_id
-                    ? input.repo.loadBidLadderUsdReset(
-                        String(child.previous_ladder_id),
-                      )
-                    : undefined;
-                if (previous && String(previous.phase) === "REOPEN_PREPARED")
-                  input.repo.transitionBidLadderUsdReset({
-                    ladderId: String(previous.ladder_id),
-                    from: "REOPEN_PREPARED",
-                    to: "REOPEN_SUBMITTED",
-                    reopenWorkflowIdentity: input.ladderId,
-                  });
-              }
-            })(),
-        });
+        input.repo.db.transaction(() => {
+          // Re-read on every canonical retry. Another recovery consumer may
+          // already have advanced either journal or workflow state.
+          const row = journalRow(input.repo, input.ladderId, input.stage);
+          if (!row) return;
+          if (String(row.status) === "PREPARED")
+            input.repo.transitionChainTransaction({
+              chainId: CHAIN_ID,
+              journalId: id,
+              from: "PREPARED",
+              to: "SUBMITTED",
+            });
+          if (
+            input.batchBinding === "close" &&
+            input.closeReason === "USDG_RESET_REPOSITION"
+          ) {
+            const reset = input.repo.loadBidLadderUsdReset(input.ladderId);
+            if (String(reset?.phase) === "CLOSE_PREPARED")
+              input.repo.transitionBidLadderUsdReset({
+                ladderId: input.ladderId,
+                from: "CLOSE_PREPARED",
+                to: "CLOSE_SUBMITTED",
+              });
+          }
+          if (input.batchBinding === "open") {
+            const child = input.repo.loadBidLadderUsdReset(input.ladderId),
+              previous = child?.previous_ladder_id
+                ? input.repo.loadBidLadderUsdReset(
+                    String(child.previous_ladder_id),
+                  )
+                : undefined;
+            if (previous && String(previous.phase) === "REOPEN_PREPARED")
+              input.repo.transitionBidLadderUsdReset({
+                ladderId: String(previous.ladder_id),
+                from: "REOPEN_PREPARED",
+                to: "REOPEN_SUBMITTED",
+                reopenWorkflowIdentity: input.ladderId,
+              });
+          }
+        })();
       },
+      handoffRecovery: (prepared) =>
+        ensureEconomicReconciliationWork(input.repo, {
+          chainId: CHAIN_ID,
+          workflowKind: bidLadderWorkKind(input.stage),
+          workflowIdentity: input.ladderId,
+          semanticStage: input.stage,
+          transactionHash: prepared.expectedHash,
+          sourceTable: "chain_transaction_journal",
+          sourceIdentity: id,
+          priority: bidLadderWorkKind(input.stage) === "V4_BID_LADDER_OPEN" ? 1_000 : 500,
+        }),
     },
     beforeSigning: ({ gasLimit, gasPrice }) => {
-      const usd = (Number(gasLimit * gasPrice) / 1e18) * input.nativeUsd;
-      if (!Number.isFinite(usd) || usd > input.runtime.maxGasUsd)
-        throw new Error("V4_BID_LADDER_GAS_CAP_EXCEEDED");
+      const projection=v4BidLadderGasProjection({estimatedGas:input.estimatedGas,signedGasLimit:gasLimit,gasPrice,gasPriceAlreadyBuffered:true,nativeUsd:input.nativeUsd,nativeUsdSource:input.nativeUsdSource,capUsd:input.runtime.maxGasUsd});
+      try{input.telemetry?.("v4_bid_ladder_gas_cap_validation",{ladderId:input.ladderId,stage:input.stage,outcome:projection.exceedsCap?"BLOCKED":"PASS",estimateGas:projection.estimatedGas.toString(),signedGasLimit:projection.signedGasLimit.toString(),gasLimitInflationFactor:projection.gasLimitInflationFactor,gasPriceWei:projection.gasPrice.toString(),gasPriceGwei:Number(projection.gasPrice)/1e9,nativeUsd:projection.nativeUsd,nativeUsdSource:projection.nativeUsdSource,nativeUsdObservedAtMs:input.nativeUsdObservedAtMs??null,estimatedExecutionUsd:projection.estimatedExecutionUsd,maximumProjectedFeeUsd:projection.maximumProjectedFeeUsd,configuredCapUsd:projection.capUsd,failureStage:projection.exceedsCap?"BEFORE_SIGNING_GAS_CAP":null,signingUsed:false,broadcastUsed:false});}catch{}
+      if (projection.exceedsCap) throw new Error(formatV4BidLadderGasCapExceeded(projection));
     },
   });
   const receipt = (result.receipt ??
     (await input.rpc.withClient((client) =>
       client.waitForTransactionReceipt({ hash: result.hash, timeout: 60_000 }),
     ))) as TransactionReceipt;
+  const persistTerminal = <T>(operation: string, run: () => T) =>
+    withEconomicForegroundPersistenceSync({
+      databasePath: input.repo.path,
+      component: "v4-bid-ladder-terminal-journal",
+      operation,
+      workflow: input.ladderId,
+      semanticStage: input.stage,
+      run,
+      onTelemetry: (event) => input.telemetry?.("sqlite_write_window", event),
+    });
   if (receipt.status !== "success") {
     const failed = journalRow(input.repo, input.ladderId, input.stage);
     if (failed && ["PREPARED", "SUBMITTED"].includes(String(failed.status))) {
       const from = String(failed.status) as "PREPARED" | "SUBMITTED";
-      withSqliteTransientRetrySync({
-        operation: `v4_bid_ladder_${input.stage.toLowerCase()}_failed_commit`,
-        run: () =>
+      persistTerminal(
+        `v4_bid_ladder_${input.stage.toLowerCase()}_failed_commit`,
+        () =>
           input.repo.transitionChainTransaction({
             chainId: CHAIN_ID,
             journalId: String(failed.journal_id),
@@ -921,27 +971,27 @@ async function submit(
             actualGasNative: receipt.gasUsed * receipt.effectiveGasPrice,
             failureReason: "TRANSACTION_REVERTED",
           }),
-      });
+      );
     }
     throw new Error(`${input.stage}_REVERTED`);
   }
   const row = journalRow(input.repo, input.ladderId, input.stage);
   if (row && String(row.status) === "PREPARED")
-    withSqliteTransientRetrySync({
-      operation: `v4_bid_ladder_${input.stage.toLowerCase()}_receipt_submitted_commit`,
-      run: () =>
+    persistTerminal(
+      `v4_bid_ladder_${input.stage.toLowerCase()}_receipt_submitted_commit`,
+      () =>
         input.repo.transitionChainTransaction({
           chainId: CHAIN_ID,
           journalId: id,
           from: "PREPARED",
           to: "SUBMITTED",
         }),
-    });
+    );
   const latest = journalRow(input.repo, input.ladderId, input.stage);
   if (latest && String(latest.status) === "SUBMITTED")
-    withSqliteTransientRetrySync({
-      operation: `v4_bid_ladder_${input.stage.toLowerCase()}_confirmed_commit`,
-      run: () =>
+    persistTerminal(
+      `v4_bid_ladder_${input.stage.toLowerCase()}_confirmed_commit`,
+      () =>
         input.repo.transitionChainTransaction({
           chainId: CHAIN_ID,
           journalId: id,
@@ -951,20 +1001,99 @@ async function submit(
           confirmationCount: 1,
           actualGasNative: receipt.gasUsed * receipt.effectiveGasPrice,
         }),
-    });
+    );
   return { hash: result.hash, receipt, recovered: result.recovered };
 }
 
-async function openState(input: LadderLiveContext, requirePrice = true) {
-  withSqliteTransientRetrySync({
-    operation: "v4_bid_ladder_live_expiry",
-    run: () =>
-      expireAbandonedPlannedV4BidLadders(input.repo, {
-        nowMs: (input.nowMs ?? Date.now)(),
-      }),
-  });
-  const state = rows(input.repo, input.ladderId),
-    blockers: string[] = [];
+type OpenChainState = {
+  pool: V4PoolState;
+  balance: bigint;
+  erc20Allowance: bigint;
+  permit: readonly [bigint, number, number];
+  blockNumber: bigint;
+  observedAtMs: number;
+};
+type OpenAttemptPriceMemo = {
+  fetch: (target: Address) => Promise<GmgnEntryPriceEvidence>;
+  stats: () => { requests: number; sourceFetches: number; cacheHits: number };
+};
+
+function openAttemptPriceMemo(input: LadderLiveContext): OpenAttemptPriceMemo {
+  const source = input.entryPriceFetch ?? fetchCanonicalGmgnEntryPrice;
+  let cached: GmgnEntryPriceEvidence | undefined;
+  let requests = 0, sourceFetches = 0, cacheHits = 0;
+  const cacheable = (evidence: GmgnEntryPriceEvidence, target: Address, nowMs: number) =>
+    typeof evidence?.token === "string" &&
+    evidence.token.toLowerCase() === target.toLowerCase() &&
+    evidence.source === "gmgn-token-info-price.price" &&
+    Number.isSafeInteger(evidence.fetchedAtMs) &&
+    Number.isSafeInteger(evidence.freshUntilMs) &&
+    evidence.fetchedAtMs <= nowMs &&
+    evidence.freshUntilMs > nowMs &&
+    evidence.freshUntilMs <= evidence.fetchedAtMs + LP_ENTRY_PRICE_PREVIEW_TTL_MS;
+  return {
+    fetch: async (target) => {
+      requests++;
+      const canonicalTarget = getAddress(target), nowMs = Date.now();
+      if (cached && cacheable(cached, canonicalTarget, nowMs)) { cacheHits++; return cached; }
+      sourceFetches++;
+      const evidence = await source(canonicalTarget);
+      cached = cacheable(evidence, canonicalTarget, Date.now()) ? evidence : undefined;
+      return evidence;
+    },
+    stats: () => ({ requests, sourceFetches, cacheHits }),
+  };
+}
+
+async function readOpenChainState(input: LadderLiveContext, state: LadderRows): Promise<OpenChainState> {
+  const stageStartedAtMs=Date.now(),timings:Record<string,number>={},measure=async<T>(stage:string,work:()=>Promise<T>)=>{const started=Date.now();try{return await work();}finally{timings[stage]=Date.now()-started;}},
+    token = getAddress(String(state.parent.funding_token)),
+    blockNumber = await measure("freshBlockMs",()=>input.rpc.withClient((client) => client.getBlockNumber(),{stage:"v4_bid_ladder_preview_block",method:"eth_blockNumber"})),
+    observedAtMs = Date.now(),
+    [pool, balance, erc20Allowance, permit] = await Promise.all([
+      measure("poolStateMs",()=>inspectV4Pool(input.rpc, state.key, blockNumber)),
+      measure("balanceMs",()=>input.rpc.withClient((client) =>
+        client.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: "balanceOf",
+          args: [input.wallet],
+          blockNumber,
+        }),
+      )),
+      measure("erc20AllowanceMs",()=>input.rpc.withClient((client) =>
+        client.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: "allowance",
+          args: [input.wallet, V4_ROBINHOOD_DEPLOYMENTS.permit2],
+          blockNumber,
+        }),
+      )),
+      measure("permit2AllowanceMs",()=>permit2Allowance(
+        input.rpc,
+        input.wallet,
+        token,
+        V4_ROBINHOOD_DEPLOYMENTS.positionManager,
+        blockNumber,
+      )),
+    ]);
+  if (pool.status === "unavailable") throw new Error(pool.reason);
+  try{input.telemetry?.("v4_bid_ladder_preview_stage",{ladderId:input.ladderId,stage:"PINNED_CHAIN_STATE",startedAtMs:stageStartedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-stageStartedAtMs,dbWaitMs:0,rpcWaitMs:Date.now()-stageStartedAtMs,provider:"robinhood-rpc",queueWaitMs:0,cache:"MISS",outcome:"COMPLETE",blockNumber:blockNumber.toString(),...timings});}catch{}
+  return { pool: pool.value, balance, erc20Allowance, permit, blockNumber, observedAtMs };
+}
+
+async function materializeOpenState(
+  input: LadderLiveContext,
+  state: LadderRows,
+  chain: OpenChainState,
+  options: {
+    requirePrice: boolean;
+    priceMemo?: OpenAttemptPriceMemo;
+    requireReadyAllowances?: boolean;
+  },
+) {
+  const blockers: string[] = [], pool = chain.pool;
   if (
     String(state.parent.status) !== "PLANNED" ||
     !["DRY_RUN", "LIVE"].includes(String(state.parent.execution_mode))
@@ -972,16 +1101,14 @@ async function openState(input: LadderLiveContext, requirePrice = true) {
     blockers.push("V4_BID_LADDER_OPEN_STATE_INVALID");
   if (input.rpc.config.chainId !== CHAIN_ID)
     blockers.push("V4_BID_LADDER_WRONG_CHAIN");
-  const pool = await inspectV4Pool(input.rpc, state.key);
-  if (pool.status === "unavailable") throw new Error(pool.reason);
-  if (!pool.value.initialized || pool.value.liquidity <= 0n)
+  if (!pool.initialized || pool.liquidity <= 0n)
     blockers.push("V4_BID_LADDER_POOL_UNINITIALIZED");
-  blockers.push(...v4ExecutionBlockers(pool.value));
+  blockers.push(...v4ExecutionBlockers(pool));
   const fundingIndex = Number(state.parent.funding_index) as 0 | 1,
     targetIndex = Number(state.parent.target_index) as 0 | 1;
   for (const leg of state.legs) {
     const amounts = amountsForLiquidity(
-        pool.value.sqrtPriceX96,
+        pool.sqrtPriceX96,
         Number(leg.tick_lower),
         Number(leg.tick_upper),
         BigInt(String(leg.planned_liquidity_raw)),
@@ -997,38 +1124,20 @@ async function openState(input: LadderLiveContext, requirePrice = true) {
   );
   if (total !== BigInt(String(state.parent.total_funding_amount_raw)))
     blockers.push("V4_BID_LADDER_CAPITAL_CHANGED");
-  const balance = await input.rpc.withClient((client) =>
-    client.readContract({
-      address: getAddress(String(state.parent.funding_token)),
-      abi: erc20Abi,
-      functionName: "balanceOf",
-      args: [input.wallet],
-    }),
-  );
-  if (balance < total)
+  if (chain.balance < total)
     blockers.push("V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT");
-  const [erc20Allowance, permit] = await Promise.all([
-      input.rpc.withClient((client) =>
-        client.readContract({
-          address: getAddress(String(state.parent.funding_token)),
-          abi: erc20Abi,
-          functionName: "allowance",
-          args: [input.wallet, V4_ROBINHOOD_DEPLOYMENTS.permit2],
-        }),
-      ),
-      permit2Allowance(
-        input.rpc,
-        input.wallet,
-        getAddress(String(state.parent.funding_token)),
-        V4_ROBINHOOD_DEPLOYMENTS.positionManager,
-      ),
-    ]),
-    now = BigInt(Math.floor(Date.now() / 1000)),
+  const now = BigInt(Math.floor(Date.now() / 1000)),
     approval = {
       aggregateRequired: total,
-      erc20Required: erc20Allowance < total,
-      permit2Required: permit[0] < total || BigInt(permit[1]) <= now,
+      erc20Required: chain.erc20Allowance < total,
+      permit2Required: chain.permit[0] < total || BigInt(chain.permit[1]) <= now,
     };
+  if (options.requireReadyAllowances) {
+    if (approval.erc20Required)
+      blockers.push("V4_BID_LADDER_ERC20_ALLOWANCE_INSUFFICIENT");
+    if (approval.permit2Required)
+      blockers.push("V4_BID_LADDER_PERMIT2_ALLOWANCE_INSUFFICIENT");
+  }
   const usd = positionUsd(state.parent, input.repo, input.fundingUsd);
   if (
     !Number.isFinite(usd) ||
@@ -1059,7 +1168,7 @@ async function openState(input: LadderLiveContext, requirePrice = true) {
         ? tokenDecimals(input.repo, String(state.parent.funding_token))
         : tokenDecimals(input.repo, String(state.parent.target_token)),
     poolPrice = orientPoolPriceFundingPerTarget({
-      priceToken1PerToken0: priceFromSqrtX96(pool.value.sqrtPriceX96, d0, d1),
+      priceToken1PerToken0: priceFromSqrtX96(pool.sqrtPriceX96, d0, d1),
       token0: state.key.currency0,
       token1: state.key.currency1,
       target: String(state.parent.target_token),
@@ -1067,58 +1176,54 @@ async function openState(input: LadderLiveContext, requirePrice = true) {
     });
   const fundingToken: BidLadderToken = {
       address: getAddress(String(state.parent.funding_token)),
-      symbol: tokenSymbol(
-        input.repo,
-        String(state.parent.funding_token),
-        "FUNDING",
-      ),
+      symbol: tokenSymbol(input.repo, String(state.parent.funding_token), "FUNDING"),
       decimals: tokenDecimals(input.repo, String(state.parent.funding_token)),
     },
     targetToken: BidLadderToken = {
       address: getAddress(String(state.parent.target_token)),
-      symbol: tokenSymbol(
-        input.repo,
-        String(state.parent.target_token),
-        "TOKEN",
-      ),
+      symbol: tokenSymbol(input.repo, String(state.parent.target_token), "TOKEN"),
       decimals: tokenDecimals(input.repo, String(state.parent.target_token)),
-    };
-  let priceGuard: LpEntryPriceGuardResult | undefined;
-  if (requirePrice) {
-    priceGuard = await freshLpEntryPriceGuard({
-      target: getAddress(String(state.parent.target_token)),
-      poolPriceFundingPerTarget: poolPrice,
-      fundingUsd: input.fundingUsd,
-      fetch: input.entryPriceFetch,
-    });
-    if (priceGuard.status === "BLOCK")
-      blockers.push(priceGuard.blocker ?? "V4_BID_LADDER_PRICE_BLOCKED");
-  }
-  const plan = mintPlan(
-    state,
-    input.wallet,
-    BigInt(Math.floor(Date.now() / 1000) + 600),
-  );
-  let estimatedGas: bigint | null = null;
-  try {
-    estimatedGas = await input.rpc.withClient((client) =>
+    },
+    plan = mintPlan(state, input.wallet, BigInt(Math.floor(Date.now() / 1000) + 600));
+  const materializationStartedAtMs=Date.now(),timings:Record<string,number>={},measure=async<T>(stage:string,work:()=>Promise<T>)=>{const started=Date.now();try{return await work();}finally{timings[stage]=Date.now()-started;}},
+    [priceGuard, estimatedGas, observedGasPrice] = await Promise.all([
+    options.requirePrice
+      ? measure("gmgnMs",()=>freshLpEntryPriceGuard({
+          target: getAddress(String(state.parent.target_token)),
+          poolPriceFundingPerTarget: poolPrice,
+          fundingUsd: input.fundingUsd,
+          fetch: options.priceMemo?.fetch ?? input.entryPriceFetch,
+        }))
+      : Promise.resolve(undefined),
+    measure("estimateGasMs",()=>input.rpc.withClient((client) =>
       client.estimateGas({
         account: input.wallet,
         to: V4_ROBINHOOD_DEPLOYMENTS.positionManager,
         data: plan.calldata,
         value: 0n,
       }),
-    );
-  } catch {
-    if (!approval.erc20Required && !approval.permit2Required)
-      blockers.push("V4_BID_LADDER_MINT_ESTIMATE_FAILED");
-  }
+      {stage:"v4_bid_ladder_preview_gas",method:"eth_estimateGas"}),
+    ).catch(() => null),
+    measure("gasPriceMs",()=>input.rpc.withClient(client=>client.getGasPrice(),{stage:"v4_bid_ladder_preview_gas_price",method:"eth_gasPrice"})).catch(()=>null),
+  ]);
+  if (priceGuard?.status === "BLOCK")
+    blockers.push(priceGuard.blocker ?? "V4_BID_LADDER_PRICE_BLOCKED");
+  if (
+    estimatedGas === null &&
+    (options.requireReadyAllowances ||
+      (!approval.erc20Required && !approval.permit2Required))
+  )
+    blockers.push("V4_BID_LADDER_MINT_ESTIMATE_FAILED");
+  const gasProjection=estimatedGas!==null&&observedGasPrice!==null?v4BidLadderGasProjection({estimatedGas,gasPrice:observedGasPrice,nativeUsd:input.nativeUsd,nativeUsdSource:input.nativeUsdSource,capUsd:input.runtime.maxGasUsd}):null;
+  if(estimatedGas!==null&&observedGasPrice===null)blockers.push("V4_BID_LADDER_GAS_PRICE_UNAVAILABLE");
+  if(gasProjection?.exceedsCap)blockers.push("V4_BID_LADDER_GAS_CAP_EXCEEDED");
+  try{input.telemetry?.("v4_bid_ladder_preview_stage",{ladderId:input.ladderId,stage:"PRICE_AND_GAS_MATERIALIZATION",startedAtMs:materializationStartedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-materializationStartedAtMs,dbWaitMs:0,rpcWaitMs:Math.max(timings.gmgnMs??0,timings.estimateGasMs??0,timings.gasPriceMs??0),provider:"gmgn+robinhood-rpc",queueWaitMs:0,cache:"FRESH",outcome:blockers.length?"BLOCKED":"READY",...timings,estimatedGas:estimatedGas?.toString()??null,signedGasLimit:gasProjection?.signedGasLimit.toString()??null,gasLimitInflationFactor:gasProjection?.gasLimitInflationFactor??null,gasPriceWei:gasProjection?.gasPrice.toString()??null,nativeUsd:input.nativeUsd,nativeUsdSource:input.nativeUsdSource??"canonical V4 WETH/USDG",estimatedExecutionUsd:gasProjection?.estimatedExecutionUsd??null,maximumProjectedFeeUsd:gasProjection?.maximumProjectedFeeUsd??null,configuredCapUsd:input.runtime.maxGasUsd});}catch{}
   return {
     state,
-    pool: pool.value,
+    pool,
     plan,
     total,
-    balance,
+    balance: chain.balance,
     approval,
     positionUsd: usd,
     poolPrice,
@@ -1126,14 +1231,293 @@ async function openState(input: LadderLiveContext, requirePrice = true) {
     marketCapEvidence: input.marketCapEvidence,
     marketCapTokens: { funding: fundingToken, target: targetToken },
     estimatedGas,
+    gasProjection,
     transactionCount:
       Number(approval.erc20Required) + Number(approval.permit2Required) + 1,
+    evidence: {
+      blockNumber: chain.blockNumber,
+      observedAtMs: chain.observedAtMs,
+      gmgnFetchedAtMs: priceGuard?.evidence?.fetchedAtMs ?? null,
+      gmgnFreshUntilMs: priceGuard?.evidence?.freshUntilMs ?? null,
+    },
     blockers: [...new Set(blockers)],
   };
 }
 
+async function openState(
+  input: LadderLiveContext,
+  requirePrice = true,
+  priceMemo?: OpenAttemptPriceMemo,
+) {
+  withSqliteTransientRetrySync({
+    operation: "v4_bid_ladder_live_expiry",
+    run: () =>
+      expireAbandonedPlannedV4BidLadders(input.repo, {
+        nowMs: (input.nowMs ?? Date.now)(),
+      }),
+  });
+  const state = rows(input.repo, input.ladderId),
+    chain = await readOpenChainState(input, state);
+  return materializeOpenState(input, state, chain, { requirePrice, priceMemo });
+}
+
 export async function previewV4BidLadderLive(input: LadderLiveContext) {
   return openState(input, true);
+}
+
+type OpenStateSnapshot = Awaited<ReturnType<typeof openState>>;
+
+async function refreshOpenApprovalDelta(
+  input: LadderLiveContext,
+  preview: OpenStateSnapshot,
+  stage: "OPEN_ERC20_APPROVAL" | "OPEN_PERMIT2_APPROVAL",
+  receiptBlock: bigint,
+) {
+  const current = rows(input.repo, input.ladderId),
+    token = getAddress(String(preview.state.parent.funding_token)),
+    journal = journalRow(input.repo, input.ladderId, stage),
+    identityChanged =
+      !sameKey(current.key, preview.state.key) ||
+      !same(String(current.parent.funding_token), token) ||
+      BigInt(String(current.parent.total_funding_amount_raw)) !== preview.total;
+  const reads = stage === "OPEN_ERC20_APPROVAL"
+    ? await Promise.all([
+        input.rpc.withClient((client) =>
+          client.readContract({
+            address: token,
+            abi: erc20Abi,
+            functionName: "balanceOf",
+            args: [input.wallet],
+            blockNumber: receiptBlock,
+          }),
+        ),
+        input.rpc.withClient((client) =>
+          client.readContract({
+            address: token,
+            abi: erc20Abi,
+            functionName: "allowance",
+            args: [input.wallet, V4_ROBINHOOD_DEPLOYMENTS.permit2],
+            blockNumber: receiptBlock,
+          }),
+        ),
+        permit2Allowance(
+          input.rpc,
+          input.wallet,
+          token,
+          V4_ROBINHOOD_DEPLOYMENTS.positionManager,
+          receiptBlock,
+        ),
+      ] as const)
+    : await Promise.all([
+        input.rpc.withClient((client) =>
+          client.readContract({
+            address: token,
+            abi: erc20Abi,
+            functionName: "balanceOf",
+            args: [input.wallet],
+            blockNumber: receiptBlock,
+          }),
+        ),
+        permit2Allowance(
+          input.rpc,
+          input.wallet,
+          token,
+          V4_ROBINHOOD_DEPLOYMENTS.positionManager,
+          receiptBlock,
+        ),
+      ] as const),
+    balance = reads[0],
+    erc20Allowance = stage === "OPEN_ERC20_APPROVAL"
+      ? reads[1] as bigint
+      : preview.approval.erc20Required ? 0n : preview.total,
+    permit = stage === "OPEN_ERC20_APPROVAL"
+      ? reads[2] as readonly [bigint, number, number]
+      : reads[1] as readonly [bigint, number, number],
+    now = BigInt(Math.floor(Date.now() / 1000)),
+    approval = {
+      aggregateRequired: preview.total,
+      erc20Required: erc20Allowance < preview.total,
+      permit2Required: permit[0] < preview.total || BigInt(permit[1]) <= now,
+    },
+    blockers = [
+      ...(identityChanged ? ["V4_BID_LADDER_OPEN_IDENTITY_CHANGED"] : []),
+      ...(!journal || String(journal.status) !== "CONFIRMED"
+        ? [`${stage}_JOURNAL_NOT_CONFIRMED`]
+        : []),
+      ...(balance < preview.total
+        ? ["V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT"]
+        : []),
+      ...(stage === "OPEN_ERC20_APPROVAL" && approval.erc20Required
+        ? ["V4_BID_LADDER_ERC20_ALLOWANCE_INSUFFICIENT"]
+        : []),
+      ...(stage === "OPEN_PERMIT2_APPROVAL" && approval.permit2Required
+        ? ["V4_BID_LADDER_PERMIT2_ALLOWANCE_INSUFFICIENT"]
+        : []),
+    ];
+  if (blockers.length)
+    throw new Error(`V4_BID_LADDER_OPEN_BLOCKED:${blockers.join(",")}`);
+  return {
+    ...preview,
+    state: current,
+    balance,
+    approval,
+    evidence: {
+      ...preview.evidence,
+      approvalDeltaStage: stage,
+      approvalDeltaBlockNumber: receiptBlock,
+      approvalDeltaObservedAtMs: Date.now(),
+    },
+  };
+}
+
+type FinalOpenEconomicState = OpenChainState & {
+  transportRpcCount: 2;
+  multicallMembers: 5;
+};
+
+function requiredFinalOpenRead<T>(
+  value: { status: "success" | "failure"; result?: unknown },
+  label: string,
+) {
+  if (value.status !== "success")
+    throw new Error(`V4_BID_LADDER_FINAL_${label}_UNAVAILABLE`);
+  return value.result as T;
+}
+
+/** One pinned-block transport read for exactly the mutable economic evidence
+ * needed immediately before OPEN_BATCH. No token metadata, historical state,
+ * market-cap materialization, or generic OPEN-state reconstruction occurs. */
+async function readFinalOpenEconomicState(
+  input: LadderLiveContext,
+  state: LadderRows,
+): Promise<FinalOpenEconomicState> {
+  const token = getAddress(String(state.parent.funding_token)), id = poolId(state.key);
+  try {
+    return await input.rpc.withClient(async (client) => {
+      const blockNumber = await client.getBlockNumber(), results = await client.multicall({
+        allowFailure: true,
+        blockNumber,
+        contracts: [
+          { address: V4_ROBINHOOD_DEPLOYMENTS.stateView, abi: v4StateViewAbi, functionName: "getSlot0", args: [id] },
+          { address: V4_ROBINHOOD_DEPLOYMENTS.stateView, abi: v4StateViewAbi, functionName: "getLiquidity", args: [id] },
+          { address: token, abi: erc20Abi, functionName: "balanceOf", args: [input.wallet] },
+          { address: token, abi: erc20Abi, functionName: "allowance", args: [input.wallet, V4_ROBINHOOD_DEPLOYMENTS.permit2] },
+          { address: V4_ROBINHOOD_DEPLOYMENTS.permit2, abi: permit2Abi, functionName: "allowance", args: [input.wallet, token, V4_ROBINHOOD_DEPLOYMENTS.positionManager] },
+        ],
+      }), slot = requiredFinalOpenRead<readonly [bigint, number, number, number]>(results[0]!, "SLOT0"),
+        liquidity = requiredFinalOpenRead<bigint>(results[1]!, "LIQUIDITY"),
+        balance = requiredFinalOpenRead<bigint>(results[2]!, "BALANCE"),
+        erc20Allowance = requiredFinalOpenRead<bigint>(results[3]!, "ERC20_ALLOWANCE"),
+        permit = requiredFinalOpenRead<readonly [bigint, number, number]>(results[4]!, "PERMIT2_ALLOWANCE"),
+        protocolFee = Number(slot[2]), lpFee = Number(slot[3]),
+        pool: V4PoolState = {
+          id, key: state.key, sqrtPriceX96: slot[0], tick: Number(slot[1]), liquidity,
+          initialized: slot[0] !== 0n, blockNumber, protocolFee, lpFee,
+          feeSemantics: decodeV4Fee(state.key.fee, lpFee, protocolFee),
+          hookSemantics: classifyV4Hooks(state.key.hooks),
+        };
+      return { pool, balance, erc20Allowance, permit, blockNumber, observedAtMs: Date.now(), transportRpcCount: 2, multicallMembers: 5 };
+    }, { workflowId: input.ladderId, stage: "v4_open_final_validation", method: "eth_blockNumber+multicall[5]" });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("V4_BID_LADDER_FINAL_")) throw error;
+    throw new Error("V4_BID_LADDER_FINAL_ECONOMIC_STATE_UNAVAILABLE", { cause: error });
+  }
+}
+
+function sameOpenGeometry(current: LadderRows, initial: LadderRows) {
+  if (current.legs.length !== initial.legs.length) return false;
+  return current.legs.every((leg, index) => {
+    const prior = initial.legs[index]!;
+    return Number(leg.leg_index) === Number(prior.leg_index) &&
+      Number(leg.tick_lower) === Number(prior.tick_lower) &&
+      Number(leg.tick_upper) === Number(prior.tick_upper) &&
+      BigInt(String(leg.planned_liquidity_raw)) === BigInt(String(prior.planned_liquidity_raw)) &&
+      BigInt(String(leg.funding_amount_raw)) === BigInt(String(prior.funding_amount_raw));
+  });
+}
+
+async function validateFinalOpenAuthority(
+  input: LadderLiveContext,
+  initial: OpenStateSnapshot,
+  priceMemo: OpenAttemptPriceMemo,
+) {
+  const startedAtMs = Date.now(), memoBefore = priceMemo.stats(), state = rows(input.repo, input.ladderId),
+    identityChanged =
+      !sameKey(state.key, initial.state.key) ||
+      !same(String(state.parent.funding_token), String(initial.state.parent.funding_token)) ||
+      !same(String(state.parent.target_token), String(initial.state.parent.target_token)) ||
+      BigInt(String(state.parent.total_funding_amount_raw)) !== initial.total ||
+      !sameOpenGeometry(state, initial.state),
+    chain = await readFinalOpenEconomicState(input, state), pool = chain.pool,
+    blockers: string[] = [...(identityChanged ? ["V4_BID_LADDER_OPEN_IDENTITY_CHANGED"] : [])];
+  if (String(state.parent.status) !== "PLANNED" || String(state.parent.execution_mode) !== "LIVE")
+    blockers.push("V4_BID_LADDER_OPEN_STATE_INVALID");
+  if (input.rpc.config.chainId !== CHAIN_ID) blockers.push("V4_BID_LADDER_WRONG_CHAIN");
+  if (!pool.initialized || pool.liquidity <= 0n) blockers.push("V4_BID_LADDER_POOL_UNINITIALIZED");
+  blockers.push(...v4ExecutionBlockers(pool));
+  const fundingIndex = Number(state.parent.funding_index) as 0 | 1,
+    targetIndex = Number(state.parent.target_index) as 0 | 1,
+    fundingAddress = getAddress(String(state.parent.funding_token)),
+    targetAddress = getAddress(String(state.parent.target_token)),
+    orientationValid = fundingIndex !== targetIndex &&
+      (fundingIndex === 0
+        ? same(state.key.currency0, fundingAddress) && same(state.key.currency1, targetAddress)
+        : same(state.key.currency1, fundingAddress) && same(state.key.currency0, targetAddress));
+  if (!orientationValid) blockers.push("V4_BID_LADDER_OPEN_TOKEN_ORIENTATION_MISMATCH");
+  for (const leg of state.legs) {
+    const amounts = amountsForLiquidity(pool.sqrtPriceX96, Number(leg.tick_lower), Number(leg.tick_upper), BigInt(String(leg.planned_liquidity_raw))),
+      funding = fundingIndex === 0 ? amounts.token0 : amounts.token1,
+      target = targetIndex === 0 ? amounts.token0 : amounts.token1;
+    if (target !== 0n || funding <= 0n) blockers.push(`V4_BID_LADDER_LEG_NOT_FUNDING_ONLY:${leg.leg_index}`);
+  }
+  const total = state.legs.reduce((sum, leg) => sum + BigInt(String(leg.funding_amount_raw)), 0n),
+    now = BigInt(Math.floor(Date.now() / 1000)), approval = {
+      aggregateRequired: initial.total,
+      erc20Required: chain.erc20Allowance < initial.total,
+      permit2Required: chain.permit[0] < initial.total || BigInt(chain.permit[1]) <= now,
+    };
+  if (total !== initial.total) blockers.push("V4_BID_LADDER_CAPITAL_CHANGED");
+  if (chain.balance < initial.total) blockers.push("V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT");
+  if (approval.erc20Required) blockers.push("V4_BID_LADDER_ERC20_ALLOWANCE_INSUFFICIENT");
+  if (approval.permit2Required) blockers.push("V4_BID_LADDER_PERMIT2_ALLOWANCE_INSUFFICIENT");
+  if (!Number.isFinite(initial.positionUsd) || initial.positionUsd > input.runtime.maxPositionUsd || initial.positionUsd > input.runtime.maxApprovalUsd)
+    blockers.push("V4_BID_LADDER_POSITION_OR_APPROVAL_CAP_EXCEEDED");
+  if (!input.runtime.executionEnabled || input.runtime.dryRun || input.runtime.emergencyPause || !input.runtime.signerConfigured || !input.runtime.allowlisted)
+    blockers.push("V4_BID_LADDER_RUNTIME_BLOCKED");
+  if (pendingOther(input.repo, input.ladderId, input.wallet)) blockers.push("V4_BID_LADDER_UNRESOLVED_TRANSACTION");
+  const batchIds = new Set(state.legs.map((leg) => String(leg.open_batch_id ?? "")).filter(Boolean));
+  if (batchIds.size > 1) blockers.push("V4_BID_LADDER_OPEN_BATCH_AMBIGUOUS");
+  const fundingToken = initial.marketCapTokens.funding, targetToken = initial.marketCapTokens.target;
+  if (!same(fundingToken.address, fundingAddress) || !same(targetToken.address, targetAddress))
+    blockers.push("V4_BID_LADDER_OPEN_TOKEN_IDENTITY_CHANGED");
+  let poolPrice = Number.NaN;
+  if (orientationValid) {
+    const d0 = fundingIndex === 0 ? fundingToken.decimals : targetToken.decimals,
+      d1 = fundingIndex === 1 ? fundingToken.decimals : targetToken.decimals;
+    try { poolPrice = orientPoolPriceFundingPerTarget({ priceToken1PerToken0: priceFromSqrtX96(pool.sqrtPriceX96, d0, d1), token0: state.key.currency0, token1: state.key.currency1, target: targetAddress, funding: fundingAddress }); }
+    catch { blockers.push("V4_BID_LADDER_OPEN_TOKEN_ORIENTATION_MISMATCH"); }
+  }
+  const plan = mintPlan(state, input.wallet, BigInt(Math.floor(Date.now() / 1000) + 600)),
+    [priceGuard, estimatedGas] = await Promise.all([
+      Number.isFinite(poolPrice) && poolPrice > 0
+        ? freshLpEntryPriceGuard({ target: targetAddress, poolPriceFundingPerTarget: poolPrice, fundingUsd: input.fundingUsd, fetch: priceMemo.fetch })
+        : Promise.resolve({ status: "BLOCK" as const, poolPriceFundingPerTarget: String(poolPrice), tokenPriceFundingPerTarget: null, deviationBps: null, blocker: "POOL_PRICE_INVALID", evidence: undefined }),
+      input.rpc.withClient((client) => client.estimateGas({ account: input.wallet, to: V4_ROBINHOOD_DEPLOYMENTS.positionManager, data: plan.calldata, value: 0n })).catch(() => null),
+    ]), memoAfter = priceMemo.stats();
+  if (priceGuard.status === "BLOCK") blockers.push(priceGuard.blocker ?? "V4_BID_LADDER_PRICE_BLOCKED");
+  if (estimatedGas === null) blockers.push("V4_BID_LADDER_MINT_ESTIMATE_FAILED");
+  try { input.telemetry?.("v4_bid_ladder_open_final_validation", {
+    ladderId: input.ladderId, outcome: blockers.length ? "BLOCKED" : "READY", durationMs: Date.now() - startedAtMs,
+    blockNumber: chain.blockNumber.toString(), observedAtMs: chain.observedAtMs, transportRpcCount: chain.transportRpcCount + 1,
+    multicallMembers: chain.multicallMembers, estimateGasRpcCount: 1, gmgnSourceFetches: memoAfter.sourceFetches - memoBefore.sourceFetches,
+    gmgnCacheHits: memoAfter.cacheHits - memoBefore.cacheHits, genericMaterialization: false,
+  }); } catch {}
+  return {
+    state, pool, plan, total: initial.total, balance: chain.balance, approval, poolPrice, priceGuard, estimatedGas,
+    evidence: { ...initial.evidence, finalBlockNumber: chain.blockNumber, finalObservedAtMs: chain.observedAtMs,
+      gmgnFetchedAtMs: priceGuard.evidence?.fetchedAtMs ?? null, gmgnFreshUntilMs: priceGuard.evidence?.freshUntilMs ?? null },
+    blockers: [...new Set(blockers)],
+  };
 }
 
 export async function v4BidLadderFundingAllowanceReadiness(input:LadderLiveContext&{fundingAmount:bigint}){
@@ -1436,7 +1820,7 @@ export async function reconcileV4BidLadderOpenReceipt(
   };
 }
 
-function bidLadderWorkKind(stage:string):EconomicWorkflowKind{return stage==='OPEN_BATCH'?'V4_BID_LADDER_OPEN':stage==='CLOSE_BATCH'?'V4_BID_LADDER_CLOSE':'V4_BID_LADDER_CLAIM';}
+function bidLadderWorkKind(stage:string):EconomicWorkflowKind{return isDurableV4ApprovalStage(stage)||stage==='OPEN_BATCH'?'V4_BID_LADDER_OPEN':stage==='CLOSE_BATCH'?'V4_BID_LADDER_CLOSE':'V4_BID_LADDER_CLAIM';}
 function handoffBidLadderReceipt(input:LadderLiveContext,stage:'OPEN_BATCH'|'CLOSE_BATCH'|`COLLECT_BATCH:${string}`,receipt:TransactionReceipt,openContext:OpenPostReceiptContext={priorReceiptReuse:false}){
  const journal=journalRow(input.repo,input.ladderId,stage);if(!journal||String(journal.status)!=='CONFIRMED'||!same(String(journal.expected_hash),receipt.transactionHash))throw new Error('V4_BID_LADDER_HANDOFF_RECEIPT_NOT_AUTHORITATIVE');
  if(stage==='OPEN_BATCH'){const existing=input.repo.db.prepare("SELECT * FROM economic_reconciliation_work WHERE chain_id=? AND workflow_kind='V4_BID_LADDER_OPEN' AND workflow_identity=? AND semantic_stage='OPEN_BATCH' AND lower(transaction_hash)=lower(?)").get(CHAIN_ID,input.ladderId,receipt.transactionHash) as Record<string,unknown>|undefined;if(existing)return {durable:true as const,work:existing};}
@@ -1611,6 +1995,8 @@ function confirmedOpenExecutionResult(
 export async function executeV4BidLadderLiveOpen(
   input: LadderLiveContext & { walletClient: WalletClient; requirePreapprovedFunding?: boolean },
 ) {
+  const executionStartedAtMs = Date.now();
+  try { input.telemetry?.("v4_bid_ladder_open_execution_start", { ladderId: input.ladderId, executionStartedAtMs }); } catch {}
   const prior = journalRow(input.repo, input.ladderId, "OPEN_BATCH"),
     priorReceipt = confirmedReceipt(prior ?? {});
   if (priorReceipt)
@@ -1618,7 +2004,10 @@ export async function executeV4BidLadderLiveOpen(
       priorReceiptReuse: true,
       mainnetTransactionsSent: 0,
     });
-  let preview = await openState(input, true);
+  const priceMemo = openAttemptPriceMemo(input);
+  const initialStartedAtMs = Date.now();
+  let preview = await openState(input, true, priceMemo);
+  try { input.telemetry?.("v4_bid_ladder_open_initial_state", { ladderId: input.ladderId, durationMs: Date.now() - initialStartedAtMs, confirmToInitialStateMs: Date.now() - executionStartedAtMs, blockNumber: preview.evidence.blockNumber.toString() }); } catch {}
   if (preview.blockers.length)
     throw new Error(`V4_BID_LADDER_OPEN_BLOCKED:${preview.blockers.join(",")}`);
   if(input.requirePreapprovedFunding&&(preview.approval.erc20Required||preview.approval.permit2Required))
@@ -1634,7 +2023,7 @@ export async function executeV4BidLadderLiveOpen(
       gas = await input.rpc.withClient((client) =>
         client.estimateGas({ account: input.wallet, to: token, data }),
       );
-    await submit({
+    const approvalReceipt = await submit({
       ...input,
       stage: "OPEN_ERC20_APPROVAL",
       to: token,
@@ -1642,7 +2031,14 @@ export async function executeV4BidLadderLiveOpen(
       estimatedGas: gas,
       activateOpen: true,
     });
-    preview = await openState(input, true);
+    const deltaStartedAtMs = Date.now();
+    preview = await refreshOpenApprovalDelta(
+      input,
+      preview,
+      "OPEN_ERC20_APPROVAL",
+      approvalReceipt.receipt.blockNumber,
+    );
+    try { input.telemetry?.("v4_bid_ladder_open_approval_delta", { ladderId: input.ladderId, stage: "OPEN_ERC20_APPROVAL", receiptBlockNumber: approvalReceipt.receipt.blockNumber.toString(), receiptToNextStageMs: Date.now() - deltaStartedAtMs }); } catch {}
   }
   if (preview.approval.permit2Required) {
     const approval = buildPermit2Approval(
@@ -1657,7 +2053,7 @@ export async function executeV4BidLadderLiveOpen(
           data: approval.data,
         }),
       );
-    await submit({
+    const approvalReceipt = await submit({
       ...input,
       stage: "OPEN_PERMIT2_APPROVAL",
       to: approval.to,
@@ -1665,29 +2061,32 @@ export async function executeV4BidLadderLiveOpen(
       estimatedGas: gas,
       activateOpen: true,
     });
-    preview = await openState(input, true);
+    const deltaStartedAtMs = Date.now();
+    preview = await refreshOpenApprovalDelta(
+      input,
+      preview,
+      "OPEN_PERMIT2_APPROVAL",
+      approvalReceipt.receipt.blockNumber,
+    );
+    try { input.telemetry?.("v4_bid_ladder_open_approval_delta", { ladderId: input.ladderId, stage: "OPEN_PERMIT2_APPROVAL", receiptBlockNumber: approvalReceipt.receipt.blockNumber.toString(), receiptToNextStageMs: Date.now() - deltaStartedAtMs }); } catch {}
   }
-  if (preview.blockers.length)
-    throw new Error(`V4_BID_LADDER_OPEN_BLOCKED:${preview.blockers.join(",")}`);
-  const gas =
-      preview.estimatedGas ??
-      (await input.rpc.withClient((client) =>
-        client.estimateGas({
-          account: input.wallet,
-          to: V4_ROBINHOOD_DEPLOYMENTS.positionManager,
-          data: preview.plan.calldata,
-          value: 0n,
-        }),
-      )),
+  const authority = await validateFinalOpenAuthority(input, preview, priceMemo);
+  if (authority.blockers.length)
+    throw new Error(`V4_BID_LADDER_OPEN_BLOCKED:${authority.blockers.join(",")}`);
+  if (authority.estimatedGas === null)
+    throw new Error("V4_BID_LADDER_MINT_ESTIMATE_FAILED");
+  try { input.telemetry?.("v4_bid_ladder_open_signer_boundary", { ladderId: input.ladderId, confirmToSignerBoundaryMs: Date.now() - executionStartedAtMs, finalValidationBlockNumber: authority.evidence.finalBlockNumber.toString(), finalValidationObservedAtMs: authority.evidence.finalObservedAtMs }); } catch {}
+  const gas = authority.estimatedGas,
     sent = await submit({
       ...input,
       stage: "OPEN_BATCH",
       to: V4_ROBINHOOD_DEPLOYMENTS.positionManager,
-      data: preview.plan.calldata,
+      data: authority.plan.calldata,
       estimatedGas: gas,
       batchBinding: "open",
     }),
     receipt = sent.receipt;
+  try { input.telemetry?.("v4_bid_ladder_open_execution_complete", { ladderId: input.ladderId, confirmToOpenReceiptMs: Date.now() - executionStartedAtMs, recovered: sent.recovered, receiptBlockNumber: receipt.blockNumber.toString(), mainnetTransactionsSent: sent.recovered ? 0 : 1 }); } catch {}
   return confirmedOpenExecutionResult(input, receipt, {
     priorReceiptReuse: sent.recovered,
     mainnetTransactionsSent: sent.recovered ? 0 : 1,
@@ -1725,7 +2124,7 @@ async function closeState(input: LadderLiveContext) {
     active = inspected.filter((value) => value.liquidity > 0n),
     pool = await inspectV4Pool(input.rpc, state.key);
   if (pool.status === "unavailable") throw new Error(pool.reason);
-  const closeValuation:BoundCloseValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:String(state.parent.pool_id),poolKey:state.key,sqrtPriceX96:pool.value.sqrtPriceX96.toString(),observationBlock:pool.value.blockNumber.toString(),observedAtMs:Date.now(),token0Decimals:tokenDecimals(input.repo,state.key.currency0),token1Decimals:tokenDecimals(input.repo,state.key.currency1)};
+  const closeValuation:BoundCloseValuation={contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:String(state.parent.pool_id),poolKey:state.key,sqrtPriceX96:pool.value.sqrtPriceX96.toString(),tick:pool.value.tick,activeLiquidity:pool.value.liquidity.toString(),initialized:pool.value.initialized,observationBlock:pool.value.blockNumber.toString(),observedAtMs:Date.now(),token0Decimals:tokenDecimals(input.repo,state.key.currency0),token1Decimals:tokenDecimals(input.repo,state.key.currency1)};
   const composition = inspected.map((value) => ({
       tokenId: value.tokenId,
       ...amountsForLiquidity(
@@ -2041,7 +2440,7 @@ async function reconcileCollect(
     throw new Error("REALIZED_PNL_RECEIPT_BLOCK_TIMESTAMP_UNAVAILABLE");
   const parent = state.parent,
     bound=await captureCollectValuation(input,state,receipt,stage),
-    valuation=bound.status==="AVAILABLE"&&bound.sqrtPriceX96!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:bound.token0Decimals,decimals1:bound.token1Decimals,amount0:result.aggregateTransfers.token0,amount1:result.aggregateTransfers.token1,sqrtPriceX96:BigInt(bound.sqrtPriceX96)}):{status:"INCOMPLETE" as const,reason:bound.reason??"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"},
+    valuation=bound.status==="AVAILABLE"&&bound.sqrtPriceX96!==null&&bound.tick!==null&&bound.activeLiquidity!==null&&bound.initialized!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:bound.token0Decimals,decimals1:bound.token1Decimals,amount0:result.aggregateTransfers.token0,amount1:result.aggregateTransfers.token1,sqrtPriceX96:BigInt(bound.sqrtPriceX96),source:{poolId:bound.poolId,poolKey:bound.poolKey,sqrtPriceX96:BigInt(bound.sqrtPriceX96),tick:bound.tick,activeLiquidity:BigInt(bound.activeLiquidity),initialized:bound.initialized,blockNumber:BigInt(bound.observationBlock),token0Decimals:bound.token0Decimals,token1Decimals:bound.token1Decimals}}):{status:"INCOMPLETE" as const,reason:bound.reason??"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"},
     feeUsd = valuation.status==="AVAILABLE" ? usdMicrosToText(valuation.totalUsdMicros) : undefined,
     finalAtMs = Number(finalBlock.timestamp) * 1000;
   withSqliteTransientRetrySync({
@@ -2278,11 +2677,11 @@ async function reconcileClose(
     fundingIndex = Number(parent.funding_index) as 0 | 1,
     fundingDecimals = Number(parent.funding_decimals ?? 6),
     closeFeeAttribution=await captureCloseFeeAttribution(input,state,receipt,expected,{token0:result.aggregateTransfers.token0,token1:result.aggregateTransfers.token1}),
-    closeFeeValuation=closeFeeAttribution.status==="AVAILABLE"&&closeFeeAttribution.sqrtPriceX96!==null&&closeFeeAttribution.closeFee0Raw!==null&&closeFeeAttribution.closeFee1Raw!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:closeFeeAttribution.token0Decimals,decimals1:closeFeeAttribution.token1Decimals,amount0:BigInt(closeFeeAttribution.closeFee0Raw),amount1:BigInt(closeFeeAttribution.closeFee1Raw),sqrtPriceX96:BigInt(closeFeeAttribution.sqrtPriceX96)}):null,
+    closeFeeValuation=closeFeeAttribution.status==="AVAILABLE"&&closeFeeAttribution.sqrtPriceX96!==null&&closeFeeAttribution.tick!==null&&closeFeeAttribution.activeLiquidity!==null&&closeFeeAttribution.initialized!==null&&closeFeeAttribution.closeFee0Raw!==null&&closeFeeAttribution.closeFee1Raw!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:closeFeeAttribution.token0Decimals,decimals1:closeFeeAttribution.token1Decimals,amount0:BigInt(closeFeeAttribution.closeFee0Raw),amount1:BigInt(closeFeeAttribution.closeFee1Raw),sqrtPriceX96:BigInt(closeFeeAttribution.sqrtPriceX96),source:{poolId:closeFeeAttribution.poolId,poolKey:closeFeeAttribution.poolKey,sqrtPriceX96:BigInt(closeFeeAttribution.sqrtPriceX96),tick:closeFeeAttribution.tick,activeLiquidity:BigInt(closeFeeAttribution.activeLiquidity),initialized:closeFeeAttribution.initialized,blockNumber:BigInt(closeFeeAttribution.observationBlock),token0Decimals:closeFeeAttribution.token0Decimals,token1Decimals:closeFeeAttribution.token1Decimals}}):null,
     closeFeeUsd=closeFeeValuation?.status==="AVAILABLE"?usdMicrosToText(closeFeeValuation.totalUsdMicros):undefined,
     bound=closeValuationFromJournal(input.repo,input.ladderId),
     boundValid=Boolean(bound&&same(bound.poolId,String(parent.pool_id))&&sameKey(bound.poolKey,state.key)),
-    valuation=boundValid?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:bound!.token0Decimals,decimals1:bound!.token1Decimals,amount0:result.aggregateTransfers.token0,amount1:result.aggregateTransfers.token1,sqrtPriceX96:BigInt(bound!.sqrtPriceX96)}):{status:"INCOMPLETE" as const,reason:"BOUND_CLOSE_PRICE_EVIDENCE_UNAVAILABLE"},
+    valuation=boundValid?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:bound!.token0Decimals,decimals1:bound!.token1Decimals,amount0:result.aggregateTransfers.token0,amount1:result.aggregateTransfers.token1,sqrtPriceX96:BigInt(bound!.sqrtPriceX96),source:{poolId:bound!.poolId,poolKey:bound!.poolKey,sqrtPriceX96:BigInt(bound!.sqrtPriceX96),tick:bound!.tick,activeLiquidity:BigInt(bound!.activeLiquidity),initialized:bound!.initialized,blockNumber:BigInt(bound!.observationBlock),token0Decimals:bound!.token0Decimals,token1Decimals:bound!.token1Decimals}}):{status:"INCOMPLETE" as const,reason:"BOUND_CLOSE_PRICE_EVIDENCE_UNAVAILABLE"},
     returnedMicros = valuation.status==="AVAILABLE"?valuation.totalUsdMicros:null,
     basisMicros = rawUsdMicros(BigInt(String(parent.total_funding_amount_raw)),fundingDecimals,"1"),
     priced = returnedMicros !== null,
@@ -2404,7 +2803,7 @@ export async function repairHistoricalV4BidLadderCloseFees(input:{repo:SqliteLed
       const context={repo:input.repo,rpc:input.rpc,ladderId,wallet} as LadderLiveContext,state=rows(input.repo,ladderId),expected=closeExpectedFromJournal(context),reconciled=await reconcileV4BatchFullDecreaseReceipt({receipt:receiptShape(receipt),expectedLegs:expected,recipient:wallet,inspectPosition:async id=>{const leg=expected.find(value=>value.tokenId===id);if(!leg)throw new Error("V4_BID_LADDER_CLOSE_TOKEN_MISMATCH");return {...leg,tokenId:id,liquidity:0n};}});
       if(reconciled.aggregateTransfers.token0===null||reconciled.aggregateTransfers.token1===null)throw new Error("REALIZED_PNL_CLOSE_TRANSFER_EVIDENCE_UNAVAILABLE");
       if(String(candidate.close_token0_raw)!==reconciled.aggregateTransfers.token0.toString()||String(candidate.close_token1_raw)!==reconciled.aggregateTransfers.token1.toString())throw new Error("V4_BID_LADDER_CLOSE_FEE_REPAIR_RETURNED_RAW_CONFLICT");
-      const attribution=await captureCloseFeeAttribution(context,state,receipt,expected,{token0:reconciled.aggregateTransfers.token0,token1:reconciled.aggregateTransfers.token1}),valuation=attribution.status==="AVAILABLE"&&attribution.sqrtPriceX96!==null&&attribution.closeFee0Raw!==null&&attribution.closeFee1Raw!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:attribution.token0Decimals,decimals1:attribution.token1Decimals,amount0:BigInt(attribution.closeFee0Raw),amount1:BigInt(attribution.closeFee1Raw),sqrtPriceX96:BigInt(attribution.sqrtPriceX96)}):null,feeUsd=valuation?.status==="AVAILABLE"?usdMicrosToText(valuation.totalUsdMicros):undefined;
+      const attribution=await captureCloseFeeAttribution(context,state,receipt,expected,{token0:reconciled.aggregateTransfers.token0,token1:reconciled.aggregateTransfers.token1}),valuation=attribution.status==="AVAILABLE"&&attribution.sqrtPriceX96!==null&&attribution.tick!==null&&attribution.activeLiquidity!==null&&attribution.initialized!==null&&attribution.closeFee0Raw!==null&&attribution.closeFee1Raw!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:attribution.token0Decimals,decimals1:attribution.token1Decimals,amount0:BigInt(attribution.closeFee0Raw),amount1:BigInt(attribution.closeFee1Raw),sqrtPriceX96:BigInt(attribution.sqrtPriceX96),source:{poolId:attribution.poolId,poolKey:attribution.poolKey,sqrtPriceX96:BigInt(attribution.sqrtPriceX96),tick:attribution.tick,activeLiquidity:BigInt(attribution.activeLiquidity),initialized:attribution.initialized,blockNumber:BigInt(attribution.observationBlock),token0Decimals:attribution.token0Decimals,token1Decimals:attribution.token1Decimals}}):null,feeUsd=valuation?.status==="AVAILABLE"?usdMicrosToText(valuation.totalUsdMicros):undefined;
       let prior:Record<string,unknown>={};try{prior=JSON.parse(String(candidate.close_event_evidence??"{}"));}catch{}
       const repaired=input.repo.repairCloseRealizedFeeAttribution({eventId:String(candidate.close_event_id),newlyRealizedFeesUsd:feeUsd,valuationEvidence:{...prior,principalFeeSplit:"EXACT_REMOVED_LIQUIDITY_AT_RECEIPT_BLOCK_PRICE",closeFeeAttribution:attribution,closeFeeValuation:valuation?.status==="AVAILABLE"?valuation.evidence:{status:"INCOMPLETE",reason:attribution.reason??(valuation?.status==="INCOMPLETE"?valuation.reason:"DIRECT_USDG_PAIR_PRICE_UNAVAILABLE")}}});
       changed+=repaired.changed;if(feeUsd===undefined)incomplete++;else available++;
@@ -2598,6 +2997,13 @@ export function formatV4BidLadderLivePreview(
     "",
     "Execution",
     `Estimated batch gas: ${preview.estimatedGas ?? "pending approvals"}`,
+    ...(preview.gasProjection ? [
+      `Estimated execution: ${gasUsdText(preview.gasProjection.estimatedExecutionUsd)}`,
+      `Maximum projected fee: ${gasUsdText(preview.gasProjection.maximumProjectedFeeUsd)}`,
+      `Safety cap: $${preview.gasProjection.capUsd.toFixed(2)}`,
+      `Gas limit: ${preview.gasProjection.signedGasLimit}`,
+      `Gas price: ${(Number(preview.gasProjection.gasPrice)/1e9).toFixed(3)} gwei`,
+    ] : ["Gas projection: unavailable"]),
     `Transactions: ${preview.transactionCount}`,
     "5 LP positions will be minted atomically.",
     "Manual reposition: USDG reset · explicit confirmation · same depth · no swap",

@@ -7,7 +7,7 @@ import {
   type TransactionReceipt,
   type WalletClient,
 } from "viem";
-import { inspectErc20, priceFromSqrtX96, robinhoodMainnet, type FallbackRpc } from "@funi/core";
+import { erc20Abi, inspectErc20, priceFromSqrtX96, robinhoodMainnet, type FallbackRpc } from "@funi/core";
 import {
   amountsForLiquidity,
   decodeV4BatchFullDecrease,
@@ -42,6 +42,7 @@ import {
 import { convergeTerminalV4BidLadder } from "./v4-bid-ladder-terminal-convergence.js";
 
 const CHAIN_ID = 4663;
+export const V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS = 3;
 const same = (a: unknown, b: unknown) =>
   String(a).toLowerCase() === String(b).toLowerCase();
 export function sameV4PoolKey(a: V4PoolKey, b: V4PoolKey) {
@@ -635,19 +636,25 @@ async function childFundingOnlyDrift(input:{repo:SqliteLedgerRepository;rpc:Fall
   return {drifted,pool:current.value};
 }
 
-export async function rematerializeV4BidLadderRepositionChildOnce(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;childId:string;wallet:Address;nowMs:number;pool?:V4PoolState}){
+export async function rematerializeV4BidLadderRepositionChildOnce(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;childId:string;wallet:Address;nowMs:number;failureCode?:'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY'|'V4_BID_LADDER_MINT_ESTIMATE_FAILED';pool?:V4PoolState;metadata?:{funding:{address:Address;decimals:number};target:{address:Address;decimals:number}}}){
   const reset=input.repo.loadBidLadderUsdReset(input.ladderId),source=ladderRows(input.repo,input.ladderId),child=ladderRows(input.repo,input.childId);
-  if(!reset||String(reset.next_ladder_id)!==input.childId||String(reset.phase)!=='REOPEN_PLANNED')throw new Error('REPOSITION_JIT_REMATERIALIZATION_AUTHORITY_INVALID');
-  if(String(child.parent.status)!=='PLANNED'||Number(child.parent.revision)!==0||String(input.repo.loadBidLadderUsdReset(input.childId)?.phase)!=='OPEN_PENDING')throw new Error('REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED');
+  const childReset=input.repo.loadBidLadderUsdReset(input.childId),activeChild=String(reset?.reopen_workflow_identity??reset?.next_ladder_id??'');
+  if(!reset||activeChild!==input.childId||String(reset.phase)!=='REOPEN_PLANNED')throw new Error('REPOSITION_JIT_REMATERIALIZATION_AUTHORITY_INVALID');
+  if(String(child.parent.status)!=='PLANNED'||String(childReset?.phase)!=='OPEN_PENDING')throw new Error('REPOSITION_JIT_REMATERIALIZATION_OPEN_AUTHORITY_EXISTS');
+  const priorAttempts=Number(childReset?.jit_rematerialization_attempts??0);
+  if(!Number.isSafeInteger(priorAttempts)||priorAttempts<0||priorAttempts>=V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS)throw new Error('REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED');
   const journal=input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='OPEN_BATCH' LIMIT 1").get(CHAIN_ID,input.childId);
   if(journal||child.legs.some(leg=>leg.open_batch_id||leg.token_id||String(leg.status)!=='PLANNED'))throw new Error('REPOSITION_JIT_REMATERIALIZATION_OPEN_AUTHORITY_EXISTS');
   const capital=BigInt(String(reset.returned_usdg_principal_raw??'0')),targetPrincipal=BigInt(String(reset.returned_target_principal_raw??'-1')),depth=input.repo.v4BidLadderStrategyDepthBps(input.ladderId),inspected=input.pool?undefined:await inspectV4Pool(input.rpc,source.key),current=input.pool??(inspected?.status==='available'?inspected.value:undefined);
   if(!current)throw new Error('REPOSITION_FRESH_POOL_STATE_UNAVAILABLE');
   if(capital<=0n||targetPrincipal!==0n||!sameV4PoolKey(current.key,source.key)||!same(current.id,source.parent.pool_id))throw new Error('REPOSITION_JIT_STRATEGY_INTENT_MISMATCH');
-  const funding=tokenFromParent(input.repo,source.parent,'funding'),target=tokenFromParent(input.repo,source.parent,'target'),fresh=previewV4BidLadder({pool:current,funding,target,totalFundingAmount:capital,maxDownsideBps:depth,owner:input.wallet,deadline:BigInt(Math.floor(input.nowMs/1000)+600),nowMs:input.nowMs}),plan={...fresh.plan,ladderId:input.childId,legs:fresh.plan.legs.map(leg=>({...leg,identity:`${input.childId}:${leg.index}:${leg.upperDropBps}:${leg.lowerDropBps}:${leg.tickLower}:${leg.tickUpper}`}))};
+  const funding=tokenFromParent(input.repo,source.parent,'funding'),target=tokenFromParent(input.repo,source.parent,'target'),metadata=input.metadata??await (async()=>{const [fundingEvidence,targetEvidence]=await Promise.all([inspectErc20(input.rpc,funding.address),inspectErc20(input.rpc,target.address)]);if(fundingEvidence.status!=='available'||targetEvidence.status!=='available')throw new Error('REPOSITION_FRESH_TOKEN_METADATA_UNAVAILABLE');return {funding:fundingEvidence.value,target:targetEvidence.value};})();
+  if(!same(metadata.funding.address,funding.address)||metadata.funding.decimals!==funding.decimals||!same(metadata.target.address,target.address)||metadata.target.decimals!==target.decimals||!same(funding.address,robinhoodMainnet.assets.USDG)||!same(current.key.currency0,source.parent.currency0)||!same(current.key.currency1,source.parent.currency1)||Number(source.parent.funding_index)!==(same(funding.address,current.key.currency0)?0:1)||Number(source.parent.target_index)!==(same(target.address,current.key.currency0)?0:1))throw new Error('REPOSITION_JIT_STRATEGY_INTENT_MISMATCH');
+  const fresh=previewV4BidLadder({pool:current,funding,target,totalFundingAmount:capital,maxDownsideBps:depth,owner:input.wallet,deadline:BigInt(Math.floor(input.nowMs/1000)+600),nowMs:input.nowMs}),plan={...fresh.plan,ladderId:input.childId,legs:fresh.plan.legs.map(leg=>({...leg,identity:`${input.childId}:${leg.index}:${leg.upperDropBps}:${leg.lowerDropBps}:${leg.tickLower}:${leg.tickUpper}`}))};
   if(plan.totalFundingAmount!==capital||plan.maxDownsideBps!==depth||plan.legs.length!==5||plan.legs.some((leg,index)=>leg.index!==index||leg.targetIndex!==Number(source.parent.target_index)||leg.fundingIndex!==Number(source.parent.funding_index)||(leg.targetIndex===0?leg.mint.amount0Expected:leg.mint.amount1Expected)!==0n)||plan.legs.reduce((sum,leg)=>sum+leg.fundingAmount,0n)!==capital)throw new Error('REPOSITION_JIT_STRATEGY_INTENT_MISMATCH');
-  input.repo.db.transaction(()=>{const parentChanged=input.repo.db.prepare("UPDATE v4_bid_ladders SET reference_tick=?,reference_block=?,reference_block_hash=?,total_funding_amount_raw=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED' AND revision=0").run(plan.referenceTick,plan.referenceBlock.toString(),plan.referenceBlockHash??null,capital.toString(),input.nowMs,input.childId).changes;if(parentChanged!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');const update=input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET upper_drop_bps=?,lower_drop_bps=?,capital_weight_bps=?,tick_lower=?,tick_upper=?,funding_amount_raw=?,planned_liquidity_raw=?,funding_index=?,target_index=?,updated_at_ms=? WHERE ladder_id=? AND leg_index=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL");for(const leg of plan.legs)if(update.run(leg.upperDropBps,leg.lowerDropBps,leg.weightBps,leg.tickLower,leg.tickUpper,leg.fundingAmount.toString(),leg.mint.liquidity.toString(),leg.fundingIndex,leg.targetIndex,input.nowMs,input.childId,leg.index).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');})();
-  return {childId:input.childId,referenceTick:plan.referenceTick,referenceBlock:plan.referenceBlock,rematerializations:1 as const};
+  const expectedParentRevision=Number(child.parent.revision),expectedResetRevision=Number(childReset!.revision),attempt=priorAttempts+1,failureCode=input.failureCode??'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY';
+  input.repo.db.transaction(()=>{const parentChanged=input.repo.db.prepare("UPDATE v4_bid_ladders SET reference_tick=?,reference_block=?,reference_block_hash=?,total_funding_amount_raw=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED' AND revision=?").run(plan.referenceTick,plan.referenceBlock.toString(),plan.referenceBlockHash??null,capital.toString(),input.nowMs,input.childId,expectedParentRevision).changes;if(parentChanged!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');const update=input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET upper_drop_bps=?,lower_drop_bps=?,capital_weight_bps=?,tick_lower=?,tick_upper=?,funding_amount_raw=?,planned_liquidity_raw=?,funding_index=?,target_index=?,updated_at_ms=? WHERE ladder_id=? AND leg_index=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL");for(const leg of plan.legs)if(update.run(leg.upperDropBps,leg.lowerDropBps,leg.weightBps,leg.tickLower,leg.tickUpper,leg.fundingAmount.toString(),leg.mint.liquidity.toString(),leg.fundingIndex,leg.targetIndex,input.nowMs,input.childId,leg.index).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');if(input.repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET jit_rematerialization_attempts=?,jit_last_failure_code=?,jit_last_reference_tick=?,jit_last_reference_block=?,jit_last_attempt_at_ms=?,revision=revision+1,updated_at_ms=? WHERE ladder_id=? AND phase='OPEN_PENDING' AND revision=? AND jit_rematerialization_attempts=?").run(attempt,failureCode,plan.referenceTick,plan.referenceBlock.toString(),input.nowMs,input.nowMs,input.childId,expectedResetRevision,priorAttempts).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');})();
+  return {childId:input.childId,referenceTick:plan.referenceTick,referenceBlock:plan.referenceBlock,rematerializations:attempt};
 }
 
 export async function previewV4BidLadderUsdReset(input: {
@@ -958,8 +965,62 @@ function confirmedCloseReceiptExists(repo: SqliteLedgerRepository, ladderId: str
   ).get(CHAIN_ID, ladderId));
 }
 
+const activeRepositionChildId=(reset:Record<string,unknown>|undefined)=>reset?.reopen_workflow_identity?String(reset.reopen_workflow_identity):reset?.next_ladder_id?String(reset.next_ladder_id):undefined;
+
+export async function v4BidLadderRepositionResumeEligibility(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;wallet:Address;nowMs?:number;leaseOwnerId?:string;context?:()=>Promise<LadderLiveContext>;readWalletBalance?:()=>Promise<bigint>;readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>}){
+  const now=input.nowMs??Date.now(),source=input.repo.loadBidLadder(input.ladderId),reset=input.repo.loadBidLadderUsdReset(input.ladderId),priorChildId=reset?.next_ladder_id?String(reset.next_ladder_id):undefined,priorChild=priorChildId?input.repo.loadBidLadder(priorChildId):undefined,priorReset=priorChildId?input.repo.loadBidLadderUsdReset(priorChildId):undefined,legs=priorChildId?input.repo.listBidLadderLegs(priorChildId):[],blockers:string[]=[];
+  if(String(source?.status)!=='CLOSED'||String(source?.close_provenance)!=='FUNI_EXECUTED')blockers.push('REPOSITION_RESUME_SOURCE_NOT_CANONICALLY_CLOSED');
+  if(String(reset?.phase)!=='BLOCKED')blockers.push('REPOSITION_RESUME_SOURCE_NOT_BLOCKED');
+  if(String(reset?.block_reason)!=='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED')blockers.push('REPOSITION_RESUME_BLOCK_REASON_NOT_JIT_EXHAUSTED');
+  const closeRows=input.repo.db.prepare("SELECT status,receipt_json,expected_hash FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' ORDER BY attempt").all(CHAIN_ID,input.ladderId) as Array<Record<string,unknown>>;
+  if(closeRows.length!==1||String(closeRows[0]?.status)!=='CONFIRMED'||!closeRows[0]?.receipt_json)blockers.push('REPOSITION_RESUME_CLOSE_RECEIPT_NOT_EXACTLY_ONCE');
+  const principal=BigInt(String(reset?.returned_usdg_principal_raw??'0')),targetPrincipal=BigInt(String(reset?.returned_target_principal_raw??'-1'));
+  if(principal<=0n)blockers.push('REPOSITION_RESUME_PRINCIPAL_MISSING');
+  if(targetPrincipal!==0n)blockers.push('REPOSITION_RESUME_TARGET_PRINCIPAL_CONVERSION_REQUIRED');
+  if(!priorChildId||!priorChild||!priorReset)blockers.push('REPOSITION_RESUME_PRIOR_CHILD_MISSING');
+  else{
+    if(String(priorChild.status)!=='CANCELLED'||String(priorReset.phase)!=='BLOCKED')blockers.push('REPOSITION_RESUME_PRIOR_CHILD_NOT_TERMINAL');
+    if(String(priorReset.root_ladder_id)!==String(reset?.root_ladder_id)||String(priorReset.previous_ladder_id)!==input.ladderId||Number(priorReset.generation)!==Number(reset?.generation)+1)blockers.push('REPOSITION_RESUME_PRIOR_CHILD_LINEAGE_INVALID');
+    if(priorReset.next_ladder_id)blockers.push('REPOSITION_RESUME_ALTERNATE_CHILD_EXISTS');
+    if(legs.length!==5||legs.some(leg=>String(leg.status)!=='CANCELLED'||leg.token_id!==null||leg.open_batch_id!==null))blockers.push('REPOSITION_RESUME_PRIOR_CHILD_NOT_EMPTY');
+    if(input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='OPEN_BATCH' LIMIT 1").get(CHAIN_ID,priorChildId))blockers.push('REPOSITION_RESUME_PRIOR_CHILD_OPEN_AUTHORITY_EXISTS');
+    if(input.repo.db.prepare("SELECT 1 FROM v4_positions WHERE open_intent_id=? LIMIT 1").get(priorChildId))blockers.push('REPOSITION_RESUME_PRIOR_CHILD_ALREADY_MINTED');
+  }
+  const unresolved=Number((input.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE chain_id=? AND lower(wallet_address)=? AND status IN ('PREPARED','SUBMITTED')").get(CHAIN_ID,input.wallet.toLowerCase()) as {count:number}).count);
+  if(unresolved)blockers.push('REPOSITION_RESUME_UNRESOLVED_WALLET_TRANSACTION');
+  if(input.repo.db.prepare("SELECT 1 FROM chain_nonce_mutex WHERE chain_id=? AND lower(wallet_address)=? AND expires_at>?").get(CHAIN_ID,input.wallet.toLowerCase(),new Date(now).toISOString())||input.repo.db.prepare("SELECT 1 FROM nonce_mutex WHERE lower(wallet)=? AND expires_at>?").get(input.wallet.toLowerCase(),new Date(now).toISOString()))blockers.push('REPOSITION_RESUME_NONCE_MUTEX_HELD');
+  const lease=input.repo.db.prepare("SELECT owner_id,lease_until_ms FROM v4_bid_ladder_usdg_reset_execution_leases WHERE ladder_id=? AND lease_until_ms>?").get(input.ladderId,now) as {owner_id:string;lease_until_ms:number}|undefined;
+  if(lease&&lease.owner_id!==input.leaseOwnerId)blockers.push('REPOSITION_RESUME_ACTIVE_LEASE');
+  let nonce:{latest:number;pending:number}|undefined;
+  try{const truth=await nonceTruth(input.repo,input.rpc,input.wallet,now);nonce={latest:truth.latest,pending:truth.pending};if(truth.latest!==truth.pending)blockers.push('REPOSITION_RESUME_NONCE_AMBIGUOUS');}catch{blockers.push('REPOSITION_RESUME_NONCE_EVIDENCE_UNAVAILABLE');}
+  let walletBalance=0n;
+  try{walletBalance=input.readWalletBalance?await input.readWalletBalance():await input.rpc.withClient(client=>client.readContract({address:getAddress(String(source?.funding_token)),abi:erc20Abi,functionName:'balanceOf',args:[input.wallet]}),{stage:'reposition_resume_eligibility',method:'ERC20.balanceOf'});if(walletBalance<principal)blockers.push('REPOSITION_RESUME_PRINCIPAL_BALANCE_INSUFFICIENT');}catch{blockers.push('REPOSITION_RESUME_PRINCIPAL_BALANCE_UNAVAILABLE');}
+  let allowance:{ready:boolean;blockers:readonly string[]}|undefined;
+  try{allowance=input.readAllowanceReadiness?await input.readAllowanceReadiness():input.context?await v4BidLadderFundingAllowanceReadiness({...(await input.context()),fundingAmount:principal}):undefined;if(!allowance?.ready)blockers.push(...(allowance?.blockers??['REPOSITION_RESUME_ALLOWANCE_EVIDENCE_UNAVAILABLE']));}catch{blockers.push('REPOSITION_RESUME_ALLOWANCE_EVIDENCE_UNAVAILABLE');}
+  return {eligible:blockers.length===0,ladderId:input.ladderId,rootLadderId:String(reset?.root_ladder_id??''),sourceGeneration:Number(reset?.generation??-1),priorChildId,priorChildGeneration:Number(priorReset?.generation??-1),nextGeneration:Number(priorReset?.generation??Number(reset?.generation??0))+1,principalRaw:principal.toString(),walletBalanceRaw:walletBalance.toString(),allowanceReady:Boolean(allowance?.ready),nonce,blockers:[...new Set(blockers)],signingCount:0,broadcastCount:0};
+}
+
+export async function resumeV4BidLadderReposition(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;wallet:Address;context:()=>Promise<LadderLiveContext>;nowMs?:number;readWalletBalance?:()=>Promise<bigint>;readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>}){
+  const now=input.nowMs??Date.now(),ownerId=`reposition-resume:${process.pid}:${randomUUID()}`,lease=acquireV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,callerSource:'USER_CONFIRM',nowMs:now});
+  if(lease.result!=='ACQUIRED')throw new Error('REPOSITION_RESUME_ALREADY_PROGRESSING');
+  try{
+    const eligibility=await v4BidLadderRepositionResumeEligibility({...input,nowMs:now,leaseOwnerId:ownerId});if(!eligibility.eligible)throw new Error(`REPOSITION_RESUME_NOT_ELIGIBLE:${eligibility.blockers.join(',')}`);
+    const sourceReset=input.repo.loadBidLadderUsdReset(input.ladderId)!,source=ladderRows(input.repo,input.ladderId),priorChildId=String(sourceReset.next_ladder_id),priorReset=input.repo.loadBidLadderUsdReset(priorChildId)!,capital=BigInt(String(sourceReset.returned_usdg_principal_raw)),depth=input.repo.v4BidLadderStrategyDepthBps(input.ladderId),pool=await inspectV4Pool(input.rpc,source.key);
+    if(pool.status==='unavailable')throw new Error('REPOSITION_RESUME_FRESH_POOL_STATE_UNAVAILABLE');
+    const funding=tokenFromParent(input.repo,source.parent,'funding'),target=tokenFromParent(input.repo,source.parent,'target'),[fundingEvidence,targetEvidence]=await Promise.all([inspectErc20(input.rpc,funding.address),inspectErc20(input.rpc,target.address)]);
+    if(fundingEvidence.status!=='available'||targetEvidence.status!=='available'||fundingEvidence.value.decimals!==funding.decimals||targetEvidence.value.decimals!==target.decimals||!sameV4PoolKey(pool.value.key,source.key)||!same(pool.value.id,source.parent.pool_id))throw new Error('REPOSITION_RESUME_FRESH_CANONICAL_STATE_INVALID');
+    const preview=previewV4BidLadder({pool:pool.value,funding,target,totalFundingAmount:capital,maxDownsideBps:depth,owner:input.wallet,deadline:BigInt(Math.floor(now/1000)+600),nowMs:now}),generation=Number(priorReset.generation)+1;
+    input.repo.db.transaction(()=>{
+      const current=input.repo.loadBidLadderUsdReset(input.ladderId),old=input.repo.loadBidLadder(priorChildId),oldReset=input.repo.loadBidLadderUsdReset(priorChildId);if(String(current?.phase)!=='BLOCKED'||String(current?.block_reason)!=='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED'||String(old?.status)!=='CANCELLED'||String(oldReset?.phase)!=='BLOCKED'||oldReset?.next_ladder_id)throw new Error('REPOSITION_RESUME_STATE_CHANGED');
+      createV4BidLadderLive(input.repo,preview,Number(capital)/10**funding.decimals,{rootLadderId:String(current!.root_ladder_id),previousLadderId:priorChildId,generation,creationReason:'USDG_RESET_REPOSITION'});
+      input.repo.transitionBidLadderUsdReset({ladderId:input.ladderId,from:'BLOCKED',to:'REOPEN_PLANNED',reopenWorkflowIdentity:preview.plan.ladderId,blockReason:null,nowMs:now});
+    })();
+    return {status:'RESUMED_REOPEN_PLANNED' as const,ladderId:input.ladderId,previousChildId:priorChildId,childId:preview.plan.ladderId,rootLadderId:String(sourceReset.root_ladder_id),generation,principalRaw:capital.toString(),depthBps:depth,jitAttemptsUsed:0,maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,signingCount:0,broadcastCount:0};
+  }finally{releaseV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId});}
+}
+
 export function convergeBlockedRepositionOrphanChild(input:{repo:SqliteLedgerRepository;sourceLadderId:string;nowMs?:number}){
-  const source=input.repo.loadBidLadderUsdReset(input.sourceLadderId),childId=source?.next_ladder_id?String(source.next_ladder_id):undefined;
+  const source=input.repo.loadBidLadderUsdReset(input.sourceLadderId),childId=source?activeRepositionChildId(source):undefined;
   if(!source||String(source.phase)!=='BLOCKED'||!childId)return {status:'NOT_ELIGIBLE' as const,sourceLadderId:input.sourceLadderId};
   const child=input.repo.loadBidLadder(childId),childReset=input.repo.loadBidLadderUsdReset(childId),legs=input.repo.listBidLadderLegs(childId),openBatch=input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='OPEN_BATCH' LIMIT 1").get(CHAIN_ID,childId),pending=input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND status IN ('PREPARED','SUBMITTED') LIMIT 1").get(CHAIN_ID,childId);
   if(String(child?.status)==='CANCELLED'&&String(childReset?.phase)==='BLOCKED')return {status:'ALREADY_CONVERGED' as const,sourceLadderId:input.sourceLadderId,childId};
@@ -1184,10 +1245,7 @@ async function processV4BidLadderUsdResetOwned(
       };
     if (!manualAuthorization(input.manualAuthorizationIdentity))
       throw new Error("REPOSITION_MANUAL_AUTHORIZATION_INVALID");
-    const finalTruth = await inspect({ ...input, ladderId, nowMs: (input.nowMs ?? Date.now)() });
-    if (!finalTruth.eligible)
-      return { status: "ABORTED_PRE_SIGN" as const, ladderId, blockers: finalTruth.blockers, signingUsed: false, broadcastUsed: false };
-    const sourceContext=await input.context(ladderId),allowance=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...sourceContext,fundingAmount:finalTruth.usdgPrincipal});
+    const sourceContext=await input.context(ladderId),allowance=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...sourceContext,fundingAmount:first.usdgPrincipal});
     if(!allowance.ready)return {status:'PREPARE_ALLOWANCE_REQUIRED' as const,ladderId,blockers:allowance.blockers,signingUsed:false,broadcastUsed:false};
     notifyWithoutBlocking(input,`USDG Reset Reposition · READY\nOld ladder: ${ladderId}\nPrincipal: USDG-only\nDepth retained: -${input.repo.v4BidLadderStrategyDepthBps(ladderId) / 100}%`);
     assertV4BidLadderRepositionLease(input, ladderId);
@@ -1273,7 +1331,7 @@ async function processV4BidLadderUsdResetOwned(
   }
   if (String(reset?.phase) === "BLOCKED")
     return { status: "BLOCKED" as const, ladderId, reason: reset?.block_reason };
-  let childId = reset?.next_ladder_id ? String(reset.next_ladder_id) : undefined;
+  let childId = activeRepositionChildId(reset);
   if(String(reset?.phase)==='PRINCIPAL_RECONCILED'){
     if(!reset) throw new Error('REPOSITION_RESET_NOT_FOUND');
     if(BigInt(String(reset.returned_target_principal_raw??'-1'))!==0n){input.repo.transitionBidLadderUsdReset({ladderId,from:'PRINCIPAL_RECONCILED',to:'BLOCKED',blockReason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL'});return {status:'BLOCKED' as const,ladderId,reason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL'};}
@@ -1313,13 +1371,28 @@ async function processV4BidLadderUsdResetOwned(
     reset = input.repo.loadBidLadderUsdReset(ladderId);
   }
   if (["REOPEN_PLANNED", "REOPEN_PREPARED", "REOPEN_SUBMITTED"].includes(String(reset?.phase))) {
-    childId = childId ?? String(reset?.next_ladder_id ?? "");
+    childId = childId ?? activeRepositionChildId(reset) ?? "";
     if (!childId) throw new Error("REPOSITION_CHILD_MISSING");
     try {
       assertV4BidLadderRepositionLease(input, ladderId);
-      const executeOpen = input.executeOpen ?? executeV4BidLadderLiveOpen,openInput={...(await input.context(childId)),walletClient:input.walletClient(),requirePreapprovedFunding:true as const};
+      const executeOpen = input.executeOpen ?? executeV4BidLadderLiveOpen,jitStartedAtMs=(input.nowMs??Date.now)();
       let opened;
-      try{opened=await executeOpen(openInput);}catch(error){const message=error instanceof Error?error.message:String(error);if(!/V4_BID_LADDER_LEG_NOT_FUNDING_ONLY|V4_BID_LADDER_MINT_ESTIMATE_FAILED/.test(message))throw error;const drift=await childFundingOnlyDrift({repo:input.repo,rpc:input.rpc,childId});if(!drift.drifted)throw error;await rematerializeV4BidLadderRepositionChildOnce({repo:input.repo,rpc:input.rpc,ladderId,childId,wallet:input.wallet,nowMs:(input.nowMs??Date.now)(),pool:drift.pool});opened=await executeOpen({...openInput,...(await input.context(childId)),walletClient:input.walletClient(),requirePreapprovedFunding:true});}
+      for(;;){
+        try{opened=await executeOpen({...(await input.context(childId)),walletClient:input.walletClient(),requirePreapprovedFunding:true});break;}
+        catch(error){
+          const message=error instanceof Error?error.message:String(error),failureCode=message.startsWith('V4_BID_LADDER_LEG_NOT_FUNDING_ONLY')?'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY' as const:message.startsWith('V4_BID_LADDER_MINT_ESTIMATE_FAILED')?'V4_BID_LADDER_MINT_ESTIMATE_FAILED' as const:undefined;
+          if(!failureCode)throw error;
+          const drift=await childFundingOnlyDrift({repo:input.repo,rpc:input.rpc,childId});if(!drift.drifted)throw error;
+          assertV4BidLadderRepositionLease(input,ladderId);
+          try{
+            const rematerialized=await rematerializeV4BidLadderRepositionChildOnce({repo:input.repo,rpc:input.rpc,ladderId,childId,wallet:input.wallet,nowMs:(input.nowMs??Date.now)(),failureCode,pool:drift.pool});
+            repositionTelemetry(input,{ladderId,childId,generation:Number(input.repo.loadBidLadderUsdReset(childId)?.generation),ownerId:input.executionLease?.ownerId??null,callerSource:input.callerSource??null,jitAttempt:rematerialized.rematerializations,maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,freshReferenceTick:rematerialized.referenceTick,freshReferenceBlock:rematerialized.referenceBlock.toString(),preflightFailureClass:failureCode,elapsedMs:(input.nowMs??Date.now)()-jitStartedAtMs});
+          }catch(rematerializationError){
+            if(rematerializationError instanceof Error&&rematerializationError.message==='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED')repositionTelemetry(input,{ladderId,childId,generation:Number(input.repo.loadBidLadderUsdReset(childId)?.generation),ownerId:input.executionLease?.ownerId??null,callerSource:input.callerSource??null,jitAttempt:Number(input.repo.loadBidLadderUsdReset(childId)?.jit_rematerialization_attempts??0),maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,preflightFailureClass:failureCode,jitBudgetExhausted:true,elapsedMs:(input.nowMs??Date.now)()-jitStartedAtMs});
+            throw rematerializationError;
+          }
+        }
+      }
       const latest = input.repo.loadBidLadderUsdReset(ladderId)!;
       const completion = ["REOPEN_PLANNED", "REOPEN_PREPARED", "REOPEN_SUBMITTED"].includes(String(latest.phase))
         ? transitionV4BidLadderUsdResetOnce({
@@ -1416,7 +1489,7 @@ function rotateV4BidLadderUsdResetCandidate(
     .run(retryReason, updatedAtMs, ladderId).changes;
 }
 
-/** The existing updated_at ordering is the durable round-funi cursor. Every
+/** The existing updated_at ordering is the durable round-robin cursor. Every
  * attempted nonterminal row moves behind the current population, including
  * passive and retryable rows, so no fixed LIMIT window can monopolize service. */
 export async function runV4BidLadderUsdResetCycle(input: V4BidLadderUsdResetCycleInput) {

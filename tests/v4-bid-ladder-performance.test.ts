@@ -345,7 +345,7 @@ describe("OPEN V4 BID Ladder aggregate performance", () => {
         [0n, 0n],
       ] as const,
       incidentPositions = incidentRanges.map(([tick_lower, tick_upper], i) => ({
-        token_id: String(100 + i),
+        token_id: String(859930 + i),
         tick_lower,
         tick_upper,
         liquidity_raw: liquidities[i]!.toString(),
@@ -354,7 +354,7 @@ describe("OPEN V4 BID Ladder aggregate performance", () => {
       })),
       incidentLegs = incidentRanges.map(([tick_lower, tick_upper], leg_index) => ({
         leg_index,
-        token_id: String(100 + leg_index),
+        token_id: String(859930 + leg_index),
         tick_lower,
         tick_upper,
         funding_amount_raw: ["160000000", "240000000", "360000000", "500000000", "740000000"][leg_index],

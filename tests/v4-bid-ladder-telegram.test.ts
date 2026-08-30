@@ -649,7 +649,7 @@ describe("V4 BID ladder manual dry-run operator surface", () => {
     expect(direct).toContain("createV4BidLadderLive(");
     expect(direct).toContain("v4BidLadderNativeUsd({ repo: db, rpc })");
     expect(direct).toContain(
-      "return bidLadderLivePreview(ctx, preview.plan.ladderId)",
+      "return bidLadderLivePreview(ctx, preview.plan.ladderId,{messageId:",
     );
     expect(direct).not.toContain("bid-ladder-create:");
     expect(source).toContain("Confirm Live Open");

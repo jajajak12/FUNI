@@ -1,4 +1,4 @@
-import { createPublicClient, getAddress, http, keccak256, zeroAddress, type Address, type Hex, type PublicClient } from 'viem';
+import { createPublicClient, getAddress, http, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient } from 'viem';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -7,6 +7,7 @@ export * from './multichain.js';
 
 export const RH_MAINNET = 4663;
 export const RH_TESTNET = 46630;
+export const ROBINHOOD_MULTICALL3 = getAddress('0xcA11bde05977b3631167028862be2a173976CA11');
 export type Availability<T> = { status: 'available'; value: T; provenance: Provenance } | { status: 'unavailable'; reason: string; provenance?: Provenance; details?: unknown };
 export type Provenance = { provider: string; observedAt: string; blockNumber?: bigint; confidence: 'verified' | 'derived' | 'partial' };
 export type ExplorerStatus='VERIFIED'|'MISMATCH'|'UNAVAILABLE'|'RATE_LIMITED'|'UNKNOWN';
@@ -29,10 +30,11 @@ export function evaluateDeploymentVerification(input:Omit<DeploymentVerification
  if(complete&&input.explorerStatus!=='VERIFIED')warnings.push(`Explorer metadata ${input.explorerStatus.toLowerCase().replace('_',' ')}; complete on-chain verification passed`);
  return {...input,finalVerificationStatus:complete?'VERIFIED_ONCHAIN':'BLOCKED',executionAllowedByDeploymentAudit:complete,blockingReasons,warnings};
 }
-export type ChainConfig = { chainId: number; name: string; rpcUrls: readonly string[]; explorerUrl?: string; nativeSymbol: string; assets: Record<string, Address> };
+export type ChainConfig = { chainId: number; name: string; rpcUrls: readonly string[]; explorerUrl?: string; nativeSymbol: string; assets: Record<string, Address>; contracts?: Chain['contracts'] };
 export const robinhoodMainnet: ChainConfig = {
   chainId: RH_MAINNET, name: 'Robinhood Chain', rpcUrls: ['https://rpc.mainnet.chain.robinhood.com'], explorerUrl: 'https://robinhoodchain.blockscout.com', nativeSymbol: 'ETH',
-  assets: { WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', USDG: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168' }
+  assets: { WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', USDG: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168' },
+  contracts: { multicall3: { address: ROBINHOOD_MULTICALL3 } }
 };
 export const UNISWAP_V3_ROBINHOOD_SOURCE='https://developers.uniswap.org/docs/protocols/v3/deployments/v3-robinhood-chain-deployments';
 export const UNISWAP_DEPLOYMENTS_JSON='https://developers.uniswap.org/deployments.json';
@@ -254,7 +256,7 @@ export class FallbackRpc {
   private readonly methodCooldownUntil:Array<Map<string,number>>;private readonly capabilityState:Array<Map<RpcMethodCapability,{status:Exclude<RpcCapabilityStatus,'COOLDOWN'>;lastSuccessfulTime?:string;lastFailureCategory?:EthGetLogsFailureCategory|'PROVIDER_ERROR';latencyClass?:'FAST'|'NORMAL'|'SLOW'}>>;private readonly cooldownMs:number;private readonly now:()=>number;private readonly onProviderEvent?:(event:RpcFailoverEvent)=>void;
   private readonly urls:readonly string[];private readonly attemptTimeoutMs:number;private readonly transportTimeoutMs:number;private readonly injectedClients:boolean;private nextProviderIndex=0;
   constructor(readonly config: ChainConfig, urls = config.rpcUrls,options:{timeoutMs?:number;attemptTimeoutMs?:number;cooldownMs?:number;now?:()=>number;clients?:PublicClient[];onProviderEvent?:(event:RpcFailoverEvent)=>void}={}) {
-    const chain={id:config.chainId,name:config.name,nativeCurrency:{name:config.nativeSymbol,symbol:config.nativeSymbol,decimals:18},rpcUrls:{default:{http:urls}}};
+    const chain={id:config.chainId,name:config.name,nativeCurrency:{name:config.nativeSymbol,symbol:config.nativeSymbol,decimals:18},rpcUrls:{default:{http:urls}},contracts:config.contracts};
     this.urls=[...urls];this.transportTimeoutMs=options.timeoutMs??12_000;this.attemptTimeoutMs=options.attemptTimeoutMs??this.transportTimeoutMs;this.injectedClients=Boolean(options.clients);
     this.clients=options.clients??urls.map(url=>createPublicClient({chain,transport:http(url,{timeout:this.transportTimeoutMs,retryCount:0})}));if(!this.clients.length)throw new Error('RPC_URL_REQUIRED');this.methodCooldownUntil=this.clients.map(()=>new Map());this.capabilityState=this.clients.map(()=>new Map());this.cooldownMs=options.cooldownMs??30_000;this.now=options.now??Date.now;this.onProviderEvent=options.onProviderEvent;this.onProviderEvent?.({event:'rpc_provider_pool_configured',providerIndex:-1,stage:'rpc_pool',method:'configuration',attempt:0,cooldownMs:this.cooldownMs,configuredProviderCount:this.clients.length,eligibleProviderCount:this.clients.length,outcome:'configured'});
   }
@@ -270,7 +272,7 @@ export class FallbackRpc {
    * contract reverts never do. */
   private attemptClient(index:number,signal:AbortSignal):PublicClient{
    if(this.injectedClients)return this.clients[index]!;
-   const urls=this.urls,chain={id:this.config.chainId,name:this.config.name,nativeCurrency:{name:this.config.nativeSymbol,symbol:this.config.nativeSymbol,decimals:18},rpcUrls:{default:{http:urls}}};
+   const urls=this.urls,chain={id:this.config.chainId,name:this.config.name,nativeCurrency:{name:this.config.nativeSymbol,symbol:this.config.nativeSymbol,decimals:18},rpcUrls:{default:{http:urls}},contracts:this.config.contracts};
    return createPublicClient({chain,transport:http(urls[index],{timeout:this.transportTimeoutMs,retryCount:0,fetchOptions:{signal}})}) as PublicClient;
   }
   async withClient<T>(operation: (client: PublicClient,attempt:RpcAttemptContext) => Promise<T>,context:RpcOperationContext={}): Promise<T> {

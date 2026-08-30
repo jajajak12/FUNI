@@ -3,7 +3,7 @@ import { assertFuniCredentialIsolation } from '../../shared/credential-isolation
 import { setTimeout as sleep } from 'node:timers/promises';
 import { FallbackRpc, ROBINHOOD_V3_DEPLOYMENT_SPECS, orderedRpcUrls, robinhoodMainnet } from '@funi/core';
 import { V4_ROBINHOOD_DEPLOYMENTS } from '@funi/v4';
-import { migrateSqlite, productionDatabasePaths, SQLITE_RUNTIME_BUSY_TIMEOUT_MS, SqliteLedgerRepository } from '@funi/ledger';
+import { EconomicForegroundDemandActiveError, migrateSqlite, productionDatabasePaths, SQLITE_RUNTIME_BUSY_TIMEOUT_MS, SqliteLedgerRepository, waitForEconomicForegroundDemandToClear } from '@funi/ledger';
 import { completeWalletPositionSync, enqueueWalletPositionSync, leaseWalletPositionSync, retryWalletPositionSync, syncWalletPositions } from '../../cli/src/position-adoption.js';
 import { acquireRpcReadLease, completePortfolioRefresh, completeTargetedPositionReconciliation, freshnessSafetyHeadroomMs, leasePortfolioRefresh, leaseTargetedPositionReconciliations, reconcileActivePositions, releaseRpcReadLease, retryTargetedPositionReconciliation } from '../../cli/src/active-position-reconciliation.js';
 import { attributedRpc } from '../../cli/src/rpc-attribution.js';
@@ -32,13 +32,14 @@ const emit=(event:string,data:Record<string,unknown>={})=>process.stdout.write(J
 const v3Factory=ROBINHOOD_V3_DEPLOYMENT_SPECS.find(item=>item.name==='factory')!.address,v3PositionManager=ROBINHOOD_V3_DEPLOYMENT_SPECS.find(item=>item.name==='positionManager')!.address;
 const deploymentCache={v3:{status:'available',value:{factory:v3Factory,positionManager:v3PositionManager},provenance:{provider:'pinned official Uniswap deployment registry',observedAt:new Date().toISOString(),confidence:'verified'}},v4:{status:'available',value:V4_ROBINHOOD_DEPLOYMENTS,provenance:{provider:'pinned official Uniswap deployment registry',observedAt:new Date().toISOString(),confidence:'verified'}}} as any;
 const open=()=>new SqliteLedgerRepository(paths.databasePath,{busyTimeoutMs:SQLITE_RUNTIME_BUSY_TIMEOUT_MS});
+const yieldEconomic=async(operation:string)=>{const result=await waitForEconomicForegroundDemandToClear({databasePath:paths.databasePath,component:'funi-v4-state-cache-worker',operation,onTelemetry:event=>emit('sqlite_write_window',event)});if(!result.cleared)throw new EconomicForegroundDemandActiveError(paths.databasePath);return result;};
 const busy=async<T>(operation:string,work:()=>Promise<T>|T):Promise<{value:T;lockRetryCount:number;dbWaitMs:number}>=>{
- const started=Date.now();let failure:unknown;
- for(let attempt=0;attempt<3;attempt++)try{return {value:await work(),lockRetryCount:attempt,dbWaitMs:Date.now()-started};}catch(error){failure=error;if(!/SQLITE_BUSY|database is locked/i.test(error instanceof Error?error.message:String(error)))throw error;const wait=50*2**attempt+Math.floor(Math.random()*50);emit('sqlite_busy_retry',{operation,attempt:attempt+1,waitMs:wait});await sleep(wait);}
+ const started=Date.now(),priority=await yieldEconomic(operation);let failure:unknown;
+ for(let attempt=0;attempt<3;attempt++)try{const windowStarted=Date.now(),value=await work();emit('sqlite_write_window',{component:'funi-v4-state-cache-worker',operation,persistenceClass:'background',economicDemandPresent:priority.demandPresent,waitYieldDurationMs:priority.waitedMs,writerWindowDurationMs:Date.now()-windowStarted,rowChangeCount:value&&typeof value==='object'&&typeof (value as {changes?:unknown}).changes==='number'?Number((value as unknown as {changes:number}).changes):null,retryCount:attempt,outcome:'SUCCEEDED'});return {value,lockRetryCount:attempt,dbWaitMs:Date.now()-started};}catch(error){failure=error;if(!/SQLITE_BUSY|database is locked/i.test(error instanceof Error?error.message:String(error)))throw error;const wait=50*2**attempt+Math.floor(Math.random()*50);emit('sqlite_busy_retry',{operation,attempt:attempt+1,waitMs:wait});await sleep(wait);}
  emit('sqlite_busy_terminal',{operation,dbWaitMs:Date.now()-started,error:failure instanceof Error?failure.message:String(failure)});throw failure;
 };
 const queueDepth=()=>{const db=open();try{return Number((db.db.prepare('SELECT COUNT(*) count FROM v4_state_refresh_queue').get() as {count:number}).count);}finally{db.close();}};
-const persistenceLease=(ownerId:string)=>({acquire:async()=>{const deadline=Date.now()+5_000;do{const acquired=await busy('state_persistence_lease_acquire',()=>{const db=open();try{return acquireStatePersistenceLease(db.db,ownerId,10_000);}finally{db.close();}});if(acquired.value)return true;await sleep(25);}while(Date.now()<deadline);return false;},release:async()=>{await busy('state_persistence_lease_release',()=>{const db=open();try{return releaseStatePersistenceLease(db.db,ownerId);}finally{db.close();}});}});
+const persistenceLease=(ownerId:string)=>({acquire:async()=>{const deadline=Date.now()+5_000;do{const acquired=await busy('state_persistence_lease_acquire',()=>{const db=open();try{return acquireStatePersistenceLease(db.db,ownerId,10_000);}finally{db.close();}});if(acquired.value){await yieldEconomic(`state_persistence_window:${ownerId.slice(0,80)}`);return true;}await sleep(25);}while(Date.now()<deadline);return false;},release:async()=>{await busy('state_persistence_lease_release',()=>{const db=open();try{return releaseStatePersistenceLease(db.db,ownerId);}finally{db.close();}});}});
 
 async function targetedReconciliationPhase(now:number){
  if(!wallet)return false;
@@ -74,6 +75,7 @@ async function stateCachePhase(now:number){
    LEFT JOIN v4_pool_registry r ON lower(r.pool_id)=lower(p.pool_id)
    WHERE p.status IN ('open','partially_closed') ORDER BY p.updated_at DESC LIMIT ?`).all(stateBatch) as Array<{pool_id:string;last_refreshed_at:string|null}>;
   activePoolCount=all.length;const due=all.filter(row=>!row.last_refreshed_at||Date.parse(row.last_refreshed_at)<=now-stateTtlMs);skippedFreshTtlCount=all.length-due.length;
+  await yieldEconomic('state_cache_queue_and_lease');
   for(const row of due)selectDb.enqueueV4StateRefresh(row.pool_id,120,'active-wallet-position',now);
   const background=selectDb.db.prepare(`SELECT p.pool_id FROM v4_pool_registry p WHERE p.chain_id=4663 AND p.dynamic_fee=0 AND p.static_fee_pips IS NOT NULL AND p.hook_classification='ZERO_HOOK' AND NOT EXISTS(SELECT 1 FROM v4_state_refresh_queue q WHERE lower(q.pool_id)=lower(p.pool_id)) ORDER BY CASE WHEN CAST(p.active_liquidity_raw AS INTEGER)>0 THEN 0 ELSE 1 END,COALESCE(p.last_refreshed_at,''),lower(p.pool_id) LIMIT ?`).all(stateBatch*2) as Array<{pool_id:string}>;
   for(const row of background)selectDb.enqueueV4StateRefresh(row.pool_id,50,'fair-registry-refresh',now);

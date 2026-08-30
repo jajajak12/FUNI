@@ -16,14 +16,18 @@ import {
   consumeGenericV4Basis,
   rawUsdMicros,
   valueGenericV4Returns,
-  valueV4ReturnsFromSqrtPriceX96,
+  valueV4ReturnsFromSqrtPriceX96 as checkedV4Returns,
 } from "../apps/cli/src/v4-realized-accounting.js";
 import { robinhoodMainnet } from "@funi/core";
+import { poolId, sqrtPriceAtTick, V4_MAX_TICK, V4_MIN_TICK } from "@funi/v4";
 import { v4BidLadderClosePairLabel } from "../apps/cli/src/v4-bid-ladder-live.js";
 import {
   aggregateFuniOpenLifecyclePnl,
   type PersistedPositionDisplayItem,
 } from "../apps/telegram-lp-bot/src/persisted-portfolio.js";
+
+function tickAtSqrt(sqrtPriceX96:bigint){let low=V4_MIN_TICK,high=V4_MAX_TICK;while(low<high){const mid=Math.ceil((low+high)/2);if(sqrtPriceAtTick(mid)<=sqrtPriceX96)low=mid;else high=mid-1;}return low;}
+function valueV4ReturnsFromSqrtPriceX96(input:{token0:string;token1:string;decimals0:number;decimals1:number;amount0:bigint;amount1:bigint;sqrtPriceX96:bigint}){const ordered=[input.token0,input.token1].sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase())),key={currency0:ordered[0]!,currency1:ordered[1]!,fee:3000,tickSpacing:10,hooks:"0x0000000000000000000000000000000000000000"},tick=tickAtSqrt(input.sqrtPriceX96);return checkedV4Returns({...input,source:{poolId:poolId(key as any),poolKey:key as any,sqrtPriceX96:input.sqrtPriceX96,tick,activeLiquidity:1_000_000n,initialized:true,blockNumber:1n,token0Decimals:input.decimals0,token1Decimals:input.decimals1}});}
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "funi-realized-pnl-")),
@@ -822,11 +826,12 @@ describe("generic V4 immutable remaining basis", () => {
   });
   it("values USDG-only and dual-asset returns exactly from bound sqrt price in both orientations", () => {
     const usdg = robinhoodMainnet.assets.USDG,
-      target = token("2"),
+      lowerTarget = token("2"),
+      higherTarget = token("f"),
       q96 = 2n ** 96n,
       a = valueV4ReturnsFromSqrtPriceX96({
         token0: usdg,
-        token1: target,
+        token1: higherTarget,
         decimals0: 6,
         decimals1: 18,
         amount0: 3_000_000n,
@@ -834,7 +839,7 @@ describe("generic V4 immutable remaining basis", () => {
         sqrtPriceX96: q96,
       }),
       b = valueV4ReturnsFromSqrtPriceX96({
-        token0: target,
+        token0: lowerTarget,
         token1: usdg,
         decimals0: 18,
         decimals1: 6,
@@ -844,7 +849,7 @@ describe("generic V4 immutable remaining basis", () => {
       }),
       only = valueV4ReturnsFromSqrtPriceX96({
         token0: usdg,
-        token1: target,
+        token1: higherTarget,
         decimals0: 6,
         decimals1: 18,
         amount0: 3_000_000n,
@@ -900,10 +905,17 @@ describe("generic V4 immutable remaining basis", () => {
       }),
     ).toMatchObject({ status: "INCOMPLETE" });
   });
+  it("rejects protocol boundaries, tick mismatch, and zero active liquidity",()=>{
+    const usdg=robinhoodMainnet.assets.USDG,target=token("f"),key={currency0:usdg,currency1:target,fee:3000,tickSpacing:10,hooks:token("0")} as any,run=(sqrtPriceX96:bigint,tick:number,activeLiquidity=1n)=>checkedV4Returns({token0:usdg,token1:target,decimals0:6,decimals1:18,amount0:1_000_000n,amount1:0n,sqrtPriceX96,source:{poolId:poolId(key),poolKey:key,sqrtPriceX96,tick,activeLiquidity,initialized:true,blockNumber:1n,token0Decimals:6,token1Decimals:18}});
+    expect(run(sqrtPriceAtTick(V4_MIN_TICK),V4_MIN_TICK)).toMatchObject({status:"INCOMPLETE",reason:"POOL_PRICE_AT_PROTOCOL_BOUNDARY"});
+    expect(run(sqrtPriceAtTick(100),99)).toMatchObject({status:"INCOMPLETE",reason:"POOL_PRICE_TICK_INCONSISTENT"});
+    expect(run(sqrtPriceAtTick(100),100,0n)).toMatchObject({status:"INCOMPLETE",reason:"POOL_ACTIVE_LIQUIDITY_UNAVAILABLE"});
+    expect(run(sqrtPriceAtTick(100),100)).toMatchObject({status:"AVAILABLE"});
+  });
 });
 
 describe("synthetic pre-CLOSE CLAIM regressions", () => {
-  const target = "0x0000000000000000000000000000000000000046";
+  const target = "0xffffffffffffffffffffffffffffffffffffffff";
   const q96 = 2n ** 96n;
   const valued = (amount0: bigint, amount1: bigint) =>
     valueV4ReturnsFromSqrtPriceX96({
@@ -1019,6 +1031,11 @@ describe("Daily PnL WIB coverage and incomplete truth", () => {
     expect(result.caption).not.toContain("Capital Basis");
     expect(result.caption).not.toContain("Coverage: full");
     expect(result.caption).not.toContain("REALIZED PNL: $0.00");
+  });
+  it("propagates one invalid CLOSE through Daily, Weekly, Monthly, and lifecycle coverage",()=>{
+    const invalid={event_id:"synthetic-invalid-close",event_kind:"CLOSE",valuation_status:"INCOMPLETE",realized_pnl_usd:null,newly_realized_fees_usd:null,capital_basis_usd:"100"};
+    expect(lifecyclePnlPresentation({closeEvent:invalid,events:[invalid]})).toMatchObject({coverage:"INCOMPLETE",pnl:null});
+    for(const kind of ["DAILY_PNL","WEEKLY_PNL","MONTHLY_PNL"] as const){const period=wibPeriodWindow(kind,new Date("2026-08-30T12:00:00.000Z")),result=periodPnlPresentation({period,coverageStartMs:period.startMs,events:[invalid]});expect(result).toMatchObject({status:"INCOMPLETE",incompleteCount:1});expect(result.caption).not.toContain("Coverage: full");}
   });
   it("shows true zero only for fully valued events", () => {
     const result = dailyPnlPresentation({

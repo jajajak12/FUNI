@@ -533,7 +533,7 @@ describe("durable direct token lookup", () => {
         multicallMembers: 24,
         rpcCallCount: 4,
         queueJobsCreated: 12,
-        terminalCandidateCount: 180,
+        terminalCandidateCount: 12,
         unavailableCandidateCount: 168,
       });
       expect(
@@ -545,6 +545,13 @@ describe("durable direct token lookup", () => {
           ["DISCOVERED", "REFRESH_REQUESTED", "LEASED"].includes(item.state),
         ),
       ).toEqual([]);
+      expect(
+        directLookupCandidateLifecycle(
+          f.repo,
+          first.request.id,
+          first.request.revision,
+        ),
+      ).toHaveLength(12);
       expect(leaseDirectLookupOutbox(f.repo, 5_000, 2_100)).toMatchObject({
         request_id: first.request.id,
         interaction_id: "interaction-1",
@@ -566,6 +573,17 @@ describe("durable direct token lookup", () => {
     } finally {
       f.close();
     }
+  });
+  it("measures a production-shaped 37-pool durable lookup completion",async()=>{
+    const f=fixture(37);
+    try{
+      const created=createOrReuseDirectLookup({repo:f.repo,token,nowMs:1_000,deadlineMs:10_000}),leased=leaseDirectTokenLookup(f.repo,10_000,1_001)!;
+      const started=performance.now();
+      await executeDirectTokenLookup({repo:f.repo,rpc:rpc(),request:leased,candidateBudget:12,maxRpcBatches:1,now:()=>2_000});
+      const completeMs=performance.now()-started,row=f.repo.db.prepare("SELECT status,candidate_pool_count,hydrated_pool_count,eligible_pool_count FROM direct_token_lookup_requests WHERE id=?").get(created.request.id);
+      expect(row).toMatchObject({status:"SUPPORTED_POOLS_FOUND",candidate_pool_count:37,hydrated_pool_count:12,eligible_pool_count:12});
+      console.log(JSON.stringify({event:"public_telegram_37_pool_durable_completion",completeMs,candidatePoolCount:37,hydratedPoolCount:12}));
+    }finally{f.close();}
   });
   it("hydrates high-fee static pools but preserves dynamic, hook, and execution safety boundaries", async () => {
     const f = fixture(6);
@@ -622,10 +640,7 @@ describe("durable direct token lookup", () => {
         executionEligible: false,
         uiState: "UNSUPPORTED:EXTREME_STATIC_FEE",
       });
-      expect(lifecycle).toMatchObject({
-        state: "UNSUPPORTED",
-        reason_code: "EXTREME_STATIC_FEE",
-      });
+      expect(lifecycle).toBeUndefined();
       expect(f.repo.v4RegistryPool(ids[3])?.initialized).toBe(0);
       expect(f.repo.v4RegistryPool(ids[1])?.initialized).toBe(0);
       expect(f.repo.v4RegistryPool(ids[2])?.initialized).toBe(0);
@@ -1081,7 +1096,7 @@ describe("durable direct token lookup", () => {
           )
           .get(),
       ).toEqual({ count: 9 });
-      expect(lifecycle).toHaveLength(173);
+      expect(lifecycle).toHaveLength(9);
       expect(
         lifecycle.filter((item) =>
           ["DISCOVERED", "REFRESH_REQUESTED", "LEASED"].includes(item.state),
@@ -1304,10 +1319,7 @@ describe("durable direct token lookup", () => {
         created.request.id,
         created.request.revision,
       );
-      expect(lifecycle.map((item) => item.state)).toEqual([
-        "ELIGIBLE",
-        "ELIGIBLE",
-      ]);
+      expect(lifecycle.map((item) => item.state)).toEqual(["ELIGIBLE"]);
       const presented = applyDirectLookupCandidatePresentation(
         f.repo,
         token,
@@ -1667,18 +1679,12 @@ describe("durable direct token lookup", () => {
         now: () => now + 2,
       });
       const firstRows = directLookupCandidateLifecycle(
-          f.repo,
-          first.request.id,
-          first.request.revision,
-        ),
-        deferred = firstRows
-          .filter(
-            (row) =>
-              row.reason_code === "BOUNDED_CANDIDATE_BUDGET_NOT_SELECTED",
-          )
-          .map((row) => row.pool_id);
+        f.repo,
+        first.request.id,
+        first.request.revision,
+      );
       expect(firstRpc.calls).toBe(12);
-      expect(deferred).toHaveLength(2);
+      expect(firstRows).toHaveLength(12);
       expect(
         (
           f.repo.db
@@ -1719,28 +1725,23 @@ describe("durable direct token lookup", () => {
           )
           .get(second.request.id) as any,
         metrics = JSON.parse(request.rpc_attribution_json),
-        reasons = rows.reduce<Record<string, number>>(
-          (out, row) => (
-            (out[String(row.reason_code)] =
-              (out[String(row.reason_code)] ?? 0) + 1),
-            out
-          ),
-          {},
-        );
+        cached = cachedV4PoolsForToken({
+          repo: f.repo,
+          token,
+          now: now + 13,
+        }).candidates;
       expect(secondRpc.calls).toBe(12);
+      expect(rows).toHaveLength(12);
       expect(
-        deferred.every(
-          (id) =>
-            rows.find((row) => row.pool_id === id)?.reason_code ===
-            "FRESH_STATEVIEW_NOT_INITIALIZED",
+        cached.filter(
+          (candidate) =>
+            candidate.uiState === "UNSUPPORTED:POOL_NOT_INITIALIZED",
         ),
-      ).toBe(true);
-      expect(reasons).toEqual({
-        FRESH_STATEVIEW_NOT_INITIALIZED: 14,
-        FRESH_ZERO_ACTIVE_LIQUIDITY: 1,
-      });
+      ).toHaveLength(14);
       expect(
-        rows.filter((row) => row.state === "NO_ACTIVE_LIQUIDITY"),
+        cached.filter(
+          (candidate) => candidate.uiState === "SUPPORTED_NO_ACTIVE_LIQUIDITY",
+        ),
       ).toHaveLength(1);
       expect(request.status).toBe("NO_ACTIVE_LIQUIDITY_POOL");
       expect(metrics).toMatchObject({

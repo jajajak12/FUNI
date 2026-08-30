@@ -60,6 +60,30 @@ V4_LIVE_CANARY_ENABLED=false
 
 Instalasi, discovery, pembacaan portfolio, dan preview tidak mengizinkan transaksi. Alur live memerlukan konfigurasi sadar pengguna, bukti preflight yang masih segar, wallet yang cocok, dan konfirmasi final. Bukti yang ambigu tetap berstatus menunggu rekonsiliasi; FUNI tidak menganggap ketidakpastian provider sebagai alasan aman untuk mengirim ulang transaksi.
 
+## Batas Gas Transaksi
+
+Nilai bawaan `MAX_GAS_COST_USD=0.70` adalah hard safety cap untuk **maximum projected fee**, bukan perkiraan biaya aktual. FUNI membedakan raw `estimateGas`, final gas limit yang sudah diberi margin satu kali, gas price yang dibuffer, **estimated execution fee** yang kemungkinan terpakai, **maximum projected fee** bila seluruh final gas limit terpakai, dan **actual receipt fee** setelah transaksi masuk chain. Kondisi jaringan menentukan biaya aktual; menaikkan atau menurunkan cap tidak mengubah harga gas jaringan.
+
+Preview atau output blokir menampilkan estimated execution fee, maximum projected fee, safety cap, final gas limit, dan gas price dalam gwei. Pengguna boleh memilih nilai lain yang tetap bounded; validasi schema mempertahankan maksimum `$1.00`. `MAX_LIFECYCLE_GAS_USD` tidak berubah, dan cap tidak pernah menjadi unlimited.
+
+## Respons Telegram
+
+Lookup token dan pembuatan LIVE preview menampilkan progress terlebih dahulu, lalu mengedit pesan yang sama dengan hasil akhir. Pool dari cache dapat muncul cepat; bukti yang belum selesai ditandai sedang diperbarui. Otoritas ekonomi akhir tetap memakai bukti pool, saldo, allowance, harga, dan gas yang fresh.
+
+Menekan Refresh, mengirim token baru, atau mengoreksi jumlah menggantikan pekerjaan sebelumnya. Hasil worker lama tidak boleh menimpa sesi yang lebih baru, dan pesan progress tidak pernah memberi otoritas eksekusi.
+
+## Pemulihan Transaksi
+
+Setelah upaya broadcast yang otoritatif, FUNI segera memeriksa expected hash yang sama dan merekonsiliasi receipt kanonis. Jangan menekan Confirm berulang kali saat status masih direkonsiliasi: kebenaran exact-hash/receipt mengalahkan status presentasi lokal, dan ketidakjelasan penyimpanan lokal bukan izin untuk rebroadcast atau transaksi pengganti semantik.
+
+## Reposition
+
+Reposition memakai paling banyak tiga rematerialisasi JIT per generasi child untuk drift yang memang dapat dirematerialisasi. Jika source sudah terbukti tertutup tetapi child belum pernah terbuka, pengguna dapat memilih Resume Reposition secara eksplisit; FUNI memvalidasi ulang source CLOSE, principal, wallet, journal, dan nonce lalu membuat generation berikutnya dari state kanonis yang fresh. Child yang dibatalkan tidak dihidupkan kembali. Alur ini tidak melakukan swap otomatis atau burn NFT.
+
+## PnL Tidak Lengkap
+
+Valuasi pool yang melewati batas protokol, tidak memiliki active liquidity, tidak konsisten antara tick dan `sqrtPrice`, atau tidak dapat dipercaya ditampilkan sebagai `Unavailable`/`INCOMPLETE`. Daily, Weekly, dan Monthly meneruskan status `PARTIAL`/`INCOMPLETE` secara jujur; FUNI tidak mengarang harga untuk memaksa coverage menjadi `FULL`. Bukti accounting mentah tetap disimpan untuk rekonsiliasi.
+
 ## Intervensi Manual Darurat
 
 Dalam kondisi normal, hindari mengirim transaksi wallet lain ketika FUNI masih merekonsiliasi transaksi `PREPARED` atau `SUBMITTED`. FUNI dapat memblokir tindakan baru sementara ketika kebenaran transaksi belum final.

@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { robinhoodMainnet } from "@funi/core";
-import { migrateSqlite, SqliteLedgerRepository } from "@funi/ledger";
+import {
+  migrateSqlite,
+  SqliteLedgerRepository,
+} from "@funi/ledger";
 import { amountsForLiquidity, poolId, sqrtPriceAtTick, type V4PoolState } from "@funi/v4";
 import {
   createV4BidLadderLive,
@@ -11,12 +14,14 @@ import {
 } from "../apps/cli/src/v4-bid-ladder-operator.js";
 import {
   acquireV4BidLadderRepositionLease,
+  assertV4BidLadderReplacementAuthorization,
   classifyV4BidLadderRepositionExecutionError,
   classifyV4BidLadderUsdResetOutputs,
   cancelV4BidLadderRepositionPreClose,
   classifyV4BidLadderUsdResetCandidateError,
   evaluateV4BidLadderUsdResetEligibility,
   processV4BidLadderUsdReset,
+  prepareAllowanceAndContinueV4BidLadderReposition,
   releaseV4BidLadderRepositionLease,
   renewV4BidLadderRepositionLease,
   rematerializeV4BidLadderRepositionChildOnce,
@@ -27,16 +32,18 @@ import {
   V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,
   V4_BID_LADDER_USDG_RESET_PARENT_STATUS_MATRIX,
   v4BidLadderRepositionResumeEligibility,
+  v4BidLadderRepositionContinuationEligibility,
+  classifyV4BidLadderRepositionState,
   v4BidLadderUsdResetParentStatePolicy,
+  v4BidLadderUsdResetStateSemantics,
 } from "../apps/cli/src/v4-bid-ladder-usdg-reset.js";
-import { executeV4BidLadderManualClose } from "../apps/cli/src/v4-bid-ladder-live.js";
+import {
+  convergeConfirmedV4BidLadderRepositionClose,
+  executeV4BidLadderManualClose,
+} from "../apps/cli/src/v4-bid-ladder-live.js";
 
 const roots: string[] = [];
-afterEach(() =>
-  roots
-    .splice(0)
-    .forEach((root) => rmSync(root, { recursive: true, force: true })),
-);
+afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const wallet = "0x00000000000000000000000000000000000000aa" as const,
   target = "0x0000000000000000000000000000000000000001" as const,
   zero = "0x0000000000000000000000000000000000000000" as const,
@@ -100,8 +107,39 @@ function setupReopen(repo:SqliteLedgerRepository,capital=1_999_999_995n){
 function insertConfirmedClose(repo:SqliteLedgerRepository,sourceId:string){
   const hash=`0x${'a'.repeat(64)}`;repo.db.prepare("INSERT INTO chain_transaction_journal(chain_id,chain_key,protocol,journal_id,wallet_address,workflow_identity,semantic_stage,attempt,status,nonce,transaction_type,expected_hash,to_address,request_fingerprint,fee_model,receipt_json,confirmation_count,created_at,submitted_at,confirmed_at,updated_at) VALUES(4663,'robinhood','uniswap_v4',?,?,?,'CLOSE_BATCH',0,'CONFIRMED',1,'legacy',?,?,?,'legacy','{}',1,'2026-01-01','2026-01-01','2026-01-01','2026-01-01')").run(`${sourceId}:close`,wallet,sourceId,hash,target,'fingerprint');
 }
+function persistCanonicalCloseJournal(repo:SqliteLedgerRepository,sourceId:string,options:{workflowIdentity?:string;status?:"PREPARED"|"CONFIRMED";receiptHash?:string;receiptStatus?:"success"|"reverted"}={}){
+  const expectedHash=`0x${"ab".repeat(32)}`,workflowIdentity=options.workflowIdentity??sourceId,journalId=`${sourceId}:CLOSE_BATCH:0`;
+  repo.persistChainPreparedTransaction({chainId:4663,chainKey:"robinhood",protocol:"uniswap_v4",journalId,wallet,workflowIdentity,semanticStage:"CLOSE_BATCH",attempt:0,nonce:760,transactionType:"modifyLiquidities",expectedHash,to:zero,requestFingerprint:"canonical-close",feeModel:"legacy"});
+  repo.db.prepare("UPDATE chain_transaction_journal SET provider_evidence_json=? WHERE chain_id=4663 AND journal_id=?").run(JSON.stringify({prepared:{expectedHash,requestFingerprint:"canonical-close",request:{account:wallet,chainId:4663,to:zero,data:"0x12",value:"0",gas:"1",gasPrice:"1",nonce:760}}}),journalId);
+  if(options.status==="CONFIRMED"){
+    repo.transitionChainTransaction({chainId:4663,journalId,from:"PREPARED",to:"SUBMITTED"});
+    repo.transitionChainTransaction({chainId:4663,journalId,from:"SUBMITTED",to:"CONFIRMED",receipt:{status:options.receiptStatus??"success",transactionHash:options.receiptHash??expectedHash}});
+  }
+  return {expectedHash,journalId};
+}
+function setupConfirmedClosePhase(repo:SqliteLedgerRepository,phase:"CLOSE_PREPARED"|"CLOSE_SUBMITTED"){
+  const parent=create(repo,6000),sourceId=parent.plan.ladderId;
+  repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance='FUNI_EXECUTED',terminal_provenance='FUNI_AUTHORED_CLOSE_BATCH' WHERE ladder_id=?").run(sourceId);
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"OPEN_PENDING",to:"WATCHING"});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"WATCHING",to:"CLOSE_PREPARED",closeWorkflowIdentity:closeIdentity});
+  if(phase==="CLOSE_SUBMITTED")repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"CLOSE_PREPARED",to:"CLOSE_SUBMITTED"});
+  persistCanonicalCloseJournal(repo,sourceId,{status:"CONFIRMED"});
+  return sourceId;
+}
 function setupBlockedIncident(repo:SqliteLedgerRepository){
   const value=setupReopen(repo);repo.transitionBidLadderUsdReset({ladderId:value.sourceId,from:'REOPEN_PLANNED',to:'BLOCKED',blockReason:'REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED'});repo.db.transaction(()=>{repo.db.prepare("UPDATE v4_bid_ladders SET status='CANCELLED',terminal_reason='JIT_EXHAUSTED',terminal_at_ms=10000,updated_at_ms=10000,revision=revision+1 WHERE ladder_id=?").run(value.childId);repo.db.prepare("UPDATE v4_bid_ladder_legs SET status='CANCELLED',updated_at_ms=10000 WHERE ladder_id=?").run(value.childId);repo.transitionBidLadderUsdReset({ladderId:value.childId,from:'OPEN_PENDING',to:'BLOCKED',blockReason:'REPOSITION_SOURCE_BLOCKED_PRE_OPEN',nowMs:10000});})();insertConfirmedClose(repo,value.sourceId);return value;
+}
+function setupFirstChildApprovalBlock(repo:SqliteLedgerRepository,capital=99_999_995n){
+  const source=create(repo,6000,0,1n,capital),sourceId=source.plan.ladderId;
+  repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance='FUNI_EXECUTED',terminal_provenance='FUNI_AUTHORED_CLOSE_BATCH' WHERE ladder_id=?").run(sourceId);
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'OPEN_PENDING',to:'WATCHING'});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'WATCHING',to:'CLOSE_PREPARED',closeWorkflowIdentity:closeIdentity});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'CLOSE_PREPARED',to:'CLOSE_SUBMITTED'});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'CLOSE_SUBMITTED',to:'CLOSE_CONFIRMED',closeReason:'USDG_RESET_REPOSITION'});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'CLOSE_CONFIRMED',to:'PRINCIPAL_RECONCILED',returnedUsdgPrincipal:capital,returnedTargetPrincipal:0n,returnedUsdgFee:5n,returnedTargetFee:0n});
+  repo.transitionBidLadderUsdReset({ladderId:sourceId,from:'PRINCIPAL_RECONCILED',to:'BLOCKED',blockReason:'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED'});
+  persistCanonicalCloseJournal(repo,sourceId,{status:'CONFIRMED'});
+  return {sourceId,capital};
 }
 function canonicalRpc(repo?:SqliteLedgerRepository,childId?:string){let block=100n;return {config:{assets:robinhoodMainnet.assets},withClient:async(fn:any)=>fn({getTransactionCount:async()=>0,getBlockNumber:async()=>block++,getBytecode:async()=>"0x01",readContract:async({address,functionName}:any)=>{const tick=repo&&childId?Math.floor((Number(repo.listBidLadderLegs(childId)[0]!.tick_lower)+Number(repo.listBidLadderLegs(childId)[0]!.tick_upper))/2):0;if(functionName==='getSlot0')return [sqrtPriceAtTick(tick),tick,0,3000];if(functionName==='getLiquidity')return 10n**24n;if(functionName==='decimals')return String(address).toLowerCase()===String(usdg).toLowerCase()?6:18;if(functionName==='symbol')return String(address).toLowerCase()===String(usdg).toLowerCase()?'USDG':'TOKEN';if(functionName==='name')return 'Token';if(functionName==='balanceOf')return 10_000_000_000n;throw new Error(`UNEXPECTED:${functionName}`);}})} as any;}
 function truths(input: {
@@ -159,6 +197,56 @@ function eligible(input: {
 }
 
 describe("USDG Reset Reposition V1", () => {
+  it.each(["CLOSE_PREPARED","CLOSE_SUBMITTED"] as const)("canonically advances CLOSED + %s from exact confirmed journal evidence and is replay-idempotent",phase=>{
+    const repo=fixture();try{
+      const sourceId=setupConfirmedClosePhase(repo,phase),before=Number(repo.loadBidLadderUsdReset(sourceId)?.revision),first=convergeConfirmedV4BidLadderRepositionClose({repo,ladderId:sourceId,nowMs:50_000}),after=repo.loadBidLadderUsdReset(sourceId)!;
+      expect(first).toMatchObject({result:"APPLIED",closeReason:"USDG_RESET_REPOSITION"});
+      expect(after).toMatchObject({phase:"CLOSE_CONFIRMED",close_reason:"USDG_RESET_REPOSITION",close_workflow_identity:closeIdentity,revision:before+1});
+      expect(convergeConfirmedV4BidLadderRepositionClose({repo,ladderId:sourceId,nowMs:60_000})).toMatchObject({result:"ALREADY_ADVANCED"});
+      expect(repo.loadBidLadderUsdReset(sourceId)?.revision).toBe(before+1);
+    }finally{repo.close();}
+  });
+  it.each([
+    ["missing journal",(_repo:SqliteLedgerRepository,_id:string):void=>{},"REPOSITION_CLOSE_JOURNAL_MISSING"],
+    ["unconfirmed journal",(repo:SqliteLedgerRepository,id:string):void=>{persistCanonicalCloseJournal(repo,id);},"REPOSITION_CLOSE_RECEIPT_NOT_CONFIRMED"],
+    ["reverted receipt",(repo:SqliteLedgerRepository,id:string):void=>{persistCanonicalCloseJournal(repo,id,{status:"CONFIRMED",receiptStatus:"reverted"});},"REPOSITION_CLOSE_CONFIRMED_REVERT"],
+    ["wrong receipt hash",(repo:SqliteLedgerRepository,id:string):void=>{persistCanonicalCloseJournal(repo,id,{status:"CONFIRMED",receiptHash:`0x${"cd".repeat(32)}`});},"REPOSITION_CLOSE_RECEIPT_HASH_OR_PREPARED_EVIDENCE_MISMATCH"],
+    ["wrong workflow identity",(repo:SqliteLedgerRepository,id:string):void=>{persistCanonicalCloseJournal(repo,id,{status:"CONFIRMED",workflowIdentity:"v4bid_wrong"});},"REPOSITION_CLOSE_WORKFLOW_IDENTITY_MISMATCH"],
+  ] as const)("fails closed for %s without advancing phase",(_name,arrange,errorCode)=>{
+    const repo=fixture();try{
+      const parent=create(repo,6000),sourceId=parent.plan.ladderId;
+      repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance='FUNI_EXECUTED',terminal_provenance='FUNI_AUTHORED_CLOSE_BATCH' WHERE ladder_id=?").run(sourceId);
+      repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"OPEN_PENDING",to:"WATCHING"});repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"WATCHING",to:"CLOSE_PREPARED",closeWorkflowIdentity:closeIdentity});repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"CLOSE_PREPARED",to:"CLOSE_SUBMITTED"});arrange(repo,sourceId);
+      expect(()=>convergeConfirmedV4BidLadderRepositionClose({repo,ladderId:sourceId})).toThrow(errorCode);
+      expect(repo.loadBidLadderUsdReset(sourceId)?.phase).toBe("CLOSE_SUBMITTED");
+    }finally{repo.close();}
+  });
+  it("requires the durable manual authorization before confirmed-close convergence",()=>{
+    const repo=fixture();try{
+      const sourceId=setupConfirmedClosePhase(repo,"CLOSE_SUBMITTED");repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET close_workflow_identity=NULL WHERE ladder_id=?").run(sourceId);
+      expect(()=>convergeConfirmedV4BidLadderRepositionClose({repo,ladderId:sourceId})).toThrow("REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING");
+      expect(repo.loadBidLadderUsdReset(sourceId)?.phase).toBe("CLOSE_SUBMITTED");
+    }finally{repo.close();}
+  });
+  it("assigns one explicit progress, wait, block, or terminal semantic to every phase and parent status",()=>{
+    const phases=Object.keys(V4_BID_LADDER_USDG_RESET_PARENT_STATUS_MATRIX) as Array<keyof typeof V4_BID_LADDER_USDG_RESET_PARENT_STATUS_MATRIX>,statuses=["PLANNED","OPEN","CLOSED","CANCELLED"] as const;
+    for(const phase of phases)for(const parentStatus of statuses){const semantic=v4BidLadderUsdResetStateSemantics(phase,parentStatus);expect(["PROGRESS","WAIT","BLOCK","TERMINAL"]).toContain(semantic.kind);expect(semantic.reason.length).toBeGreaterThan(0);expect(semantic.kind==="BLOCK").toBe(!v4BidLadderUsdResetParentStatePolicy(phase,parentStatus).valid);}
+    expect(v4BidLadderUsdResetStateSemantics("CLOSE_SUBMITTED","CLOSED")).toMatchObject({kind:"PROGRESS",reason:"REPOSITION_VALIDATE_CONFIRMED_CLOSE"});
+    expect(v4BidLadderUsdResetStateSemantics("CLOSE_SUBMITTED","OPEN")).toMatchObject({kind:"WAIT",reason:"REPOSITION_WAITING_FOR_CLOSE_CANONICAL_PROJECTION"});
+  });
+  it("heals the production CLOSED + CLOSE_SUBMITTED incident in one owned cycle without repeating CLOSE or duplicating child work",async()=>{
+    const repo=fixture();try{
+      const sourceId=setupConfirmedClosePhase(repo,"CLOSE_SUBMITTED");let closes=0,principalRuns=0,childPlans=0,opens=0;let childId="";
+      const input={repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,readAllowanceReadiness:async()=>({ready:true,blockers:[]} as any),executeClose:async()=>{closes++;throw new Error("CLOSE_MUST_NOT_REPEAT");},reconcilePrincipal:async()=>{principalRuns++;repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"CLOSE_CONFIRMED",to:"PRINCIPAL_RECONCILED",returnedUsdgPrincipal:900n,returnedTargetPrincipal:0n,returnedUsdgFee:10n,returnedTargetFee:20n});return{returnedUsdgPrincipal:900n} as any;},planChild:async()=>{childPlans++;const child=create(repo,6000,300,3n,900n,{rootLadderId:sourceId,previousLadderId:sourceId,generation:1,creationReason:"USDG_RESET_REPOSITION"});childId=child.plan.ladderId;repo.transitionBidLadderUsdReset({ladderId:sourceId,from:"PRINCIPAL_RECONCILED",to:"REOPEN_PLANNED",reopenWorkflowIdentity:childId});return childId;},executeOpen:async()=>{opens++;return{status:"OPEN",mainnetTransactionsSent:0} as any;}} as any;
+      expect(await processV4BidLadderUsdReset(input,sourceId)).toMatchObject({status:"COMPLETED",childId});
+      expect({closes,principalRuns,childPlans,opens}).toEqual({closes:0,principalRuns:1,childPlans:1,opens:1});
+      expect(repo.loadBidLadderUsdReset(sourceId)).toMatchObject({phase:"COMPLETED",returned_usdg_principal_raw:"900",returned_target_principal_raw:"0",next_ladder_id:childId});
+      expect(await processV4BidLadderUsdReset(input,sourceId)).toMatchObject({status:"COMPLETED"});
+      expect({closes,principalRuns,childPlans,opens}).toEqual({closes:0,principalRuns:1,childPlans:1,opens:1});
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE workflow_identity=? AND semantic_stage='CLOSE_BATCH'").get(sourceId)).toEqual({count:1});
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE previous_ladder_id=?").get(sourceId)).toEqual({count:1});
+    }finally{repo.close();}
+  });
   it("pins CLOSE execution state to its block and ignores every later block", async () => {
     const key = state(0, 100n).key,
       calls: any[] = [];
@@ -587,36 +675,102 @@ describe("USDG Reset Reposition V1", () => {
       repo.close();
     }
   });
-  it("acknowledges the exact CLOSE receipt without running principal or child OPEN in the handler", async () => {
+  it("continues from a hot-path confirmed CLOSE receipt through principal and one child without periodic cadence", async () => {
     const repo = fixture();
     try {
       const parent = create(repo, 6000), id = parent.plan.ladderId,
         identity = "manual-reposition:7:00000000-0000-4000-8000-000000000007",
-        hash = `0x${"cd".repeat(32)}` as const;
+        events:string[]=[];
       repo.db.prepare("UPDATE v4_bid_ladders SET status='OPEN' WHERE ladder_id=?").run(id);
       repo.transitionBidLadderUsdReset({ ladderId: id, from: "OPEN_PENDING", to: "WATCHING" });
-      let principal = 0, child = 0, opens = 0;
       const result = await processV4BidLadderUsdReset({
         repo, rpc: {} as any, wallet, walletClient: () => ({} as any), context: async () => ({} as any),
-        manualAuthorizationIdentity: identity, returnAfterCloseReceipt: true, readAllowanceReadiness:async()=>({ready:true,blockers:[]} as any),
+        manualAuthorizationIdentity: identity, readAllowanceReadiness:async()=>({ready:true,blockers:[]} as any),
         readTruth: async () => ({ eligible: true, blockers: [], usdgPrincipal: 500n } as any),
         executeClose: async () => {
+          events.push("close");
           repo.transitionBidLadderUsdReset({ ladderId: id, from: "WATCHING", to: "CLOSE_PREPARED", closeWorkflowIdentity: identity });
           repo.transitionBidLadderUsdReset({ ladderId: id, from: "CLOSE_PREPARED", to: "CLOSE_SUBMITTED" });
-          repo.persistChainPreparedTransaction({ chainId: 4663, chainKey: "robinhood", protocol: "uniswap_v4", journalId: `${id}:CLOSE_BATCH:0`, wallet, workflowIdentity: id, semanticStage: "CLOSE_BATCH", attempt: 0, nonce: 1, transactionType: "modifyLiquidities", expectedHash: hash, to: zero, requestFingerprint: "bounded-close", feeModel: "legacy" });
-          repo.transitionChainTransaction({ chainId: 4663, journalId: `${id}:CLOSE_BATCH:0`, from: "PREPARED", to: "SUBMITTED" });
-          repo.transitionChainTransaction({ chainId: 4663, journalId: `${id}:CLOSE_BATCH:0`, from: "SUBMITTED", to: "CONFIRMED", receipt: { status: "success", transactionHash: hash } });
+          repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance='FUNI_EXECUTED',terminal_provenance='FUNI_AUTHORED_CLOSE_BATCH' WHERE ladder_id=?").run(id);
+          persistCanonicalCloseJournal(repo,id,{status:"CONFIRMED"});
           return { status: "CLOSED", mainnetTransactionsSent: 0 } as any;
         },
-        reconcilePrincipal: async () => { principal++; throw new Error("HANDLER_MUST_NOT_RECONCILE"); },
-        planChild: async () => { child++; throw new Error("HANDLER_MUST_NOT_PLAN"); },
-        executeOpen: async () => { opens++; throw new Error("HANDLER_MUST_NOT_OPEN"); },
+        reconcilePrincipal: async () => {events.push("principal");repo.transitionBidLadderUsdReset({ladderId:id,from:"CLOSE_CONFIRMED",to:"PRINCIPAL_RECONCILED",returnedUsdgPrincipal:500n,returnedTargetPrincipal:0n,returnedUsdgFee:5n,returnedTargetFee:0n});return{returnedUsdgPrincipal:500n} as any;},
+        planChild: async () => {events.push("child");const child=create(repo,6000,100,2n,500n,{rootLadderId:id,previousLadderId:id,generation:1,creationReason:"USDG_RESET_REPOSITION"});repo.transitionBidLadderUsdReset({ladderId:id,from:"PRINCIPAL_RECONCILED",to:"REOPEN_PLANNED",reopenWorkflowIdentity:child.plan.ladderId});return child.plan.ladderId;},
+        executeOpen: async () => {events.push("open");return{status:"OPEN",mainnetTransactionsSent:0} as any;},
       }, id);
-      expect(result).toEqual({ status: "CLOSE_CONFIRMED_PREPARING_REPLACEMENT", ladderId: id, durableContinuation: true });
-      expect({ principal, child, opens }).toEqual({ principal: 0, child: 0, opens: 0 });
-      expect(repo.loadBidLadderUsdReset(id)?.phase).toBe("CLOSE_SUBMITTED");
+      expect(result).toMatchObject({status:"COMPLETED",ladderId:id});
+      expect(events).toEqual(["close","principal","child","open"]);
+      expect(repo.loadBidLadderUsdReset(id)?.phase).toBe("COMPLETED");
       expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='CLOSE_BATCH' AND status='CONFIRMED'").get()).toEqual({ count: 1 });
     } finally { repo.close(); }
+  });
+  it.each([
+    ["none",false,false],
+    ["ERC20 only",true,false],
+    ["Permit2 only",false,true],
+    ["both",true,true],
+  ] as const)("continues the exact-consumption shape with %s replacement approval requirements under the original Confirm",async(_name,erc20Required,permit2Required)=>{
+    const repo=fixture();
+    try{
+      const parent=create(repo,6000),id=parent.plan.ladderId,identity=closeIdentity,events:string[]=[];
+      repo.db.prepare("UPDATE v4_bid_ladders SET status='OPEN' WHERE ladder_id=?").run(id);
+      repo.transitionBidLadderUsdReset({ladderId:id,from:'OPEN_PENDING',to:'WATCHING'});
+      let allowanceReads=0;
+      const result=await processV4BidLadderUsdReset({
+        repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async(ladderId:string)=>({ladderId}) as any,manualAuthorizationIdentity:identity,
+        readAllowanceReadiness:async()=>{allowanceReads++;return {ready:true,blockers:[]} as any;},
+        readTruth:async()=>({eligible:true,blockers:[],usdgPrincipal:900n} as any),
+        executeClose:async()=>{events.push('close');repo.transitionBidLadderUsdReset({ladderId:id,from:'WATCHING',to:'CLOSE_PREPARED',closeWorkflowIdentity:identity});repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_PREPARED',to:'CLOSE_SUBMITTED'});repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED',close_provenance='FUNI_EXECUTED',terminal_provenance='FUNI_AUTHORED_CLOSE_BATCH' WHERE ladder_id=?").run(id);repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_SUBMITTED',to:'CLOSE_CONFIRMED',closeReason:'USDG_RESET_REPOSITION'});return {status:'CLOSED'} as any;},
+        reconcilePrincipal:async()=>{events.push('principal');repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_CONFIRMED',to:'PRINCIPAL_RECONCILED',returnedUsdgPrincipal:900n,returnedTargetPrincipal:0n,returnedUsdgFee:5n,returnedTargetFee:7n});return {returnedUsdgPrincipal:900n} as any;},
+        planChild:async()=>{events.push('child');const child=create(repo,6000,300,3n,900n,{rootLadderId:id,previousLadderId:id,generation:1,creationReason:'USDG_RESET_REPOSITION'});repo.transitionBidLadderUsdReset({ladderId:id,from:'PRINCIPAL_RECONCILED',to:'REOPEN_PLANNED',reopenWorkflowIdentity:child.plan.ladderId});return child.plan.ladderId;},
+        executeOpen:async(openInput:any)=>{events.push(...(erc20Required?['erc20']:[]),...(permit2Required?['permit2']:[]),'open');expect(openInput.requirePreapprovedFunding).toBe(false);const child=repo.loadBidLadder(openInput.ladderId)!;expect(String(child.funding_token).toLowerCase()).toBe(usdg.toLowerCase());expect(String(child.target_token).toLowerCase()).toBe(target.toLowerCase());expect(BigInt(String(child.total_funding_amount_raw))).toBe(900n);return {status:'OPEN',mainnetTransactionsSent:0} as any;},
+      },id);
+      expect(result.status,JSON.stringify(result)).toBe('COMPLETED');
+      expect(result).toMatchObject({ladderId:id});
+      expect(events).toEqual(['close','principal','child',...(erc20Required?['erc20']:[]),...(permit2Required?['permit2']:[]),'open']);
+      expect(allowanceReads).toBe(1);
+      expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:'COMPLETED',block_reason:null});
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE previous_ladder_id=?").get(id)).toEqual({count:1});
+    }finally{repo.close();}
+  });
+  it("binds replacement authority to manual Confirm, exact principal, token, depth, lineage, and child identity",()=>{
+    const repo=fixture();try{
+      const {sourceId,childId,capital}=setupReopen(repo),scope=assertV4BidLadderReplacementAuthorization({repo,sourceLadderId:sourceId,childLadderId:childId});
+      expect(scope).toMatchObject({sourceLadderId:sourceId,childLadderId:childId,rootLadderId:sourceId,sourceGeneration:0,childGeneration:1,principal:capital,retainedDepthBps:6000,fundingToken:usdg,targetToken:target,manualAuthorizationIdentity:closeIdentity});
+      repo.db.prepare("UPDATE v4_bid_ladders SET target_token=? WHERE ladder_id=?").run('0x0000000000000000000000000000000000000002',childId);
+      expect(()=>assertV4BidLadderReplacementAuthorization({repo,sourceLadderId:sourceId,childLadderId:childId})).toThrow('REPOSITION_REPLACEMENT_AUTHORIZATION_STRATEGY_OR_TOKEN_MISMATCH');
+    }finally{repo.close();}
+  });
+  it.each(['PREPARED','SUBMITTED','CONFIRMED'] as const)("is restart-safe at replacement approval %s without creating a second child",async status=>{
+    const repo=fixture();try{
+      const {sourceId,childId}=setupReopen(repo),journalId=`${childId}:OPEN_PERMIT2_APPROVAL:0`,hash=`0x${'8'.repeat(64)}`;
+      repo.persistChainPreparedTransaction({chainId:4663,chainKey:'robinhood',protocol:'uniswap_v4',journalId,wallet,workflowIdentity:childId,semanticStage:'OPEN_PERMIT2_APPROVAL',attempt:0,nonce:9,transactionType:'OPEN_PERMIT2_APPROVAL',expectedHash:hash,to:target,requestFingerprint:'restart-boundary',feeModel:'legacy'});
+      if(status!=='PREPARED')repo.db.prepare("UPDATE chain_transaction_journal SET status=?,submitted_at='2026-01-01',confirmed_at=?,receipt_json=? WHERE journal_id=?").run(status,status==='CONFIRMED'?'2026-01-01':null,status==='CONFIRMED'?'{}':null,journalId);
+      let opens=0;
+      const result=await processV4BidLadderUsdReset({repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,executeOpen:async()=>{opens++;if(status!=='CONFIRMED')throw new Error('DURABLE_TRANSACTION_RECONCILIATION_PENDING');return {status:'OPEN',mainnetTransactionsSent:0} as any;}},sourceId);
+      if(status==='CONFIRMED')expect(result).toMatchObject({status:'COMPLETED'});else expect(result).toMatchObject({status:'REPLACEMENT_APPROVAL_PREPARING',approvalStage:'OPEN_PERMIT2_APPROVAL',journalStatus:status,durableContinuation:true});
+      expect(opens).toBe(1);
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE previous_ladder_id=?").get(sourceId)).toEqual({count:1});
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE workflow_identity=? AND semantic_stage='OPEN_PERMIT2_APPROVAL'").get(childId)).toEqual({count:1});
+    }finally{repo.close();}
+  });
+  it.each(['TRANSACTION_REVERTED','NONCE_NO_LONGER_AVAILABLE'] as const)("terminalizes a failed replacement approval (%s) without retrying or resurrecting its child",async failureReason=>{
+    const repo=fixture();try{
+      const {sourceId,childId}=setupReopen(repo),journalId=`${childId}:OPEN_ERC20_APPROVAL:0`,hash=`0x${'9'.repeat(64)}`;
+      repo.persistChainPreparedTransaction({chainId:4663,chainKey:'robinhood',protocol:'uniswap_v4',journalId,wallet,workflowIdentity:childId,semanticStage:'OPEN_ERC20_APPROVAL',attempt:0,nonce:10,transactionType:'OPEN_ERC20_APPROVAL',expectedHash:hash,to:usdg,requestFingerprint:'failed-approval',feeModel:'legacy'});
+      repo.db.prepare("UPDATE chain_transaction_journal SET status='FAILED',failure_reason=? WHERE journal_id=?").run(failureReason,journalId);
+      let opens=0;const result=await processV4BidLadderUsdReset({repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,executeOpen:async()=>{opens++;return {} as any;}},sourceId);
+      expect(result).toMatchObject({status:'BLOCKED',reason:`REPOSITION_REPLACEMENT_TRANSACTION_FAILED_OPEN_ERC20_APPROVAL_${failureReason}`});
+      expect(opens).toBe(0);
+      expect(repo.loadBidLadderUsdReset(sourceId)).toMatchObject({phase:'BLOCKED'});
+      expect(repo.loadBidLadder(childId)).toMatchObject({status:'CANCELLED'});
+      expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE workflow_identity=? AND semantic_stage='OPEN_ERC20_APPROVAL'").get(childId)).toEqual({count:1});
+    }finally{repo.close();}
+  });
+  it("classifies replacement approval revert, external nonce consumption, funding loss, and gas cap as terminal safety blockers",()=>{
+    for(const error of ['OPEN_ERC20_APPROVAL_REVERTED','DURABLE_TRANSACTION_EXACT_HASH_ABSENT_NONCE_UNAVAILABLE','V4_BID_LADDER_FUNDING_BALANCE_INSUFFICIENT','V4_BID_LADDER_GAS_CAP_EXCEEDED'])
+      expect(classifyV4BidLadderRepositionExecutionError(new Error(error))).toMatchObject({classification:'DETERMINISTIC_TERMINAL',code:error});
   });
   it("continues the normal authorized hot path directly with sub-2s internal overhead and no cadence dependency",async()=>{
     const repo=fixture();try{const parent=create(repo,6000),id=parent.plan.ladderId,identity="manual-reposition:7:00000000-0000-4000-8000-000000000007",events:string[]=[];repo.db.prepare("UPDATE v4_bid_ladders SET status='OPEN' WHERE ladder_id=?").run(id);repo.transitionBidLadderUsdReset({ladderId:id,from:'OPEN_PENDING',to:'WATCHING'});const started=Date.now(),result=await processV4BidLadderUsdReset({repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,manualAuthorizationIdentity:identity,confirmAtMs:started,readAllowanceReadiness:async()=>({ready:true,blockers:[]} as any),readTruth:async()=>{events.push('preflight');return {eligible:true,blockers:[],usdgPrincipal:900n} as any;},executeClose:async()=>{events.push('close');repo.transitionBidLadderUsdReset({ladderId:id,from:'WATCHING',to:'CLOSE_PREPARED',closeWorkflowIdentity:identity});repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_PREPARED',to:'CLOSE_SUBMITTED'});repo.db.prepare("UPDATE v4_bid_ladders SET status='CLOSED' WHERE ladder_id=?").run(id);repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_SUBMITTED',to:'CLOSE_CONFIRMED',closeReason:'USDG_RESET_REPOSITION'});return {status:'CLOSED'} as any;},reconcilePrincipal:async()=>{events.push('principal');repo.transitionBidLadderUsdReset({ladderId:id,from:'CLOSE_CONFIRMED',to:'PRINCIPAL_RECONCILED',returnedUsdgPrincipal:900n,returnedTargetPrincipal:0n,returnedUsdgFee:10n,returnedTargetFee:20n});return {returnedUsdgPrincipal:900n} as any;},planChild:async()=>{events.push('plan');const child=create(repo,6000,300,3n,900n,{rootLadderId:id,previousLadderId:id,generation:1,creationReason:'USDG_RESET_REPOSITION'});repo.transitionBidLadderUsdReset({ladderId:id,from:'PRINCIPAL_RECONCILED',to:'REOPEN_PLANNED',reopenWorkflowIdentity:child.plan.ladderId});return child.plan.ladderId;},executeOpen:async()=>{events.push('open');return {status:'OPEN',mainnetTransactionsSent:0} as any;}},id);const elapsed=Date.now()-started;expect(result.status).toBe('COMPLETED');expect(events).toEqual(['preflight','close','principal','plan','open']);expect(elapsed).toBeLessThan(2_000);expect(repo.loadBidLadderUsdReset(id)?.phase).toBe('COMPLETED');const telemetry=repo.db.prepare("SELECT context_json FROM latency_telemetry WHERE metric='v4_bid_ladder_reposition_sla'").get() as {context_json:string};expect(JSON.parse(telemetry.context_json)).toMatchObject({confirm_at:started,sla:'PASS'});const source=readFileSync('apps/cli/src/v4-bid-ladder-usdg-reset.ts','utf8');expect(source).not.toMatch(/processV4BidLadderUsdReset[\s\S]*await sleep/);}
@@ -788,7 +942,7 @@ describe("USDG Reset Reposition V1", () => {
       repo.close();
     }
   });
-  it("resumes only a durably authorized reposition after restart", async () => {
+  it("requires durable authorization and a CLOSE journal before restart recovery", async () => {
     for (const authorized of [false, true]) {
       const repo = fixture();
       try {
@@ -825,17 +979,16 @@ describe("USDG Reset Reposition V1", () => {
           },
           id,
         );
-        if (authorized)
-          await expect(attempt).rejects.toThrow("AUTHORIZED_RECOVERY_REACHED");
-        else
+        if (authorized) {
+          await expect(attempt).resolves.toMatchObject({status:"BLOCKED",reason:"REPOSITION_CLOSE_JOURNAL_MISSING"});
+          expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:"BLOCKED",close_workflow_identity:identity,block_reason:"REPOSITION_CLOSE_JOURNAL_MISSING"});
+        } else {
           await expect(attempt).rejects.toThrow(
             "REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING",
           );
-        expect(contexts).toBe(authorized ? 1 : 0);
-        expect(repo.loadBidLadderUsdReset(id)).toMatchObject({
-          phase: "CLOSE_PREPARED",
-          close_workflow_identity: identity,
-        });
+          expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:"CLOSE_PREPARED",close_workflow_identity:identity});
+        }
+        expect(contexts).toBe(0);
       } finally {
         repo.close();
       }
@@ -1062,8 +1215,11 @@ describe("USDG Reset Reposition V1", () => {
   it.each([2,3])("opens successfully after %i durable JIT rematerializations under one owner",async failures=>{const repo=fixture();try{const {sourceId,childId}=setupReopen(repo);let opens=0;const telemetry:any[]=[],result=await processV4BidLadderUsdReset({repo,rpc:canonicalRpc(repo,childId),wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,executeOpen:async()=>{opens++;if(opens<=failures)throw new Error(opens%2?'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY':'V4_BID_LADDER_MINT_ESTIMATE_FAILED');return {status:'OPEN'} as any;},telemetry:event=>telemetry.push(event)},sourceId);expect(result).toMatchObject({status:'COMPLETED',childId});expect(repo.loadBidLadderUsdReset(childId)).toMatchObject({jit_rematerialization_attempts:failures});expect(repo.loadBidLadderUsdReset(sourceId)).toMatchObject({phase:'COMPLETED'});expect(opens).toBe(failures+1);expect(telemetry.filter(row=>row.jitAttempt)).toHaveLength(failures);expect(new Set(telemetry.filter(row=>row.jitAttempt).map(row=>row.ownerId)).size).toBe(1);}finally{repo.close();}});
   it("blocks exactly once on the fourth drift need and cannot hot-retry or notify again",async()=>{const repo=fixture();try{const {sourceId,childId}=setupReopen(repo);let opens=0,notifications=0;const input={repo,rpc:canonicalRpc(repo,childId),wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,executeOpen:async()=>{opens++;throw new Error('V4_BID_LADDER_LEG_NOT_FUNDING_ONLY');},notify:async()=>{notifications++;}};const result=await processV4BidLadderUsdReset(input,sourceId);expect(result).toMatchObject({status:'BLOCKED',reason:'REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED'});expect(repo.loadBidLadderUsdReset(childId)).toMatchObject({jit_rematerialization_attempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,phase:'BLOCKED'});expect(repo.loadBidLadder(childId)).toMatchObject({status:'CANCELLED'});expect(opens).toBe(4);expect(notifications).toBe(1);expect(await processV4BidLadderUsdReset(input,sourceId)).toMatchObject({status:'BLOCKED'});expect({opens,notifications}).toEqual({opens:4,notifications:1});}finally{repo.close();}});
   it.each([1,2])("preserves JIT attempt #%i across repository restart while revision remains CAS version",async attempts=>{const first=fixture(),{sourceId,childId}=setupReopen(first),path=first.path,metadata={funding:{address:usdg,decimals:6},target:{address:target,decimals:18}};try{first.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET revision=revision+5 WHERE ladder_id=?").run(childId);for(let index=0;index<attempts;index++)await rematerializeV4BidLadderRepositionChildOnce({repo:first,rpc:{} as any,ladderId:sourceId,childId,wallet,nowMs:5_000+index,pool:state(index*10,100n+BigInt(index)),metadata});const before=first.loadBidLadderUsdReset(childId)!;expect(Number(before.revision)).toBe(5+attempts);expect(Number(before.jit_rematerialization_attempts)).toBe(attempts);first.close();const reopened=new SqliteLedgerRepository(path);try{expect(reopened.loadBidLadderUsdReset(childId)).toMatchObject({revision:5+attempts,jit_rematerialization_attempts:attempts,jit_last_reference_block:String(99+attempts)});}finally{reopened.close();}}finally{try{first.close();}catch{}}});
-  it("CAS-serializes duplicate rematerializers so only one consumes an attempt",async()=>{const root=mkdtempSync(join(tmpdir(),'jit-cas-')),path=join(root,'db.sqlite');roots.push(root);migrateSqlite(path,'infra/migrations');const one=new SqliteLedgerRepository(path),{sourceId,childId}=setupReopen(one),two=new SqliteLedgerRepository(path),metadata={funding:{address:usdg,decimals:6},target:{address:target,decimals:18}},rpc=canonicalRpc(),call=(repo:SqliteLedgerRepository)=>rematerializeV4BidLadderRepositionChildOnce({repo,rpc,ladderId:sourceId,childId,wallet,nowMs:8_000,metadata});try{const values=await Promise.allSettled([call(one),call(two)]);expect(values.filter(row=>row.status==='fulfilled')).toHaveLength(1);expect(values.filter(row=>row.status==='rejected')).toHaveLength(1);expect(one.loadBidLadderUsdReset(childId)).toMatchObject({jit_rematerialization_attempts:1});}finally{one.close();two.close();}});
+  it("CAS-serializes duplicate rematerializers so only one consumes an attempt",async()=>{const root=mkdtempSync(join(tmpdir(),'reposition-jit-cas-')),path=join(root,'db.sqlite');roots.push(root);migrateSqlite(path,'infra/migrations');const one=new SqliteLedgerRepository(path),{sourceId,childId}=setupReopen(one),two=new SqliteLedgerRepository(path),metadata={funding:{address:usdg,decimals:6},target:{address:target,decimals:18}},rpc=canonicalRpc(),call=(repo:SqliteLedgerRepository)=>rematerializeV4BidLadderRepositionChildOnce({repo,rpc,ladderId:sourceId,childId,wallet,nowMs:8_000,metadata});try{const values=await Promise.allSettled([call(one),call(two)]);expect(values.filter(row=>row.status==='fulfilled')).toHaveLength(1);expect(values.filter(row=>row.status==='rejected')).toHaveLength(1);expect(one.loadBidLadderUsdReset(childId)).toMatchObject({jit_rematerialization_attempts:1});}finally{one.close();two.close();}});
   it("keeps cancelled generation immutable and explicit Resume creates exactly one linked generation+1",async()=>{const repo=fixture();try{const {sourceId,childId,capital}=setupBlockedIncident(repo),rpc=canonicalRpc(),context=async()=>({}) as any,base={repo,rpc,ladderId:sourceId,wallet,context,readWalletBalance:async()=>capital,readAllowanceReadiness:async()=>({ready:true,blockers:[]})};const status=await v4BidLadderRepositionResumeEligibility(base);expect(status).toMatchObject({eligible:true,priorChildId:childId,priorChildGeneration:1,nextGeneration:2,signingCount:0,broadcastCount:0});const resumed=await resumeV4BidLadderReposition(base);expect(resumed).toMatchObject({status:'RESUMED_REOPEN_PLANNED',previousChildId:childId,generation:2,jitAttemptsUsed:0,signingCount:0,broadcastCount:0});expect(repo.loadBidLadder(childId)).toMatchObject({status:'CANCELLED'});expect(repo.loadBidLadderUsdReset(childId)).toMatchObject({phase:'BLOCKED'});expect(repo.loadBidLadderUsdReset(resumed.childId)).toMatchObject({generation:2,root_ladder_id:sourceId,previous_ladder_id:childId,jit_rematerialization_attempts:0,phase:'OPEN_PENDING'});expect(repo.loadBidLadderUsdReset(sourceId)).toMatchObject({phase:'REOPEN_PLANNED',next_ladder_id:childId,reopen_workflow_identity:resumed.childId});expect(repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE root_ladder_id=? AND generation=2").get(sourceId)).toEqual({count:1});await expect(resumeV4BidLadderReposition(base)).rejects.toThrow();expect(repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE root_ladder_id=? AND generation=2").get(sourceId)).toEqual({count:1});}finally{repo.close();}});
+  it("heals the production first-child approval shape under one owner and creates generation 1 exactly once",async()=>{const repo=fixture();try{const {sourceId,capital}=setupFirstChildApprovalBlock(repo),rpc=canonicalRpc(),events:any[]=[];let allowanceReady=false,preparations=0,opens=0;const context=async(id:string)=>({repo,rpc,ladderId:id,wallet,fundingUsd:1,nativeUsd:1,runtime:{executionEnabled:true,dryRun:false,emergencyPause:false,signerConfigured:true,allowlisted:true,maxPositionUsd:1000,maxApprovalUsd:1000,maxGasUsd:.7,slippageBps:50}}) as any,eligibility=await v4BidLadderRepositionContinuationEligibility({repo,rpc,ladderId:sourceId,wallet,context:()=>context(sourceId),readWalletBalance:async()=>capital,readAllowanceReadiness:async()=>({ready:false,blockers:['REPOSITION_PERMIT2_EXACT_ALLOWANCE_REQUIRED']})});expect(eligibility).toMatchObject({eligible:false,mode:'FIRST_CHILD',nextGeneration:1,principalRaw:capital.toString(),blockers:['REPOSITION_PERMIT2_EXACT_ALLOWANCE_REQUIRED']});const result=await prepareAllowanceAndContinueV4BidLadderReposition({repo,rpc,ladderId:sourceId,wallet,walletClient:()=>({}) as any,context,readWalletBalance:async()=>capital,readAllowanceReadiness:async()=>allowanceReady?({ready:true,erc20Ready:true,permit2Ready:true,amount:capital,blockers:[]} as any):({ready:false,erc20Ready:true,permit2Ready:false,amount:capital,blockers:['REPOSITION_PERMIT2_EXACT_ALLOWANCE_REQUIRED']} as any),prepareAllowance:async(input:any)=>{preparations++;expect(input.approvalIdentity).toBe('g1');expect(input.fundingAmount).toBe(capital);allowanceReady=true;return {status:'READY',readiness:{ready:true},mainnetTransactionsSent:0} as any;},executeOpen:async()=>{opens++;return {status:'OPEN',mainnetTransactionsSent:0} as any;},correlationId:'production-boner-shape',telemetry:event=>events.push(event)});expect(result).toMatchObject({status:'REPOSITION_ALLOWANCE_PREPARED_AND_CONTINUED',mode:'FIRST_CHILD',approvalIdentity:'g1',continuation:{status:'COMPLETED'}});expect({preparations,opens}).toEqual({preparations:1,opens:1});const sourceReset=repo.loadBidLadderUsdReset(sourceId)!,children=repo.db.prepare("SELECT * FROM v4_bid_ladder_usdg_reset_v1 WHERE previous_ladder_id=?").all(sourceId) as Array<Record<string,unknown>>;expect(sourceReset).toMatchObject({phase:'COMPLETED',returned_usdg_principal_raw:capital.toString(),returned_target_principal_raw:'0'});expect(children).toHaveLength(1);expect(children[0]).toMatchObject({generation:1,root_ladder_id:sourceId,previous_ladder_id:sourceId});expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE workflow_identity=? AND semantic_stage='CLOSE_BATCH'").get(sourceId)).toEqual({count:1});expect(events.some(row=>row.operation==='v4_bid_ladder_reposition_child_generation_commit'&&row.correlationId==='production-boner-shape')).toBe(true);expect(events.some(row=>row.operation==='v4_bid_ladder_reposition_phase_blocked_to_principal_reconciled')).toBe(true);}finally{repo.close();}});
+  it("classifies the complete parent/phase/child/approval/journal/lease Cartesian matrix without an undefined outcome",()=>{const parents=['PLANNED','OPEN','CLOSED','CANCELLED'] as const,phases=Object.keys(V4_BID_LADDER_USDG_RESET_PARENT_STATUS_MATRIX) as Array<keyof typeof V4_BID_LADDER_USDG_RESET_PARENT_STATUS_MATRIX>,children=['NONE','PLANNED','OPEN','CANCELLED','BLOCKED'] as const,approvals=['READY','REQUIRED','UNKNOWN'] as const,journals=['NONE','PENDING','CONFIRMED','FAILED'] as const,leases=['FREE','OWNED','OTHER'] as const;let classified=0;for(const parentStatus of parents)for(const phase of phases)for(const childState of children)for(const approvalReadiness of approvals)for(const journalState of journals)for(const leaseState of leases){const result=classifyV4BidLadderRepositionState({parentStatus,phase,childState,approvalReadiness,journalState,leaseState,blockReason:phase==='BLOCKED'?'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED':null});expect(['PROGRESS','WAIT','BLOCK','TERMINAL']).toContain(result.kind);expect(result.reason.length).toBeGreaterThan(0);classified++;}expect(classified).toBe(8640);expect(classifyV4BidLadderRepositionState({parentStatus:'CLOSED',phase:'PRINCIPAL_RECONCILED',childState:'NONE',approvalReadiness:'REQUIRED',journalState:'CONFIRMED',leaseState:'FREE'})).toEqual({kind:'PROGRESS',reason:'REPOSITION_REPLACEMENT_APPROVAL_PREPARING'});expect(classifyV4BidLadderRepositionState({parentStatus:'CLOSED',phase:'BLOCKED',childState:'NONE',approvalReadiness:'REQUIRED',journalState:'CONFIRMED',leaseState:'FREE',blockReason:'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED'})).toEqual({kind:'BLOCK',reason:'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED',healer:'reposition-prepare-allowance-and-continue'});});
+  it("retries a transient lock on the initial periodic authority read without creating authority",async()=>{const repo=fixture();try{const parent=create(repo,5000,0,1n,1_000_000n),ladderId=parent.plan.ladderId,load=repo.loadBidLadderUsdReset.bind(repo),events:any[]=[];let reads=0;(repo as any).loadBidLadderUsdReset=(id:string)=>{reads++;if(reads===1){const error=Object.assign(new Error('database is locked'),{code:'SQLITE_BUSY'});throw error;}return load(id);};const result=await processV4BidLadderUsdReset({repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,telemetry:event=>events.push(event)},ladderId);expect(result).toMatchObject({status:'OPEN_PENDING',ladderId});expect(reads).toBeGreaterThan(1);expect(events).toContainEqual(expect.objectContaining({operation:'v4_bid_ladder_reposition_dispatch_authority_read',sqliteCode:'SQLITE_OK',finalDisposition:'RECOVERED'}));expect(repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE workflow_identity=?").get(ladderId)).toEqual({count:0});}finally{repo.close();}});
   it.each([
     ['source not CLOSED',(repo:SqliteLedgerRepository,id:string)=>repo.db.prepare("UPDATE v4_bid_ladders SET status='OPEN' WHERE ladder_id=?").run(id),'REPOSITION_RESUME_SOURCE_NOT_CANONICALLY_CLOSED'],
     ['missing principal',(repo:SqliteLedgerRepository,id:string)=>repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET returned_usdg_principal_raw='0' WHERE ladder_id=?").run(id),'REPOSITION_RESUME_PRINCIPAL_MISSING'],
@@ -1442,7 +1598,7 @@ describe("USDG Reset Reposition V1", () => {
     } finally { repo.close(); }
   });
   it("keeps single-flight ownership durable across repositories, renews a slow live owner, and permits expired-owner recovery", () => {
-    const root=mkdtempSync(join(tmpdir(),"usdg-reset-cross-process-")),path=join(root,"ledger.sqlite");roots.push(root);migrateSqlite(path,"infra/migrations");
+    const root=mkdtempSync(join(tmpdir(),"reposition-lease-")),path=join(root,"ledger.sqlite");roots.push(root);migrateSqlite(path,"infra/migrations");
     const first=new SqliteLedgerRepository(path),second=new SqliteLedgerRepository(path);
     try {
       const ladder=create(first,6000).plan.ladderId;
@@ -1490,7 +1646,7 @@ describe("USDG Reset Reposition V1", () => {
         const input={repo,rpc:{} as any,wallet,walletClient:()=>({}) as any,context:async()=>({}) as any,executeOpen:async()=>{attempts++;if(attempts===1)throw new Error(failure);confirmedOpens++;return {status:"OPEN"} as any;}};
         const firstResult=await processV4BidLadderUsdReset(input,id);
         if(failure.endsWith("MUTEX_HELD")){
-          expect(firstResult).toMatchObject({status:"RECOVERY_REQUIRED",reason:"DURABLE_TRANSACTION_NONCE_MUTEX_HELD"});expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:"REOPEN_PLANNED"});expect(repo.loadBidLadder(child.plan.ladderId)).toMatchObject({status:"PLANNED"});expect(await processV4BidLadderUsdReset(input,id)).toMatchObject({status:"COMPLETED"});expect({attempts,confirmedOpens}).toEqual({attempts:2,confirmedOpens:1});
+          expect(firstResult).toMatchObject({status:"AUTOMATIC_RECOVERY_ACTIVE",reason:"DURABLE_TRANSACTION_NONCE_MUTEX_HELD"});expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:"REOPEN_PLANNED"});expect(repo.loadBidLadder(child.plan.ladderId)).toMatchObject({status:"PLANNED"});expect(await processV4BidLadderUsdReset(input,id)).toMatchObject({status:"COMPLETED"});expect({attempts,confirmedOpens}).toEqual({attempts:2,confirmedOpens:1});
         }else{
           expect(firstResult).toMatchObject({status:"BLOCKED",reason:"DURABLE_TRANSACTION_NONCE_DIVERGENCE"});expect(repo.loadBidLadderUsdReset(id)).toMatchObject({phase:"BLOCKED"});expect(repo.loadBidLadder(child.plan.ladderId)).toMatchObject({status:"CANCELLED"});expect({attempts,confirmedOpens}).toEqual({attempts:1,confirmedOpens:0});
         }
@@ -1499,7 +1655,7 @@ describe("USDG Reset Reposition V1", () => {
     expect(classifyV4BidLadderRepositionExecutionError(new Error("DURABLE_TRANSACTION_NONCE_MUTEX_HELD"))).toMatchObject({classification:"RETRYABLE"});
     expect(classifyV4BidLadderRepositionExecutionError(new Error("DURABLE_TRANSACTION_NONCE_DIVERGENCE"))).toMatchObject({classification:"DETERMINISTIC_TERMINAL"});
   });
-  it("retains exact-hash close and the 200 bps safety minimum", () => {
+  it("retains exact-hash close and 200 bps minima without swap or burn", () => {
     const reset = readFileSync(
         "apps/cli/src/v4-bid-ladder-usdg-reset.ts",
         "utf8",
@@ -1508,6 +1664,9 @@ describe("USDG Reset Reposition V1", () => {
     expect(reset).toContain("executeV4BidLadderManualClose");
     expect(reset).toContain('closeReason: "USDG_RESET_REPOSITION"');
     expect(reset).toContain("REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING");
+    expect(reset).not.toMatch(
+      /executeV4Rebalance|buildV4ExactInputSingle|BURN_POSITION|rebalance_workflows|rebalance_lineages/,
+    );
     expect(close).toContain("V4_BID_LADDER_CLOSE_SLIPPAGE_BPS = 200");
     expect(close).toContain("broadcastDurableTransaction");
     expect(close).toContain("REPOSITION_MANUAL_AUTHORIZATION_REQUIRED");

@@ -229,6 +229,13 @@ import {
 } from "./telegram-sender.js";
 import { drainClosePnlCardDeliveries } from "./pnl-card-delivery.js";
 import {
+  LIVE_PREVIEW_HARD_DEADLINE_MS,
+  createLivePreviewExecutionContext,
+  isLivePreviewTimeout,
+  runLivePreviewDeliveryWorkflow,
+  type LivePreviewExecutionContext,
+} from "./live-preview-lifecycle.js";
+import {
   formatV4BidLadderUsdResetPreview,
   previewV4BidLadderUsdReset,
   processV4BidLadderUsdReset,
@@ -270,9 +277,10 @@ const allowed = new Set(
     .map((x) => x.trim())
     .filter(Boolean),
 );
-type BidLadderInteractiveWork = { updateId:string; generation:number; progressMessageId?:number; promise?:Promise<unknown> };
+type BidLadderInteractiveWork = { updateId:string; generation:number; progressMessageId?:number; execution?:LivePreviewExecutionContext; promise?:Promise<unknown> };
 const bidLadderDirectLiveInFlight = new Map<string, BidLadderInteractiveWork>();
 const bidLadderLiveOpenInFlight = new Map<string, Promise<unknown>>();
+const bidLadderPreviewAuthorities = new Map<string,{requestId:string;userId:string;chatId:string;sessionId?:string;expiresAtMs:number}>();
 if (!allowed.size)
   throw new Error(
     "TELEGRAM_ALLOWED_USER_IDS must contain the single operator user ID",
@@ -332,6 +340,13 @@ const chat = (ctx: { chat?: { id: number } }) => String(ctx.chat?.id ?? "");
 const sessionTtlMs = env.TELEGRAM_SESSION_TTL_SECONDS * 1000;
 const reduced = (value: string) =>
   value.length <= 4 ? "…" : `…${value.slice(-4)}`;
+const bidLadderPreviewScope = (ctx: any) => `${owner(ctx)}:${chat(ctx)}`;
+function supersedeActiveBidLadderPreview(ctx: any, code: string) {
+  const request = bidLadderDirectLiveInFlight.get(bidLadderPreviewScope(ctx));
+  request?.execution?.supersede(code);
+  for(const [ladderId,authority] of bidLadderPreviewAuthorities)
+    if(authority.userId===owner(ctx)&&authority.chatId===chat(ctx))bidLadderPreviewAuthorities.delete(ladderId);
+}
 function registryMatchesV4Key(
   row: Record<string, unknown>,
   key: V4PoolKey,
@@ -411,6 +426,7 @@ function telegramFlowWrite<T>(
   });
 }
 function newFlow(ctx: any, state: Record<string, unknown>) {
+  supersedeActiveBidLadderPreview(ctx, "NEW_FLOW");
   const flow = telegramFlowWrite("createTelegramFlow", (db) =>
     db.createTelegramFlow({
       userId: owner(ctx),
@@ -463,6 +479,7 @@ function advanceFlow(
   flow: TelegramFlowSession,
   state: Record<string, unknown>,
   reason: string,
+  preserveActiveBidLadderPreview = false,
 ) {
   const result = telegramFlowWrite("transitionTelegramFlowCAS", (db) =>
     db.transitionTelegramFlowCAS({
@@ -478,6 +495,8 @@ function advanceFlow(
   );
   flowCasLog(reason, flow, String(state.kind), result);
   if (result.result === "APPLIED" && result.flow) {
+    if (!preserveActiveBidLadderPreview)
+      supersedeActiveBidLadderPreview(ctx, `FLOW_ADVANCED:${reason}`);
     transitionLog(result.flow, String(flow.state.kind), String(state.kind), reason);
     return result.flow;
   }
@@ -506,6 +525,7 @@ function cancelFlow(ctx: any, sessionId?: string) {
     if (outcome) {
       flowCasLog("cancel", outcome.flow, String(outcome.flow.state.kind), outcome.result);
       const cancelled = outcome.result.result === "APPLIED";
+      if (cancelled) supersedeActiveBidLadderPreview(ctx, "FLOW_CANCELLED");
       log("telegram_flow_cancelled", {
         sessionId,
         user: reduced(owner(ctx)),
@@ -516,6 +536,7 @@ function cancelFlow(ctx: any, sessionId?: string) {
     }
     return false;
   }
+  supersedeActiveBidLadderPreview(ctx, "START_OVER");
   const flow = telegramFlowWrite("createTelegramFlow", (db) => db.createTelegramFlow({
       userId: owner(ctx),
       chatId: chat(ctx),
@@ -1993,7 +2014,7 @@ async function bidLadderDryRunPreview(ctx: any, enteredAmount?: string) {
     return ctx.reply(`V4_BID_LADDER_PREVIEW_REJECTED\n${textError(error)}`);
   }
 }
-async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interactive?:{requestId:string;isCurrent:()=>boolean;setProgressMessageId:(messageId:number)=>void}) {
+async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interactive?:{requestId:string;isCurrent:()=>boolean;setExecution:(execution:LivePreviewExecutionContext)=>void;setProgressMessageId:(messageId:number)=>void}) {
   const flow = loadFlow(ctx), raw = enteredAmount ?? ctx.match?.trim();
   if (!flow || flow.status !== "active" || flow.state.kind !== "v4_bid_ladder_amount")
     return unavailableFlow(ctx, "missing");
@@ -2006,23 +2027,35 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interac
     return ctx.reply("V4_BID_LADDER_SELECTION_METADATA_INCOMPLETE");
   let total: bigint;
   try { total = parseHumanAmount(raw, funding.decimals); } catch (error) { return ctx.reply(textError(error)); }
-  const interactionStartedAtMs=Date.now(),progressStartedAtMs=Date.now(),progress=await ctx.reply("Preparing fresh LIVE preview…"),progressPaintedAtMs=Date.now(),progressMessageId=Number(progress.message_id);
-  interactive?.setProgressMessageId(progressMessageId);
-  log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"PROGRESS_FIRST_PAINT",startedAtMs:progressStartedAtMs,endedAtMs:progressPaintedAtMs,elapsedMs:progressPaintedAtMs-progressStartedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"MISS",outcome:"PAINTED",messageId:progressMessageId});
-  const discardProgress=async()=>{try{await bot.api.deleteMessage(Number(chat(ctx)),progressMessageId);}catch{}};
-  const editProgress=async(text:string,rows?:Array<Array<{label:string;data:string}>>)=>bot.api.editMessageText(Number(chat(ctx)),progressMessageId,text,rows?{reply_markup:keyboard(rows)}:undefined);
-  if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
-  const poolStartedAtMs=Date.now();
-  const current = await inspectV4Pool(rpc, key);
-  const poolEndedAtMs=Date.now();
-  log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"SELECTED_POOL_RESOLUTION",startedAtMs:poolStartedAtMs,endedAtMs:poolEndedAtMs,elapsedMs:poolEndedAtMs-poolStartedAtMs,dbWaitMs:0,rpcWaitMs:poolEndedAtMs-poolStartedAtMs,provider:"robinhood-rpc",queueWaitMs:0,cache:"MISS",outcome:current.status.toUpperCase()});
-  if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
-  if (current.status === "unavailable") return editProgress("V4_BID_LADDER_PREVIEW_UNAVAILABLE");
-  if (current.value.initialized && exactV4PoolState(current.value, key, String(flow.state.poolId ?? "")) && current.value.liquidity === 0n)
-    return editProgress(
-      "V4 BID Ladder LIVE preview unavailable\nPool state: NO ACTIVE LIQUIDITY\nThe pool lost active liquidity before creation.\nRetry when liquidity returns.",
-    );
+  const interactionStartedAtMs=Date.now(),amountIdentity=`${funding.address.toLowerCase()}:${total.toString()}`;
+  let execution!:LivePreviewExecutionContext;
+  execution=createLivePreviewExecutionContext({
+    sessionId:flow.sessionId,flowRevision:flow.flowRevision,requestId:interactive?.requestId??randomUUID(),poolId:String(flow.state.poolId??""),amountIdentity,startedAtMs:interactionStartedAtMs,hardDeadlineMs:LIVE_PREVIEW_HARD_DEADLINE_MS,
+    isCurrent:()=>{
+      if(interactive?.isCurrent()===false)return false;
+      const currentFlow=loadFlow(ctx),lifecycle=currentFlow?.state.livePreviewLifecycle as Record<string,unknown>|undefined;
+      return Boolean(currentFlow&&currentFlow.status==="active"&&currentFlow.sessionId===execution.identity.sessionId&&currentFlow.flowRevision===execution.flowRevision&&String(currentFlow.state.poolId??"").toLowerCase()===execution.identity.poolId.toLowerCase()&&(!lifecycle||String(lifecycle.requestId)===execution.identity.requestId&&String(lifecycle.amountIdentity)===execution.identity.amountIdentity));
+    },
+    telemetry:(event,data)=>log(event,data),
+  });
+  interactive?.setExecution(execution);
+  let progressMessageId:number|undefined;
+  const discardProgress=async()=>{if(!progressMessageId)return;try{await bot.api.deleteMessage(Number(chat(ctx)),progressMessageId,AbortSignal.timeout(1_000) as any);}catch{}};
+  const failClosed=async(text:string,rows?:Array<Array<{label:string;data:string}>>)=>{
+    if(execution.terminal?.phase==="SUPERSEDED"){await discardProgress();return execution.terminal;}
+    const terminal=execution.terminal??execution.terminalize("FAILED","EXPLICIT_FAIL_CLOSED","DIRECT_PREVIEW_FAIL_CLOSED");
+    if(progressMessageId)await execution.notifyTerminal("TELEGRAM_DIRECT_PREVIEW_FAILURE_DELIVERY",signal=>bot.api.editMessageText(Number(chat(ctx)),progressMessageId!,text,rows?{reply_markup:keyboard(rows)}:undefined,signal as any));
+    return terminal;
+  };
   try {
+    const progressStartedAtMs=Date.now(),progress=await execution.run<{message_id:number}>("TELEGRAM_PREVIEW_PROGRESS_PAINT",signal=>ctx.reply("Preparing fresh LIVE preview…",undefined,signal as any),{maxMs:1_000,reserveMs:1_500}),progressPaintedAtMs=Date.now();
+    progressMessageId=Number(progress.message_id);
+    interactive?.setProgressMessageId(progressMessageId);
+    log("telegram_interactive_stage",{interactionId:execution.identity.requestId,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:execution.identity.requestId,stage:"PROGRESS_FIRST_PAINT",startedAtMs:progressStartedAtMs,endedAtMs:progressPaintedAtMs,elapsedMs:progressPaintedAtMs-progressStartedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"MISS",outcome:"PAINTED",messageId:progressMessageId});
+    const poolStartedAtMs=Date.now(),current=await execution.run("SELECTED_POOL_RESOLUTION",signal=>inspectV4Pool(rpc.scoped({workflowId:execution.identity.requestId,stage:"selected_pool_resolution",signal}),key),{reserveMs:1_500}),poolEndedAtMs=Date.now();
+    log("telegram_interactive_stage",{interactionId:execution.identity.requestId,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:execution.identity.requestId,stage:"SELECTED_POOL_RESOLUTION",startedAtMs:poolStartedAtMs,endedAtMs:poolEndedAtMs,elapsedMs:poolEndedAtMs-poolStartedAtMs,dbWaitMs:0,rpcWaitMs:poolEndedAtMs-poolStartedAtMs,provider:"robinhood-rpc",queueWaitMs:0,cache:"MISS",outcome:current.status.toUpperCase()});
+    if(current.status==="unavailable")return await failClosed("V4_BID_LADDER_PREVIEW_UNAVAILABLE");
+    if(current.value.initialized&&exactV4PoolState(current.value,key,String(flow.state.poolId??""))&&current.value.liquidity===0n)return await failClosed("V4 BID Ladder LIVE preview unavailable\nPool state: NO ACTIVE LIQUIDITY\nThe pool lost active liquidity before creation.\nRetry when liquidity returns.");
     const preview = previewV4BidLadder({
         pool: current.value,
         funding: { ...funding, address: getAddress(funding.address) },
@@ -2036,16 +2069,20 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interac
       next = advanceFlow(
         ctx,
         flow,
-        { ...flow.state, kind: "v4_bid_ladder_preview", bidLadderPreview: snapshotV4BidLadderPreview(preview) },
+        { ...flow.state, kind: "v4_bid_ladder_preview", bidLadderPreview: snapshotV4BidLadderPreview(preview), livePreviewLifecycle:{status:"PREPARING",requestId:execution.identity.requestId,ladderId:preview.plan.ladderId,poolId:execution.identity.poolId,amountIdentity:execution.identity.amountIdentity,startedAtMs:execution.identity.startedAtMs,hardDeadlineAtMs:execution.identity.hardDeadlineAtMs,updatedAtMs:Date.now()} },
         "direct LIVE BID ladder created",
+        true,
       );
-    if (!next || (interactive&&!interactive.isCurrent())) { await discardProgress(); return; }
+    if(!next){execution.supersede("LIVE_PREVIEW_FLOW_ADVANCE_CONFLICT");await discardProgress();return execution.terminal;}
+    execution.setFlowRevision(next.flowRevision);
+    execution.validateCurrent();
     const persistenceStartedAtMs=Date.now();
     const db = repo();
     try {
       const native = sameAddress(funding.address, robinhoodMainnet.assets.USDG)
         ? 1
-        : (await v4BidLadderNativeUsd({ repo: db, rpc })).nativeUsd;
+        : (await execution.run("PREVIEW_PLAN_NATIVE_USD",signal=>v4BidLadderNativeUsd({repo:db,rpc:rpc.scoped({workflowId:execution.identity.requestId,stage:"preview_plan_native_usd",signal})}),{reserveMs:1_500})).nativeUsd;
+      execution.validateCurrent();
       createV4BidLadderLive(
         db,
         preview,
@@ -2053,35 +2090,40 @@ async function bidLadderDirectLiveOnce(ctx: any, enteredAmount?: string, interac
       );
     } finally { db.close(); }
     const persistenceEndedAtMs=Date.now();
-    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"PREVIEW_PLAN_PERSISTED",startedAtMs:persistenceStartedAtMs,endedAtMs:persistenceEndedAtMs,elapsedMs:persistenceEndedAtMs-persistenceStartedAtMs,dbWaitMs:persistenceEndedAtMs-persistenceStartedAtMs,rpcWaitMs:0,provider:"sqlite-wal",queueWaitMs:0,cache:"MISS",outcome:"COMPLETE",ladderId:preview.plan.ladderId});
-    return bidLadderLivePreview(ctx, preview.plan.ladderId,{messageId:progressMessageId,requestId:interactive?.requestId??randomUUID(),sessionId:next.sessionId,isCurrent:interactive?.isCurrent,interactionStartedAtMs});
+    log("telegram_interactive_stage",{interactionId:execution.identity.requestId,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:execution.identity.requestId,stage:"PREVIEW_PLAN_PERSISTED",startedAtMs:persistenceStartedAtMs,endedAtMs:persistenceEndedAtMs,elapsedMs:persistenceEndedAtMs-persistenceStartedAtMs,dbWaitMs:persistenceEndedAtMs-persistenceStartedAtMs,rpcWaitMs:0,provider:"sqlite-wal",queueWaitMs:0,cache:"MISS",outcome:"COMPLETE",ladderId:preview.plan.ladderId});
+    return await bidLadderLivePreview(ctx,preview.plan.ladderId,{messageId:progressMessageId,requestId:execution.identity.requestId,sessionId:next.sessionId,interactionStartedAtMs,execution});
   } catch (error) {
+    if(execution.terminal?.phase==="SUPERSEDED"){await discardProgress();return execution.terminal;}
     if (textError(error).includes("V4_BID_LADDER_DEPTH_NOT_REPRESENTABLE")) {
-      const retry = advanceFlow(ctx, flow, { ...flow.state, kind: "v4_bid_ladder_depth" }, "BID ladder depth no longer representable");
-      if (!retry || (interactive&&!interactive.isCurrent())) { await discardProgress(); return; }
-      return editProgress(
+      const retry=advanceFlow(ctx,flow,{...flow.state,kind:"v4_bid_ladder_depth"},"BID ladder depth no longer representable",true);
+      if(!retry){execution.supersede("LIVE_PREVIEW_DEPTH_FLOW_CONFLICT");await discardProgress();return execution.terminal;}
+      execution.setFlowRevision(retry.flowRevision);
+      return await failClosed(
         `BID Ladder ${Number(flow.state.maxDownsideBps ?? 0) / 100}% is not representable as 5 distinct V4 ranges for this pool's tick spacing. Choose another max downside.`,
         [bidLadderDepthRows(retry), [{ label: "Custom", data: `bid-ladder-depth:${retry.sessionId}:custom` }], flowControls(retry)],
       );
     }
-    if(interactive&&!interactive.isCurrent()){await discardProgress();return;}
-    return editProgress(`V4_BID_LADDER_CREATE_REJECTED\n${textError(error)}`);
+    execution.cancelWork(error);
+    return await failClosed(isLivePreviewTimeout(error)?"LIVE PREVIEW TIMED OUT\n\nNo transaction was prepared or sent.\nPlease retry.":`V4_BID_LADDER_CREATE_REJECTED\n${textError(error)}`);
+  } finally {
+    if(!execution.terminal)execution.terminalize("DELIVERY_FAILED","EXPLICIT_FAIL_CLOSED","DIRECT_PREVIEW_UNEXPECTED_NONTERMINAL_EXIT");
   }
 }
 async function bidLadderDirectLive(ctx: any, enteredAmount?: string) {
   const flow = loadFlow(ctx);
   if (!flow || flow.status !== "active") return unavailableFlow(ctx, "missing");
-  const key = `${owner(ctx)}:${chat(ctx)}:${flow.sessionId}`,
+  const key = bidLadderPreviewScope(ctx),
     updateId=String(ctx.update?.update_id??ctx.message?.message_id??"unknown"),
     existing = bidLadderDirectLiveInFlight.get(key);
   if (existing?.updateId===updateId&&existing.promise) return existing.promise;
+  existing?.execution?.supersede("NEW_AMOUNT");
   const request:BidLadderInteractiveWork={updateId,generation:(existing?.generation??0)+1};
   bidLadderDirectLiveInFlight.set(key,request);
-  if(existing?.progressMessageId)void bot.api.deleteMessage(Number(chat(ctx)),existing.progressMessageId).catch(()=>{});
+  if(existing?.progressMessageId)void bot.api.deleteMessage(Number(chat(ctx)),existing.progressMessageId,AbortSignal.timeout(1_000) as any).catch(()=>{});
   const requestId=`${flow.sessionId}:${flow.flowRevision}:${updateId}`,
-    work=bidLadderDirectLiveOnce(ctx,enteredAmount,{requestId,isCurrent:()=>bidLadderDirectLiveInFlight.get(key)===request,setProgressMessageId:(messageId)=>{request.progressMessageId=messageId;if(bidLadderDirectLiveInFlight.get(key)!==request)void bot.api.deleteMessage(Number(chat(ctx)),messageId).catch(()=>{});}});
+    work=bidLadderDirectLiveOnce(ctx,enteredAmount,{requestId,isCurrent:()=>bidLadderDirectLiveInFlight.get(key)===request,setExecution:execution=>{request.execution=execution;if(bidLadderDirectLiveInFlight.get(key)!==request)execution.supersede("REQUEST_REPLACED_BEFORE_CONTEXT_BIND");},setProgressMessageId:(messageId)=>{request.progressMessageId=messageId;if(bidLadderDirectLiveInFlight.get(key)!==request)void bot.api.deleteMessage(Number(chat(ctx)),messageId,AbortSignal.timeout(1_000) as any).catch(()=>{});}});
   request.promise=work;
-  try { return await work; } finally { if(bidLadderDirectLiveInFlight.get(key)===request)bidLadderDirectLiveInFlight.delete(key); }
+  try { return await work; } finally { if(!request.execution?.terminal)request.execution?.terminalize("DELIVERY_FAILED","EXPLICIT_FAIL_CLOSED","DIRECT_PREVIEW_IN_FLIGHT_FINALLY");if(bidLadderDirectLiveInFlight.get(key)===request)bidLadderDirectLiveInFlight.delete(key); }
 }
 async function bidLadderStart(ctx: any, selectionId: string) {
   const flow = loadFlow(ctx);
@@ -2445,6 +2487,7 @@ async function ladderLiveContext(
   db: SqliteLedgerRepository,
   allowlisted = allowed.has(owner(ctx)),
   reuseConfirmedOpen = false,
+  previewExecution?: { requestId: string; signal: AbortSignal },
 ): Promise<LadderLiveContext> {
   const parent = db.loadBidLadder(ladderId);
   if (!parent) throw new Error("V4_BID_LADDER_NOT_FOUND");
@@ -2454,9 +2497,12 @@ async function ladderLiveContext(
       ? confirmedV4BidLadderOpenTruth(db, ladderId)
       : undefined;
   if (!wallet.address) throw new Error("V4_BID_LADDER_WALLET_REQUIRED");
+  const previewRpc = previewExecution
+    ? rpc.scoped({ workflowId: previewExecution.requestId, stage: "v4_bid_ladder_live_preview", signal: previewExecution.signal })
+    : rpc;
   const native = confirmedOpen?.projectionComplete
     ? { nativeUsd: 1 }
-    : await v4BidLadderNativeUsd({ repo: db, rpc });
+    : await v4BidLadderNativeUsd({ repo: db, rpc: previewRpc });
   let fundingUsd: number;
   if (sameAddress(tokens.funding.address, robinhoodMainnet.assets.USDG))
     fundingUsd = 1;
@@ -2465,7 +2511,7 @@ async function ladderLiveContext(
   else throw new Error("V4_FUNDING_PRICE_UNAVAILABLE");
   const context: LadderLiveContext = {
     repo: db,
-    rpc,
+    rpc: previewRpc,
     ladderId,
     wallet: wallet.address,
     fundingUsd,
@@ -2512,45 +2558,101 @@ async function ladderLiveContext(
   };
   return context;
 }
-async function bidLadderLivePreview(ctx: any, ladderId: string, interactive?:{messageId:number;requestId:string;sessionId:string;isCurrent?:()=>boolean;interactionStartedAtMs:number}) {
+type BidLadderLivePreviewInteractive = {
+  messageId:number;
+  requestId:string;
+  sessionId:string;
+  interactionStartedAtMs:number;
+  execution:LivePreviewExecutionContext;
+};
+function persistInteractivePreviewLifecycle(
+  ctx:any,
+  execution:LivePreviewExecutionContext,
+  status:"COMPUTED"|"DELIVERED"|"FAILED"|"DELIVERY_FAILED",
+  ladderId:string,
+  extra:Record<string,unknown>={},
+) {
+  const flow=loadFlow(ctx);
+  if(!flow||flow.status!=="active"||flow.sessionId!==execution.identity.sessionId||flow.flowRevision!==execution.flowRevision){
+    execution.record("live_preview_durable_state",{status,outcome:"REJECTED_STALE",ladderId});
+    execution.supersede("LIVE_PREVIEW_FLOW_PERSISTENCE_SUPERSEDED");
+    return false;
+  }
+  const result=telegramFlowWrite("persistLivePreviewLifecycle",db=>db.transitionTelegramFlowCAS({
+    userId:owner(ctx),chatId:chat(ctx),sessionId:flow.sessionId,expectedRevision:flow.flowRevision,expectedStatus:"active",
+    nextState:{...flow.state,livePreviewLifecycle:{status,requestId:execution.identity.requestId,ladderId,poolId:execution.identity.poolId,amountIdentity:execution.identity.amountIdentity,startedAtMs:execution.identity.startedAtMs,hardDeadlineAtMs:execution.identity.hardDeadlineAtMs,updatedAtMs:Date.now(),...extra}},
+    now:nowMs(),ttlMs:sessionTtlMs,
+  }));
+  if(result.result!=="APPLIED"||!result.flow){execution.record("live_preview_durable_state",{status,outcome:"CAS_CONFLICT",result:result.result,ladderId});execution.supersede("LIVE_PREVIEW_FLOW_PERSISTENCE_CONFLICT");return false;}
+  execution.setFlowRevision(result.flow.flowRevision);
+  execution.record("live_preview_durable_state",{status,outcome:"PERSISTED",ladderId,flowRevision:result.flow.flowRevision});
+  return true;
+}
+async function bidLadderLivePreview(ctx: any, ladderId: string, interactive?:BidLadderLivePreviewInteractive) {
   const db = repo();
+  const parentForIdentity=db.loadBidLadder(ladderId);
+  if(!parentForIdentity){db.close();throw new Error("V4_BID_LADDER_NOT_FOUND");}
+  const execution=interactive?.execution??createLivePreviewExecutionContext({
+    sessionId:`manual:${ladderId}`,
+    flowRevision:Number(parentForIdentity.revision??0),
+    requestId:randomUUID(),
+    poolId:String(parentForIdentity.pool_id),
+    amountIdentity:`${String(parentForIdentity.funding_token).toLowerCase()}:${String(parentForIdentity.total_funding_amount_raw)}`,
+    isCurrent:()=>{
+      const current=db.loadBidLadder(ladderId);
+      return Boolean(current&&String(current.pool_id).toLowerCase()===String(parentForIdentity.pool_id).toLowerCase()&&String(current.total_funding_amount_raw)===String(parentForIdentity.total_funding_amount_raw));
+    },
+    telemetry:(event,data)=>log(event,data),
+  });
+  let durableTerminal=true;
   try {
-    const parentForLiquidity=db.loadBidLadder(ladderId),liquidityStartedAtMs=Date.now(),liquidityPromise=parentForLiquidity?dexV4PoolLiquidityLine(String(parentForLiquidity.pool_id),{
-        currency0:getAddress(String(parentForLiquidity.currency0)),currency1:getAddress(String(parentForLiquidity.currency1)),fee:Number(parentForLiquidity.fee),tickSpacing:Number(parentForLiquidity.tick_spacing),hooks:getAddress(String(parentForLiquidity.hooks)),
-      }).then(value=>({value,elapsedMs:Date.now()-liquidityStartedAtMs})):Promise.resolve({value:"Pool liquidity: Unavailable",elapsedMs:0}),
-      contextStartedAtMs=Date.now(),context = await ladderLiveContext(
-        ctx,
-        ladderId,
-        db,
-        allowed.has(owner(ctx)),
-        true,
-      ),
-      contextEndedAtMs=Date.now(),previewStartedAtMs=Date.now(),preview = await previewV4BidLadderLive(context),previewEndedAtMs=Date.now(),liquidity=await liquidityPromise,
-      buttons = preview.blockers.length
-        ? [[{ label: "Retry LIVE Preview", data: bidLadderCallback("livePreview", ladderId) }]]
-        : [
-            [
-              {
-                label: "Confirm Live Open",
-                data: bidLadderCallback("liveOpen", ladderId),
-              },
-            ],
-          ];
-    const text=formatV4BidLadderLivePreview(preview,{poolLiquidityLine:liquidity.value}),currentFlow=interactive?loadFlow(ctx):undefined,
-      current=!interactive||(interactive.isCurrent?.()!==false&&currentFlow?.status==="active"&&currentFlow.sessionId===interactive.sessionId);
-    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"AUTHORITATIVE_PREVIEW_READY",startedAtMs:previewStartedAtMs,endedAtMs:previewEndedAtMs,elapsedMs:previewEndedAtMs-previewStartedAtMs,dbWaitMs:contextEndedAtMs-contextStartedAtMs,rpcWaitMs:previewEndedAtMs-previewStartedAtMs,provider:"robinhood-rpc+gmgn",queueWaitMs:0,cache:"CANONICAL_FRESH",outcome:preview.blockers.length?"BLOCKED":"READY",ladderId,liquidityMs:liquidity.elapsedMs,totalMs:Date.now()-(interactive?.interactionStartedAtMs??previewStartedAtMs)});
-    if(!current){if(interactive)try{await bot.api.deleteMessage(Number(chat(ctx)),interactive.messageId);}catch{}return;}
-    const sendStartedAtMs=Date.now();
-    const result=interactive
-      ? await bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,text,buttons.length?{reply_markup:keyboard(buttons)}:undefined)
-      : await ctx.reply(text,buttons.length?{reply_markup:keyboard(buttons)}:undefined);
-    log("telegram_interactive_stage",{interactionId:interactive?.requestId??null,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:interactive?.requestId??null,stage:"FINAL_PREVIEW_TELEGRAM_DELIVERY",startedAtMs:sendStartedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-sendStartedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"N/A",outcome:"DELIVERED",ladderId});
-    return result;
-  } catch (error) {
-    if(interactive&&(interactive.isCurrent?.()===false||loadFlow(ctx)?.sessionId!==interactive.sessionId)){try{await bot.api.deleteMessage(Number(chat(ctx)),interactive.messageId);}catch{}return;}
-    const text=`V4_BID_LADDER_LIVE_PREVIEW_BLOCKED\n${textError(error)}`,options={reply_markup:keyboard([[{ label: "Retry LIVE Preview", data: bidLadderCallback("livePreview", ladderId) }]])};
-    return interactive?bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,text,options):ctx.reply(text,options);
+    const liquidityStartedAtMs=Date.now(),liquidity=dexV4PoolLiquidityLine(String(parentForIdentity.pool_id),{
+      currency0:getAddress(String(parentForIdentity.currency0)),currency1:getAddress(String(parentForIdentity.currency1)),fee:Number(parentForIdentity.fee),tickSpacing:Number(parentForIdentity.tick_spacing),hooks:getAddress(String(parentForIdentity.hooks)),
+    }).then(value=>{execution.record("live_preview_liquidity",{outcome:"SETTLED",elapsedMs:Date.now()-liquidityStartedAtMs});return value;}),
+      terminal=await runLivePreviewDeliveryWorkflow({
+        execution,
+        liquidity,
+        compute:async signal=>{
+          const contextStartedAtMs=Date.now(),context=await ladderLiveContext(ctx,ladderId,db,allowed.has(owner(ctx)),true,{requestId:execution.identity.requestId,signal}),contextEndedAtMs=Date.now(),previewStartedAtMs=Date.now(),preview=await previewV4BidLadderLive(context),previewEndedAtMs=Date.now();
+          log("telegram_interactive_stage",{interactionId:execution.identity.requestId,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:execution.identity.requestId,stage:"AUTHORITATIVE_PREVIEW_READY",startedAtMs:previewStartedAtMs,endedAtMs:previewEndedAtMs,elapsedMs:previewEndedAtMs-previewStartedAtMs,dbWaitMs:contextEndedAtMs-contextStartedAtMs,rpcWaitMs:previewEndedAtMs-previewStartedAtMs,provider:"robinhood-rpc+gmgn",queueWaitMs:0,cache:"CANONICAL_FRESH",outcome:preview.blockers.length?"BLOCKED":"READY",ladderId,totalMs:Date.now()-execution.identity.startedAtMs});
+          return preview;
+        },
+        persistComputed:async preview=>{
+          execution.validateCurrent();
+          if(interactive&&!persistInteractivePreviewLifecycle(ctx,execution,"COMPUTED",ladderId,{blockerCount:preview.blockers.length}))throw new Error("LIVE_PREVIEW_COMPUTED_PERSISTENCE_SUPERSEDED");
+        },
+        render:(preview,poolLiquidityLine)=>{
+          execution.validateCurrent();
+          const buttons=preview.blockers.length
+            ? [[{label:"Retry LIVE Preview",data:bidLadderCallback("livePreview",ladderId)}]]
+            : [[{label:"Confirm Live Open",data:bidLadderCallback("liveOpen",ladderId)}]];
+          return {text:formatV4BidLadderLivePreview(preview,{poolLiquidityLine}),buttons};
+        },
+        deliver:async(rendered,signal)=>{
+          execution.validateCurrent();
+          const startedAtMs=Date.now(),options=rendered.buttons.length?{reply_markup:keyboard(rendered.buttons)}:undefined,result=interactive
+            ? await bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,rendered.text,options,signal as any)
+            : await ctx.reply(rendered.text,options,signal as any);
+          log("telegram_interactive_stage",{interactionId:execution.identity.requestId,interactionType:"V4_BID_LADDER_AMOUNT_PREVIEW",requestId:execution.identity.requestId,stage:"FINAL_PREVIEW_TELEGRAM_DELIVERY",startedAtMs,endedAtMs:Date.now(),elapsedMs:Date.now()-startedAtMs,dbWaitMs:0,rpcWaitMs:0,provider:"telegram",queueWaitMs:0,cache:"N/A",outcome:"DELIVERED",ladderId});
+          return result;
+        },
+        deliverFailure:async(text,signal)=>{
+          const options={reply_markup:keyboard([[{label:"Retry LIVE Preview",data:bidLadderCallback("livePreview",ladderId)}]])};
+          return interactive
+            ? bot.api.editMessageText(Number(chat(ctx)),interactive.messageId,text,options,signal as any)
+            : ctx.reply(text,options,signal as any);
+        },
+        computedOutcome:preview=>preview.blockers.length?"EXPLICIT_FAIL_CLOSED":"AUTHORITATIVE_LIVE_PREVIEW",
+        failureText:(error,timedOut)=>timedOut
+          ? "LIVE PREVIEW TIMED OUT\n\nNo transaction was prepared or sent.\nPlease retry."
+          : `V4_BID_LADDER_LIVE_PREVIEW_BLOCKED\n${textError(error)}`,
+        persistTerminal:terminal=>{durableTerminal=!interactive||persistInteractivePreviewLifecycle(ctx,execution,terminal.phase==="DELIVERED"?"DELIVERED":terminal.phase==="DELIVERY_FAILED"?"DELIVERY_FAILED":"FAILED",ladderId,{outcome:terminal.outcome,code:terminal.code,terminalAtMs:terminal.terminalAtMs});},
+      });
+    if(terminal.phase==="DELIVERED"&&durableTerminal)bidLadderPreviewAuthorities.set(ladderId.toLowerCase(),{requestId:execution.identity.requestId,userId:owner(ctx),chatId:chat(ctx),sessionId:interactive?.sessionId,expiresAtMs:Date.now()+sessionTtlMs});
+    else bidLadderPreviewAuthorities.delete(ladderId.toLowerCase());
+    return terminal;
   } finally {
+    if(!execution.terminal)execution.terminalize("DELIVERY_FAILED","EXPLICIT_FAIL_CLOSED","LIVE_PREVIEW_UNEXPECTED_NONTERMINAL_EXIT");
     db.close();
   }
 }
@@ -2672,6 +2774,10 @@ async function bidLadderLiveOpen(ctx: any, ladderId: string) {
     });
     return existing;
   }
+  const authority=bidLadderPreviewAuthorities.get(ladderId.toLowerCase()),flow=authority?.sessionId?loadFlow(ctx,authority.sessionId):undefined,lifecycle=flow?.state.livePreviewLifecycle as Record<string,unknown>|undefined,
+    valid=Boolean(authority&&authority.userId===owner(ctx)&&authority.chatId===chat(ctx)&&authority.expiresAtMs>Date.now()&&(!authority.sessionId||flow?.status==="active"&&String(lifecycle?.status)==="DELIVERED"&&String(lifecycle?.requestId)===authority.requestId&&String(lifecycle?.ladderId).toLowerCase()===ladderId.toLowerCase()));
+  if(!valid){bidLadderPreviewAuthorities.delete(ladderId.toLowerCase());return ctx.reply("LIVE PREVIEW STALE OR SUPERSEDED\nNo transaction was prepared or sent.\nPlease request a fresh LIVE preview.",undefined,AbortSignal.timeout(3_000) as any);}
+  bidLadderPreviewAuthorities.delete(ladderId.toLowerCase());
   const work = bidLadderLiveOpenOnce(ctx, ladderId);
   bidLadderLiveOpenInFlight.set(ladderId, work);
   try {

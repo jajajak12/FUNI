@@ -62,7 +62,7 @@ describe("explicit Telegram CA freshness acceleration",()=>{
   });
   it("uses one progress message and revision-scoped latest-work authority for corrected amounts",()=>{
     const source=readFileSync("apps/telegram-lp-bot/src/index.ts","utf8"),direct=source.slice(source.indexOf("async function bidLadderDirectLiveOnce"),source.indexOf("async function bidLadderStart"));
-    expect(direct).toContain('ctx.reply("Preparing fresh LIVE preview…")');
+    expect(direct).toContain('ctx.reply("Preparing fresh LIVE preview…",undefined,signal as any)');
     expect(direct).toContain("bot.api.editMessageText");
     expect(direct).toContain("bidLadderDirectLiveInFlight.get(key)===request");
     expect(direct).toContain("existing?.updateId===updateId");

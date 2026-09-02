@@ -62,9 +62,9 @@ Instalasi, discovery, pembacaan portfolio, dan preview tidak mengizinkan transak
 
 ## Batas Gas Transaksi
 
-Nilai bawaan `MAX_GAS_COST_USD=0.70` adalah hard safety cap untuk **maximum projected fee**, bukan perkiraan biaya aktual. FUNI membedakan raw `estimateGas`, final gas limit yang sudah diberi margin satu kali, gas price yang dibuffer, **estimated execution fee** yang kemungkinan terpakai, **maximum projected fee** bila seluruh final gas limit terpakai, dan **actual receipt fee** setelah transaksi masuk chain. Kondisi jaringan menentukan biaya aktual; menaikkan atau menurunkan cap tidak mengubah harga gas jaringan.
+Nilai bawaan `MAX_GAS_COST_USD=0.70` adalah hard safety cap untuk **maximum projected fee**, bukan perkiraan biaya aktual. Validasi konfigurasi menerima cap hingga `2.00`, tetapi nilai bawaan publik tetap konservatif. FUNI membedakan raw `estimateGas`, final gas limit dengan margin `1.20x`, gas price dengan buffer `1.10x`, **estimated execution fee** yang kemungkinan terpakai, **maximum projected fee** bila seluruh final gas limit terpakai, dan **actual receipt fee** setelah transaksi masuk chain. Kondisi jaringan menentukan biaya aktual; menaikkan atau menurunkan cap tidak mengubah harga gas jaringan.
 
-Preview atau output blokir menampilkan estimated execution fee, maximum projected fee, safety cap, final gas limit, dan gas price dalam gwei. Pengguna boleh memilih nilai lain yang tetap bounded; validasi schema mempertahankan maksimum `$1.00`. `MAX_LIFECYCLE_GAS_USD` tidak berubah, dan cap tidak pernah menjadi unlimited.
+Preview atau output blokir menampilkan estimated execution fee, maximum projected fee, safety cap, final gas limit, dan gas price dalam gwei. Pengguna boleh memilih nilai lain yang tetap bounded; validasi schema mempertahankan maksimum `$2.00`. `MAX_LIFECYCLE_GAS_USD` tidak berubah, dan cap tidak pernah menjadi unlimited.
 
 ## Respons Telegram
 

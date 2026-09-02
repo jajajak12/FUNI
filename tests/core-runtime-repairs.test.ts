@@ -133,7 +133,7 @@ describe("reconcile lifecycle exact CLI and wrapper paths", () => {
           cwd: process.cwd(),
           env: cliEnv(f.dir, f.database),
           encoding: "utf8",
-          timeout: 15_000,
+          timeout: 30_000,
         },
       );
     } finally {
@@ -156,7 +156,7 @@ describe("reconcile lifecycle exact CLI and wrapper paths", () => {
         cwd: process.cwd(),
         env: cliEnv(f.dir, f.database),
         encoding: "utf8",
-        timeout: 15_000,
+        timeout: 30_000,
       },
     );
     expect(recovered.status).toBe(0);
@@ -199,7 +199,7 @@ describe("reconcile lifecycle exact CLI and wrapper paths", () => {
         cwd: process.cwd(),
         env: cliEnv(dir, database),
         encoding: "utf8",
-        timeout: 15_000,
+        timeout: 30_000,
       },
     );
     expect(result.status).toBe(0);

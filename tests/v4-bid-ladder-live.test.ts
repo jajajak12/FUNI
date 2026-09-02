@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { FallbackRpc, robinhoodMainnet } from "@funi/core";
 import {
+  economicForegroundMarkerDirectory,
   migrateSqlite,
   SQLITE_RUNTIME_BUSY_TIMEOUT_MS,
   SqliteLedgerRepository,
@@ -30,6 +31,7 @@ import {
 } from "viem";
 import {
   createV4BidLadderDryRun,
+  createV4BidLadderLive,
   displayV4BidLadderMarketCapEvidence,
   previewV4BidLadder,
 } from "../apps/cli/src/v4-bid-ladder-operator.js";
@@ -37,6 +39,7 @@ import {
   captureV4BidLadderCollectValuation,
   captureV4BidLadderCloseFeeAttribution,
   exactV4BidLadderClosePrincipalFeeDecomposition,
+  executeV4BidLadderCollect,
   executeV4BidLadderLiveOpen,
   executeV4BidLadderManualClose,
   formatV4BidLadderLivePreview,
@@ -48,16 +51,13 @@ import {
   v4BidLadderCollectStage,
   v4BidLadderNativeUsd,
 } from "../apps/cli/src/v4-bid-ladder-live.js";
+import { processV4BidLadderUsdReset } from "../apps/cli/src/v4-bid-ladder-usdg-reset.js";
 import { reconcileDurableV4Journals } from "../apps/cli/src/v4-durable-journal-reconcile.js";
 import { durableTransactionReconciliationPending } from "../apps/cli/src/transaction-boundary.js";
 import { persistedPositionDisplayItems, persistedPositionViews } from "../apps/telegram-lp-bot/src/persisted-portfolio.js";
 
 const roots: string[] = [];
-afterEach(() =>
-  roots
-    .splice(0)
-    .forEach((root) => rmSync(root, { recursive: true, force: true })),
-);
+afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const c0 = "0x0000000000000000000000000000000000000001" as const,
   c1 = robinhoodMainnet.assets.USDG,
   owner = "0x0000000000000000000000000000000000000003" as const,
@@ -371,7 +371,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
     ["ERC20 allowance",{erc20Allowance:0n},"V4_BID_LADDER_ERC20_ALLOWANCE_INSUFFICIENT"],
     ["Permit2 allowance",{permitAllowance:0n},"V4_BID_LADDER_PERMIT2_ALLOWANCE_INSUFFICIENT"],
     ["active liquidity",{liquidity:0n},"V4_BID_LADDER_POOL_UNINITIALIZED"],
-  ] as const)("blocks final %s drift from the pinned multicall before signing",async(label,values,blocker)=>{const f=fixture();try{f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.setBlockSequence(123n,124n);f.setBlockValues(124n,values);let walletCalls=0;const telemetry:any[]=[];await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}}),telemetry:(event,data)=>telemetry.push({event,...data})})).rejects.toThrow(blocker);expect(walletCalls).toBe(0);expect(f.multicallBlocks).toEqual([124n]);const finalValidation=telemetry.find(item=>item.event==='v4_bid_ladder_open_final_validation');expect(finalValidation).toMatchObject({outcome:'BLOCKED',transportRpcCount:3,multicallMembers:5,genericMaterialization:false});console.log(JSON.stringify({event:'public_v4_final_validation_performance',case:label,durationMs:finalValidation.durationMs,transportRpcCount:finalValidation.transportRpcCount,multicallMembers:finalValidation.multicallMembers,genericMaterialization:finalValidation.genericMaterialization}));expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{f.repo.close();}});
+  ] as const)("blocks final %s drift from the pinned multicall before signing",async(_label,values,blocker)=>{const f=fixture();try{f.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(f.ladderId);f.setBlockSequence(123n,124n);f.setBlockValues(124n,values);let walletCalls=0;const telemetry:any[]=[];await expect(executeV4BidLadderLiveOpen({repo:f.repo,rpc:f.rpc,ladderId:f.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:new Proxy({} as any,{get(){walletCalls++;throw new Error('wallet boundary reached');}}),telemetry:(event,data)=>telemetry.push({event,...data})})).rejects.toThrow(blocker);expect(walletCalls).toBe(0);expect(f.multicallBlocks).toEqual([124n]);expect(telemetry).toContainEqual(expect.objectContaining({event:'v4_bid_ladder_open_final_validation',outcome:'BLOCKED',transportRpcCount:3,multicallMembers:5,genericMaterialization:false}));expect(f.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{f.repo.close();}});
   it("fails closed on unavailable final liquidity or the one exact final calldata estimate",async()=>{const unavailable=fixture();try{unavailable.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(unavailable.ladderId);unavailable.setBlockSequence(123n,124n);unavailable.setFinalReadFailure('getLiquidity');await expect(executeV4BidLadderLiveOpen({repo:unavailable.repo,rpc:unavailable.rpc,ladderId:unavailable.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:{account:{}} as any})).rejects.toThrow('V4_BID_LADDER_FINAL_LIQUIDITY_UNAVAILABLE');expect(unavailable.calls.estimateGas).toBe(1);expect(unavailable.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{unavailable.repo.close();}const gas=fixture();try{gas.repo.db.prepare("UPDATE v4_bid_ladders SET execution_mode='LIVE',entry_usd_snapshot=10 WHERE ladder_id=?").run(gas.ladderId);gas.setBlockSequence(123n,124n);gas.setEstimateGasFailureAt(2);await expect(executeV4BidLadderLiveOpen({repo:gas.repo,rpc:gas.rpc,ladderId:gas.ladderId,wallet:owner,fundingUsd:1,nativeUsd:1,runtime,nowMs:()=>1_000,entryPriceFetch:async target=>freshEntryEvidence(target),walletClient:{account:{}} as any})).rejects.toThrow('V4_BID_LADDER_MINT_ESTIMATE_FAILED');expect(gas.calls.estimateGas).toBe(2);expect(gas.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE semantic_stage='OPEN_BATCH'").get()).toEqual({count:0});}finally{gas.repo.close();}});
   it("values recurring claim fees with canonical token orientation and decimals", () => {
     expect(
@@ -797,7 +797,9 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
   it("keeps CLOSE independent from price, swap, router, burn, and cleanup paths", () => {
     const source = readFileSync("apps/cli/src/v4-bid-ladder-live.ts", "utf8"),
       close = source.slice(source.indexOf("async function closeState"));
-    expect(close).not.toMatch(/freshLpEntryPriceGuard|BURN_POSITION|cleanup/i);
+    expect(close).not.toMatch(
+      /freshLpEntryPriceGuard|executeV4CloseAutoSwap|buildV4ExactInputSingle|universalRouter|BURN_POSITION|cleanup/i,
+    );
     const text = formatV4BidLadderClosePreview({
       state: { parent: { ladder_id: "x" } } as any,
       active: [],
@@ -836,7 +838,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
     expect(pending).toContain("Nonce:");
     expect(pending).not.toContain("No transaction was sent");
   });
-  it("recovers confirmed open and close receipts without invoking the wallet or sending again", async () => {
+  it("keeps confirmed Reposition CLOSE ordering atomic and continues inline without state-cache or worker recovery", async () => {
     const f = fixture(),
       transfer = parseAbiItem(
         "event Transfer(address indexed from,address indexed to,uint256 indexed id)",
@@ -1320,8 +1322,19 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
           hash,
           receipt(hash, logs),
           collectPlan.calldata,
-          false,
+          true,
         );
+        const inlineClaim=await executeV4BidLadderCollect({
+          ...context,
+          collectAuthorizationId:authorization,
+          expectedTokenIds:["101","102","103","104","105"],
+        });
+        expect(inlineClaim).toMatchObject({
+          status:"COLLECTED",
+          continuationStatus:"COMPLETED",
+          reconciliationPending:false,
+          mainnetTransactionsSent:0,
+        });
         const recovered = await reconcileDurableV4Journals({
           repo: f.repo,
           rpc: f.rpc,
@@ -1331,11 +1344,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
             receipt: receipt(hash, logs),
           }),
         });
-        expect(recovered.results[0]?.error).toBeUndefined();
-        expect(recovered.results[0]).toMatchObject({
-          outcome: "CONFIRMED_RECONCILED",
-          semanticStage: stage,
-        });
+        expect(recovered).toMatchObject({scanned:0,results:[],signingAttempts:0,broadcasts:0,mainnetTransactionsSent:0});
         collectReplays.push({stage:stage as `COLLECT_BATCH:${string}`,receipt:receipt(hash,logs)});
       }
       const cumulative = f.repo.db
@@ -1360,6 +1369,25 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
       expect(claimEvents).toHaveLength(2);expect(claimEvents.every(row=>row.valuation_status==="AVAILABLE"&&row.realized_pnl_usd===row.newly_realized_fees_usd)).toBe(true);expect(claimEvents.map(row=>JSON.parse(String(row.valuation_evidence_json)))).toEqual(expect.arrayContaining([expect.objectContaining({contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V2",sanityStatus:"AVAILABLE",sameBlockLaterPoolSwaps:0,evidenceSource:"ARCHIVAL_STATEVIEW_BLOCK_END_NO_LATER_POOL_SWAP"})]));
       const economicSnapshot=()=>({collections:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(fee0_raw AS INTEGER)) fee0,SUM(CAST(fee1_raw AS INTEGER)) fee1 FROM collections").get(),feeClaims:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(token0_raw AS INTEGER)) token0,SUM(CAST(token1_raw AS INTEGER)) token1 FROM fee_claims").get(),positions:f.repo.db.prepare("SELECT SUM(CAST(claimed_fee0_raw AS INTEGER)) fee0,SUM(CAST(claimed_fee1_raw AS INTEGER)) fee1 FROM v4_positions").get(),events:f.repo.db.prepare("SELECT COUNT(*) count,SUM(CAST(realized_pnl_usd AS REAL)) pnl FROM realized_pnl_events WHERE event_kind='CLAIM'").get()}),beforeReplay=economicSnapshot();
       await reconcileConfirmedV4BidLadderJournal({...context,semanticStage:collectReplays[0]!.stage,receipt:collectReplays[0]!.receipt});
+      expect(economicSnapshot()).toEqual(beforeReplay);
+      f.repo.db.exec("CREATE TABLE inline_projection_production_shape(id INTEGER PRIMARY KEY,payload TEXT NOT NULL); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000) INSERT INTO inline_projection_production_shape(payload) SELECT printf('row-%08d',x) FROM n; CREATE TABLE inline_projection_writer(id INTEGER PRIMARY KEY,value INTEGER NOT NULL); INSERT INTO inline_projection_writer VALUES(1,0);");
+      const markerDirectory=economicForegroundMarkerDirectory(f.repo.path),writer=spawn(process.execPath,["-e",`const fs=require('node:fs'),DB=require('better-sqlite3'),db=new DB(${JSON.stringify(f.repo.path)});db.pragma('busy_timeout=1');let yields=0,writes=0,busy=0;const timer=setInterval(()=>{let foreground=false;try{foreground=fs.readdirSync(${JSON.stringify(markerDirectory)}).some(name=>name.startsWith('fg-'))}catch{}if(foreground){yields++;return}try{db.prepare('UPDATE inline_projection_writer SET value=value+1 WHERE id=1').run();writes++}catch(error){if(/busy|locked/i.test(String(error)))busy++;else throw error}},2);process.stdout.write('ready\\n');process.stdin.on('data',()=>{clearInterval(timer);setTimeout(()=>{process.stdout.write(JSON.stringify({yields,writes,busy}));db.close();process.exit(0)},10)})`],{cwd:process.cwd(),stdio:["pipe","pipe","inherit"]}),chunks:Buffer[]=[];
+      writer.stdout!.on("data",chunk=>chunks.push(chunk));
+      await new Promise<void>((resolve,reject)=>{writer.stdout!.on("data",chunk=>{if(String(chunk).includes("ready"))resolve()});writer.once("error",reject)});
+      const projectionMs:number[]=[];
+      for(let iteration=0;iteration<20;iteration++){
+        const started=Date.now();
+        await reconcileConfirmedV4BidLadderJournal({...context,canonicalProjectionLane:"FOREGROUND",semanticStage:collectReplays[iteration%collectReplays.length]!.stage,receipt:collectReplays[iteration%collectReplays.length]!.receipt});
+        projectionMs.push(Date.now()-started);
+      }
+      writer.stdin!.end("stop");
+      await new Promise<void>((resolve,reject)=>{writer.once("close",()=>resolve());writer.once("error",reject)});
+      const writerReport=JSON.parse(Buffer.concat(chunks).toString().replace("ready\n","")) as {yields:number;writes:number;busy:number},percentile=(values:number[],q:number)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1]!,projectionSla={iterations:projectionMs.length,p50:percentile(projectionMs,.5),p90:percentile(projectionMs,.9),p95:percentile(projectionMs,.95),max:Math.max(...projectionMs),background:writerReport};
+      process.stdout.write(`inline_projection_sla ${JSON.stringify(projectionSla)}\n`);
+      expect(projectionSla.p95).toBeLessThan(500);
+      expect(projectionSla.max).toBeLessThan(2_000);
+      expect(writerReport.yields).toBeGreaterThan(0);
+      expect(writerReport.writes).toBeGreaterThan(0);
       expect(economicSnapshot()).toEqual(beforeReplay);
       expect(
         f.repo
@@ -1413,7 +1441,7 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         closeHash,
         receipt(closeHash, closeLogs),
         plan.calldata,
-        false,
+        true,
         {contract:"DIRECT_V4_POOL_SQRT_PRICE_CAPTURE_V1",poolId:poolId(f.key),poolKey:f.key,sqrtPriceX96:f.preview.plan.pool.sqrtPriceX96.toString(),tick:f.preview.plan.pool.tick,activeLiquidity:f.preview.plan.pool.liquidity.toString(),initialized:f.preview.plan.pool.initialized,observationBlock:f.preview.plan.pool.blockNumber.toString(),observedAtMs:1_000,token0Decimals:18,token1Decimals:6},
       );
       f.repo.db
@@ -1422,36 +1450,47 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         )
         .run(`${f.ladderId}:CLOSE_BATCH:0`, f.ladderId);
       f.closePositions();
-      const recoveredClose = await reconcileDurableV4Journals({
-        repo: f.repo,
-        rpc: f.rpc,
-        wallet: owner,
-        observe: async () => ({
-          kind: "RECEIPT",
-          receipt: receipt(closeHash, closeLogs),
-        }),
+      const closeIdentity="manual-reposition:7:00000000-0000-4000-8000-000000000007";
+      f.repo.transitionBidLadderUsdReset({ladderId:f.ladderId,from:"OPEN_PENDING",to:"WATCHING"});
+      f.repo.transitionBidLadderUsdReset({ladderId:f.ladderId,from:"WATCHING",to:"CLOSE_PREPARED",closeWorkflowIdentity:closeIdentity});
+      f.repo.transitionBidLadderUsdReset({ladderId:f.ladderId,from:"CLOSE_PREPARED",to:"CLOSE_SUBMITTED"});
+      const revisionBeforeClose=Number(f.repo.loadBidLadder(f.ladderId)!.revision),receiptDetectedAtMs=Date.now(),
+        closed=await executeV4BidLadderManualClose(context),
+        canonicalProjectionCommittedAtMs=Date.now(),
+        recoveredClose = await reconcileDurableV4Journals({
+          repo: f.repo,
+          rpc: f.rpc,
+          wallet: owner,
+          observe: async () => {
+            throw new Error("confirmed race must not query transaction evidence again");
+          },
+        });
+      expect(closed).toMatchObject({
+        status: "CLOSED",
+        continuationStatus:"COMPLETED",
+        reconciliationPending:false,
+        mainnetTransactionsSent: 0,
+        reconciliation:{
+          canonicalMirror:{writes:{positions:0,v4Positions:0,legs:0,parent:0}},
+          atomicPostcondition:{status:"PROVEN",parentRevision:revisionBeforeClose+1,terminalTransitions:1},
+        },
       });
       expect(recoveredClose).toMatchObject({
-        scanned: 1,
+        scanned: 0,
         broadcasts: 0,
         signingAttempts: 0,
         mainnetTransactionsSent: 0,
-        results: [
-          { outcome: "CONFIRMED_RECONCILED", semanticStage: "CLOSE_BATCH" },
-        ],
-      });
-      const closed = await executeV4BidLadderManualClose(context);
-      expect(closed).toMatchObject({
-        status: "CLOSED",
-        mainnetTransactionsSent: 0,
+        results: [],
       });
       expect(f.repo.loadBidLadder(f.ladderId)).toMatchObject({
         status: "CLOSED",
         close_provenance: "FUNI_EXECUTED",
+        terminal_provenance: "FUNI_AUTHORED_CLOSE_BATCH",
+        revision: revisionBeforeClose+1,
       });
       expect(f.repo.loadBidLadderUsdReset(f.ladderId)).toMatchObject({
-        phase: "OPERATOR_CLOSED",
-        close_reason: "NORMAL_OPERATOR_CLOSE",
+        phase: "CLOSE_CONFIRMED",
+        close_reason: "USDG_RESET_REPOSITION",
         next_ladder_id: null,
       });
       expect(
@@ -1500,6 +1539,26 @@ describe("V4 BID ladder Phase 2B operator boundary", () => {
         legs: 0,
         parent: 0,
       });
+      expect(replayedClose.reconciliation.atomicPostcondition).toMatchObject({status:"PROVEN",parentRevision:revisionBeforeClose+1,terminalTransitions:0});
+      const restartRepo=new SqliteLedgerRepository(f.repo.path,{busyTimeoutMs:SQLITE_RUNTIME_BUSY_TIMEOUT_MS});
+      try{
+        const restartReplay=await executeV4BidLadderManualClose({...context,repo:restartRepo});
+        expect(restartReplay.reconciliation).toMatchObject({canonicalMirror:{writes:{positions:0,v4Positions:0,legs:0,parent:0}},atomicPostcondition:{status:"PROVEN",parentRevision:revisionBeforeClose+1,terminalTransitions:0}});
+      }finally{restartRepo.close();}
+      let childOpenPrepareAtMs=0;
+      const continuation=await processV4BidLadderUsdReset({
+        repo:f.repo,rpc:f.rpc,wallet:owner,walletClient:()=>({}) as any,context:async(ladderId:string)=>({...context,ladderId}) as any,
+        callerSource:"USER_CONFIRM",
+        reconcilePrincipal:async()=>{f.repo.transitionBidLadderUsdReset({ladderId:f.ladderId,from:"CLOSE_CONFIRMED",to:"PRINCIPAL_RECONCILED",returnedUsdgPrincipal:10_000_000n,returnedTargetPrincipal:0n,returnedUsdgFee:0n,returnedTargetFee:0n});return{returnedUsdgPrincipal:10_000_000n} as any;},
+        planChild:async()=>{const child=previewV4BidLadder({pool:{...f.preview.plan.pool,blockNumber:124n},funding:{address:c1,symbol:"USDG",decimals:6},target:{address:c0,symbol:"TOKEN",decimals:18},totalFundingAmount:10_000_000n,owner,deadline:999999n,nowMs:2000});createV4BidLadderLive(f.repo,child,10,{rootLadderId:f.ladderId,previousLadderId:f.ladderId,generation:1,creationReason:"USDG_RESET_REPOSITION"});f.repo.transitionBidLadderUsdReset({ladderId:f.ladderId,from:"PRINCIPAL_RECONCILED",to:"REOPEN_PLANNED",reopenWorkflowIdentity:child.plan.ladderId});return child.plan.ladderId;},
+        executeOpen:async(openInput:any)=>{childOpenPrepareAtMs=Date.now();f.repo.db.prepare("UPDATE v4_bid_ladders SET status='OPEN',revision=revision+1 WHERE ladder_id=? AND status='PLANNED'").run(openInput.ladderId);return{status:"OPEN",mainnetTransactionsSent:0} as any;},
+      },f.ladderId);
+      expect(continuation).toMatchObject({status:"COMPLETED"});
+      expect(f.repo.loadBidLadder((continuation as {childId:string}).childId)).toMatchObject({status:"OPEN"});
+      const sla={receipt_to_projection_ms:canonicalProjectionCommittedAtMs-receiptDetectedAtMs,projection_to_child_open_prepare_ms:childOpenPrepareAtMs-canonicalProjectionCommittedAtMs};
+      process.stdout.write(`reposition_inline_sla ${JSON.stringify(sla)}\n`);
+      expect(sla.receipt_to_projection_ms).toBeLessThan(5_000);
+      expect(sla.projection_to_child_open_prepare_ms).toBeLessThan(5_000);
       expect(f.repo.db.prepare("SELECT status FROM economic_reconciliation_work WHERE workflow_kind='V4_BID_LADDER_CLOSE'").get()).toEqual({status:'PENDING'});
       expect(walletCalls).toBe(0);
       expect(

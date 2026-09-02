@@ -1194,7 +1194,7 @@ describe("Close card presentation contract", () => {
     expect(ladder).toContain("OPEN_RECEIPT_BLOCK_TIMESTAMP");
     expect(card).toContain("t.me/Jajajakbothouse");
     expect(reconcile).not.toContain("USDG_ONLY_CANONICAL_VALUE");
-    expect(close).toContain("handoffBidLadderReceipt");
+    expect(close).toContain("inlineCanonicalBidLadderReceipt");
     expect(close).not.toContain("await reconcileClose");
   });
   it("prefers canonical symbols and otherwise shortens addresses", () => {

@@ -100,7 +100,8 @@ describe('v4 operational open gate',()=>{
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.3192}}).reasons).not.toContain('V4_TX_GAS_CAP_EXCEEDED');
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.5}}).reasons).not.toContain('V4_TX_GAS_CAP_EXCEEDED');
     expect(evaluateV4OperationalGates({...base,gas:{...base.gas,maxTxUsd:.5,perTxUsd:.5000001}}).reasons).toContain('V4_TX_GAS_CAP_EXCEEDED');
-    expect(runtimeEnvSchema.safeParse({...process.env,RH_CHAIN_ID:'4663',MAX_GAS_COST_USD:'1.01'}).success).toBe(false);
+    expect(runtimeEnvSchema.safeParse({...process.env,RH_CHAIN_ID:'4663',MAX_GAS_COST_USD:'2.00'}).success).toBe(true);
+    expect(runtimeEnvSchema.safeParse({...process.env,RH_CHAIN_ID:'4663',MAX_GAS_COST_USD:'2.01'}).success).toBe(false);
   });
   it('blocks when the range or single-sided invariant is not satisfied',()=>{
     expect(evaluateV4OperationalGates({...base,range:{valid:false}}).reasons).toContain('V4_RANGE_INVALID');

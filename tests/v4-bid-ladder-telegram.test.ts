@@ -647,9 +647,9 @@ describe("V4 BID ladder manual dry-run operator surface", () => {
     ])
       expect(source).toContain(`bot.command("${command}"`);
     expect(direct).toContain("createV4BidLadderLive(");
-    expect(direct).toContain("v4BidLadderNativeUsd({ repo: db, rpc })");
+    expect(direct).toContain("v4BidLadderNativeUsd({repo:db,rpc:rpc.scoped(");
     expect(direct).toContain(
-      "return bidLadderLivePreview(ctx, preview.plan.ladderId,{messageId:",
+      "return await bidLadderLivePreview(ctx,preview.plan.ladderId,{messageId:",
     );
     expect(direct).not.toContain("bid-ladder-create:");
     expect(source).toContain("Confirm Live Open");
@@ -837,7 +837,7 @@ describe("V4 BID ladder manual dry-run operator surface", () => {
         live.indexOf("export async function v4BidLadderNativeUsd"),
         live.indexOf("async function openState"),
       );
-    expect(context).toContain("v4BidLadderNativeUsd({ repo: db, rpc })");
+    expect(context).toContain("v4BidLadderNativeUsd({ repo: db, rpc: previewRpc })");
     expect(context).not.toMatch(
       /operationalNativeUsd|operationalFundingUsd|trustedWethUsdReference|cachedV3DeploymentAudit|auditRobinhoodV3Deployments|v3_deployment_audit/,
     );

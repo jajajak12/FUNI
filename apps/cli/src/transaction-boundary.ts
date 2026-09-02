@@ -24,7 +24,7 @@ export function durableTransactionReconciliationPending(error:unknown):DurableTr
  return undefined;
 }
 
-export function bufferedBroadcastGasPrice(observedGasPrice:bigint){if(observedGasPrice<=0n)throw new Error('TRANSACTION_GAS_PRICE_INVALID');return observedGasPrice*12n/10n;}
+export function bufferedBroadcastGasPrice(observedGasPrice:bigint){if(observedGasPrice<=0n)throw new Error('TRANSACTION_GAS_PRICE_INVALID');return observedGasPrice*11n/10n;}
 function transactionNotFound(error:unknown){return /not found|could not be found|unknown transaction/i.test(error instanceof Error?error.message:String(error));}
 function validHash(value:unknown):value is Hash{return typeof value==='string'&&/^0x[0-9a-fA-F]{64}$/.test(value);}
 function validAddress(value:unknown):value is Address{return typeof value==='string'&&/^0x[0-9a-fA-F]{40}$/.test(value);}

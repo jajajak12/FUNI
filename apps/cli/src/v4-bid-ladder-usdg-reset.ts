@@ -24,6 +24,8 @@ import {
 import {
   type SqliteLedgerRepository,
   type V4BidLadderUsdResetPhase,
+  withEconomicForegroundPersistenceSync,
+  withSqliteTransientRetrySync,
 } from "@funi/ledger";
 import {
   createV4BidLadderLive,
@@ -36,6 +38,8 @@ import { orientPoolPriceFundingPerTarget } from "./lp-entry-price-guard.js";
 import {
   executeV4BidLadderLiveOpen,
   executeV4BidLadderManualClose,
+  convergeConfirmedV4BidLadderRepositionClose,
+  prepareV4BidLadderFundingAllowance,
   v4BidLadderFundingAllowanceReadiness,
   type LadderLiveContext,
 } from "./v4-bid-ladder-live.js";
@@ -158,6 +162,94 @@ export function v4BidLadderUsdResetParentStatePolicy(
     parentStatus,
     allowedParentStatuses,
     valid: (allowedParentStatuses as readonly string[]).includes(parentStatus),
+  };
+}
+
+export type V4BidLadderUsdResetStateSemantics = { kind: "PROGRESS" | "WAIT" | "BLOCK" | "TERMINAL"; reason: string };
+export function v4BidLadderUsdResetStateSemantics(
+  phase: V4BidLadderUsdResetPhase,
+  parentStatus: V4BidLadderParentStatus,
+): V4BidLadderUsdResetStateSemantics {
+  const policy = v4BidLadderUsdResetParentStatePolicy(phase,parentStatus);
+  if (!policy.valid) return { kind: "BLOCK" as const,reason: `REPOSITION_PARENT_STATE_INVALID:${phase}:${parentStatus}` };
+  if (["COMPLETED","BLOCKED","OPERATOR_CLOSED"].includes(phase))
+    return { kind: "TERMINAL" as const,reason: `REPOSITION_${phase}` };
+  if (phase === "OPEN_PENDING")
+    return { kind: "WAIT" as const,reason: parentStatus === "PLANNED" ? "REPOSITION_WAITING_FOR_INITIAL_OPEN" : "REPOSITION_WAITING_FOR_OPEN_CONVERGENCE" };
+  if (phase === "WATCHING")
+    return { kind: "WAIT" as const,reason: "REPOSITION_WAITING_FOR_OPERATOR_OR_ELIGIBILITY" };
+  if (phase === "CLOSE_SUBMITTED" && parentStatus === "OPEN")
+    return { kind: "WAIT" as const,reason: "REPOSITION_WAITING_FOR_CLOSE_CANONICAL_PROJECTION" };
+  return { kind: "PROGRESS" as const,reason: phase === "CLOSE_SUBMITTED" ? "REPOSITION_VALIDATE_CONFIRMED_CLOSE" : `REPOSITION_ADVANCE_${phase}` };
+}
+
+export type V4BidLadderRepositionStateSnapshot = {
+  parentStatus: V4BidLadderParentStatus;
+  phase: V4BidLadderUsdResetPhase;
+  childState: "NONE" | "PLANNED" | "OPEN" | "CANCELLED" | "BLOCKED";
+  approvalReadiness: "READY" | "REQUIRED" | "UNKNOWN";
+  journalState: "NONE" | "PENDING" | "CONFIRMED" | "FAILED";
+  leaseState: "FREE" | "OWNED" | "OTHER";
+  blockReason?: string | null;
+};
+
+/** Total, side-effect-free classification used by every owned-cycle entrypoint.
+ * Invalid combinations are explicit blockers rather than silent no-ops. */
+export function classifyV4BidLadderRepositionState(
+  snapshot: V4BidLadderRepositionStateSnapshot,
+): V4BidLadderUsdResetStateSemantics & { healer?: string } {
+  const parent = v4BidLadderUsdResetParentStatePolicy(snapshot.phase, snapshot.parentStatus);
+  if (!parent.valid)
+    return { kind: "BLOCK", reason: `REPOSITION_PARENT_STATE_INVALID:${snapshot.phase}:${snapshot.parentStatus}` };
+  if (snapshot.leaseState === "OTHER")
+    return { kind: "WAIT", reason: "REPOSITION_WAITING_FOR_ACTIVE_OWNER" };
+  if (snapshot.journalState === "FAILED")
+    return { kind: "BLOCK", reason: "REPOSITION_TRANSACTION_JOURNAL_FAILED" };
+  if (snapshot.journalState === "PENDING")
+    return { kind: "WAIT", reason: "REPOSITION_WAITING_FOR_EXACT_HASH_RECOVERY" };
+  if (snapshot.phase === "COMPLETED" || snapshot.phase === "OPERATOR_CLOSED")
+    return { kind: "TERMINAL", reason: `REPOSITION_${snapshot.phase}` };
+  if (snapshot.phase === "BLOCKED") {
+    if (
+      snapshot.blockReason === "REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED" &&
+      snapshot.childState === "NONE"
+    )
+      return {
+        kind: "BLOCK",
+        reason: snapshot.blockReason,
+        healer: "reposition-prepare-allowance-and-continue",
+      };
+    if (
+      snapshot.blockReason === "REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED" &&
+      snapshot.childState === "CANCELLED"
+    )
+      return {
+        kind: "BLOCK",
+        reason: snapshot.blockReason,
+        healer: "reposition-prepare-allowance-and-continue",
+      };
+    return { kind: "BLOCK", reason: snapshot.blockReason || "REPOSITION_BLOCKED" };
+  }
+  if (snapshot.phase === "OPEN_PENDING")
+    return { kind: "WAIT", reason: snapshot.parentStatus === "PLANNED" ? "REPOSITION_WAITING_FOR_INITIAL_OPEN" : "REPOSITION_WAITING_FOR_OPEN_CONVERGENCE" };
+  if (snapshot.phase === "WATCHING")
+    return { kind: "WAIT", reason: "REPOSITION_WAITING_FOR_OPERATOR_OR_ELIGIBILITY" };
+  if (snapshot.phase === "CLOSE_SUBMITTED" && snapshot.parentStatus === "OPEN")
+    return { kind: "WAIT", reason: "REPOSITION_WAITING_FOR_CLOSE_CANONICAL_PROJECTION" };
+  if (snapshot.phase === "PRINCIPAL_RECONCILED" && snapshot.approvalReadiness !== "READY")
+    return {
+      kind: snapshot.approvalReadiness === "REQUIRED" ? "PROGRESS" : "WAIT",
+      reason: snapshot.approvalReadiness === "REQUIRED"
+        ? "REPOSITION_REPLACEMENT_APPROVAL_PREPARING"
+        : "REPOSITION_ALLOWANCE_EVIDENCE_UNAVAILABLE",
+    };
+  if (["REOPEN_PLANNED", "REOPEN_PREPARED", "REOPEN_SUBMITTED"].includes(snapshot.phase) && snapshot.childState === "NONE")
+    return { kind: "BLOCK", reason: "REPOSITION_CHILD_MISSING" };
+  return {
+    kind: "PROGRESS",
+    reason: snapshot.phase === "CLOSE_SUBMITTED"
+      ? "REPOSITION_VALIDATE_CONFIRMED_CLOSE"
+      : `REPOSITION_ADVANCE_${snapshot.phase}`,
   };
 }
 
@@ -524,6 +616,8 @@ export async function reconcileV4BidLadderUsdResetPrincipal(input: {
   rpc: FallbackRpc;
   ladderId: string;
   wallet: Address;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
   const proof = await proveV4BidLadderUsdResetPrincipal(input),
     values = {
@@ -533,7 +627,14 @@ export async function reconcileV4BidLadderUsdResetPrincipal(input: {
       returnedTargetFee: proof.returnedTargetFee,
     };
   let transitionResult: "APPLIED" | "ALREADY_ADVANCED" | "CONFLICT" = "CONFLICT";
-  input.repo.db.transaction(() => {
+  repositionPersistence({
+    repo: input.repo,
+    ladderId: input.ladderId,
+    operation: "v4_bid_ladder_reposition_principal_commit",
+    semanticStage: "PRINCIPAL_RECONCILED",
+    correlationId: input.correlationId,
+    telemetry: input.telemetry,
+    run: () => input.repo.db.transaction(() => {
     const current = input.repo.loadBidLadderUsdReset(input.ladderId);
     if (String(current?.phase) === "CLOSE_CONFIRMED") {
       input.repo.transitionBidLadderUsdReset({
@@ -556,7 +657,8 @@ export async function reconcileV4BidLadderUsdResetPrincipal(input: {
           blockReason: "REPOSITION_BLOCKED_NON_USDG_PRINCIPAL",
         });
     }
-  })();
+    })(),
+  });
   return { ...proof, transitionResult };
 }
 
@@ -583,6 +685,8 @@ async function planChild(input: {
   ladderId: string;
   wallet: Address;
   nowMs: number;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
   const reset = input.repo.loadBidLadderUsdReset(input.ladderId),
     state = ladderRows(input.repo, input.ladderId);
@@ -611,21 +715,34 @@ async function planChild(input: {
     entryUsd = Number(capital) / 10 ** funding.decimals;
   if (!Number.isFinite(entryUsd) || entryUsd <= 0)
     throw new Error("REPOSITION_CHILD_CAPITAL_INVALID");
-  createV4BidLadderLive(input.repo, preview, entryUsd, {
-    rootLadderId: String(reset.root_ladder_id),
-    previousLadderId: input.ladderId,
-    generation: Number(reset.generation) + 1,
-    creationReason: "USDG_RESET_REPOSITION",
+  repositionPersistence({
+    repo: input.repo,
+    ladderId: input.ladderId,
+    operation: "v4_bid_ladder_reposition_child_generation_commit",
+    semanticStage: "REOPEN_PLANNED",
+    correlationId: input.correlationId,
+    telemetry: input.telemetry,
+    run: () => input.repo.db.transaction(() => {
+      const current = input.repo.loadBidLadderUsdReset(input.ladderId);
+      if (!current || String(current.phase) !== "PRINCIPAL_RECONCILED") {
+        if (current?.next_ladder_id) return;
+        throw new Error("REPOSITION_CHILD_CREATION_CAS_CONFLICT");
+      }
+      createV4BidLadderLive(input.repo, preview, entryUsd, {
+        rootLadderId: String(current.root_ladder_id),
+        previousLadderId: input.ladderId,
+        generation: Number(current.generation) + 1,
+        creationReason: "USDG_RESET_REPOSITION",
+      });
+      input.repo.transitionBidLadderUsdReset({
+        ladderId: input.ladderId,
+        from: "PRINCIPAL_RECONCILED",
+        to: "REOPEN_PLANNED",
+        reopenWorkflowIdentity: preview.plan.ladderId,
+      });
+    })(),
   });
-  const latest = input.repo.loadBidLadderUsdReset(input.ladderId)!;
-  if (String(latest.phase) === "PRINCIPAL_RECONCILED")
-    input.repo.transitionBidLadderUsdReset({
-      ladderId: input.ladderId,
-      from: "PRINCIPAL_RECONCILED",
-      to: "REOPEN_PLANNED",
-      reopenWorkflowIdentity: preview.plan.ladderId,
-    });
-  return preview.plan.ladderId;
+  return String(input.repo.loadBidLadderUsdReset(input.ladderId)?.reopen_workflow_identity??input.repo.loadBidLadderUsdReset(input.ladderId)?.next_ladder_id??preview.plan.ladderId);
 }
 
 async function childFundingOnlyDrift(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;childId:string}){
@@ -636,7 +753,7 @@ async function childFundingOnlyDrift(input:{repo:SqliteLedgerRepository;rpc:Fall
   return {drifted,pool:current.value};
 }
 
-export async function rematerializeV4BidLadderRepositionChildOnce(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;childId:string;wallet:Address;nowMs:number;failureCode?:'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY'|'V4_BID_LADDER_MINT_ESTIMATE_FAILED';pool?:V4PoolState;metadata?:{funding:{address:Address;decimals:number};target:{address:Address;decimals:number}}}){
+export async function rematerializeV4BidLadderRepositionChildOnce(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;childId:string;wallet:Address;nowMs:number;failureCode?:'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY'|'V4_BID_LADDER_MINT_ESTIMATE_FAILED';pool?:V4PoolState;metadata?:{funding:{address:Address;decimals:number};target:{address:Address;decimals:number}};correlationId?:string;telemetry?:(event:Record<string,unknown>)=>void}){
   const reset=input.repo.loadBidLadderUsdReset(input.ladderId),source=ladderRows(input.repo,input.ladderId),child=ladderRows(input.repo,input.childId);
   const childReset=input.repo.loadBidLadderUsdReset(input.childId),activeChild=String(reset?.reopen_workflow_identity??reset?.next_ladder_id??'');
   if(!reset||activeChild!==input.childId||String(reset.phase)!=='REOPEN_PLANNED')throw new Error('REPOSITION_JIT_REMATERIALIZATION_AUTHORITY_INVALID');
@@ -653,7 +770,7 @@ export async function rematerializeV4BidLadderRepositionChildOnce(input:{repo:Sq
   const fresh=previewV4BidLadder({pool:current,funding,target,totalFundingAmount:capital,maxDownsideBps:depth,owner:input.wallet,deadline:BigInt(Math.floor(input.nowMs/1000)+600),nowMs:input.nowMs}),plan={...fresh.plan,ladderId:input.childId,legs:fresh.plan.legs.map(leg=>({...leg,identity:`${input.childId}:${leg.index}:${leg.upperDropBps}:${leg.lowerDropBps}:${leg.tickLower}:${leg.tickUpper}`}))};
   if(plan.totalFundingAmount!==capital||plan.maxDownsideBps!==depth||plan.legs.length!==5||plan.legs.some((leg,index)=>leg.index!==index||leg.targetIndex!==Number(source.parent.target_index)||leg.fundingIndex!==Number(source.parent.funding_index)||(leg.targetIndex===0?leg.mint.amount0Expected:leg.mint.amount1Expected)!==0n)||plan.legs.reduce((sum,leg)=>sum+leg.fundingAmount,0n)!==capital)throw new Error('REPOSITION_JIT_STRATEGY_INTENT_MISMATCH');
   const expectedParentRevision=Number(child.parent.revision),expectedResetRevision=Number(childReset!.revision),attempt=priorAttempts+1,failureCode=input.failureCode??'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY';
-  input.repo.db.transaction(()=>{const parentChanged=input.repo.db.prepare("UPDATE v4_bid_ladders SET reference_tick=?,reference_block=?,reference_block_hash=?,total_funding_amount_raw=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED' AND revision=?").run(plan.referenceTick,plan.referenceBlock.toString(),plan.referenceBlockHash??null,capital.toString(),input.nowMs,input.childId,expectedParentRevision).changes;if(parentChanged!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');const update=input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET upper_drop_bps=?,lower_drop_bps=?,capital_weight_bps=?,tick_lower=?,tick_upper=?,funding_amount_raw=?,planned_liquidity_raw=?,funding_index=?,target_index=?,updated_at_ms=? WHERE ladder_id=? AND leg_index=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL");for(const leg of plan.legs)if(update.run(leg.upperDropBps,leg.lowerDropBps,leg.weightBps,leg.tickLower,leg.tickUpper,leg.fundingAmount.toString(),leg.mint.liquidity.toString(),leg.fundingIndex,leg.targetIndex,input.nowMs,input.childId,leg.index).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');if(input.repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET jit_rematerialization_attempts=?,jit_last_failure_code=?,jit_last_reference_tick=?,jit_last_reference_block=?,jit_last_attempt_at_ms=?,revision=revision+1,updated_at_ms=? WHERE ladder_id=? AND phase='OPEN_PENDING' AND revision=? AND jit_rematerialization_attempts=?").run(attempt,failureCode,plan.referenceTick,plan.referenceBlock.toString(),input.nowMs,input.nowMs,input.childId,expectedResetRevision,priorAttempts).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');})();
+  repositionPersistence({repo:input.repo,ladderId:input.ladderId,operation:'v4_bid_ladder_reposition_jit_rematerialization_commit',semanticStage:'REOPEN_PLANNED',correlationId:input.correlationId,telemetry:input.telemetry,run:()=>input.repo.db.transaction(()=>{const parentChanged=input.repo.db.prepare("UPDATE v4_bid_ladders SET reference_tick=?,reference_block=?,reference_block_hash=?,total_funding_amount_raw=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED' AND revision=?").run(plan.referenceTick,plan.referenceBlock.toString(),plan.referenceBlockHash??null,capital.toString(),input.nowMs,input.childId,expectedParentRevision).changes;if(parentChanged!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');const update=input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET upper_drop_bps=?,lower_drop_bps=?,capital_weight_bps=?,tick_lower=?,tick_upper=?,funding_amount_raw=?,planned_liquidity_raw=?,funding_index=?,target_index=?,updated_at_ms=? WHERE ladder_id=? AND leg_index=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL");for(const leg of plan.legs)if(update.run(leg.upperDropBps,leg.lowerDropBps,leg.weightBps,leg.tickLower,leg.tickUpper,leg.fundingAmount.toString(),leg.mint.liquidity.toString(),leg.fundingIndex,leg.targetIndex,input.nowMs,input.childId,leg.index).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');if(input.repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET jit_rematerialization_attempts=?,jit_last_failure_code=?,jit_last_reference_tick=?,jit_last_reference_block=?,jit_last_attempt_at_ms=?,revision=revision+1,updated_at_ms=? WHERE ladder_id=? AND phase='OPEN_PENDING' AND revision=? AND jit_rematerialization_attempts=?").run(attempt,failureCode,plan.referenceTick,plan.referenceBlock.toString(),input.nowMs,input.nowMs,input.childId,expectedResetRevision,priorAttempts).changes!==1)throw new Error('REPOSITION_JIT_REMATERIALIZATION_CONFLICT');})()});
   return {childId:input.childId,referenceTick:plan.referenceTick,referenceBlock:plan.referenceBlock,rematerializations:attempt};
 }
 
@@ -777,6 +894,8 @@ export type V4BidLadderUsdResetCycleInput = {
   reconcilePrincipal?: typeof reconcileV4BidLadderUsdResetPrincipal;
   planChild?: typeof planChild;
   readAllowanceReadiness?: typeof v4BidLadderFundingAllowanceReadiness;
+  prepareAllowance?: typeof prepareV4BidLadderFundingAllowance;
+  readWalletBalance?: () => Promise<bigint>;
   executeOpen?: typeof executeV4BidLadderLiveOpen;
   executeClose?: typeof executeV4BidLadderManualClose;
   nowMs?: () => number;
@@ -788,6 +907,7 @@ export type V4BidLadderUsdResetCycleInput = {
   callerSource?: RepositionCallerSource;
   executionOwnerId?: string;
   executionLeaseMs?: number;
+  correlationId?: string;
   telemetry?: (event: Record<string, unknown>) => void;
   executionLease?: { ownerId: string; leaseMs: number };
 };
@@ -804,8 +924,47 @@ function repositionTelemetry(
   event: Record<string, unknown>,
 ) {
   try {
-    input.telemetry?.({ event: "v4_bid_ladder_reposition_single_flight", ...event });
+    input.telemetry?.({
+      event: "v4_bid_ladder_reposition_single_flight",
+      correlationId: input.correlationId ?? event.ladderId ?? null,
+      ...event,
+    });
   } catch {}
+}
+
+async function repositionContext(input:V4BidLadderUsdResetCycleInput,ladderId:string){
+  const context=await input.context(ladderId),upstream=context.telemetry,correlationId=input.correlationId??ladderId;
+  return {...context,telemetry:(event:string,data:Record<string,unknown>)=>{
+    try{upstream?.(event,{correlationId,...data});}catch{}
+  }};
+}
+
+function repositionPersistence<T>(input: {
+  repo: SqliteLedgerRepository;
+  operation: string;
+  ladderId: string;
+  semanticStage: string;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
+  run: () => T;
+}) {
+  return withEconomicForegroundPersistenceSync({
+    databasePath: input.repo.path,
+    component: "v4-bid-ladder-reposition",
+    operation: input.operation,
+    workflow: input.ladderId,
+    semanticStage: input.semanticStage,
+    run: input.run,
+    onTelemetry: (event) => {
+      try {
+        input.telemetry?.({
+          event: "sqlite_write_window",
+          correlationId: input.correlationId ?? input.ladderId,
+          ...event,
+        });
+      } catch {}
+    },
+  });
 }
 
 export function acquireV4BidLadderRepositionLease(input: {
@@ -815,6 +974,8 @@ export function acquireV4BidLadderRepositionLease(input: {
   callerSource: RepositionCallerSource;
   nowMs?: number;
   leaseMs?: number;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
   const now = input.nowMs ?? Date.now(),
     leaseMs = input.leaseMs ?? REPOSITION_EXECUTION_LEASE_MS,
@@ -822,6 +983,11 @@ export function acquireV4BidLadderRepositionLease(input: {
   if (!reset) return { result: "NOT_FOUND" as const };
   if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(leaseMs) || leaseMs < 1)
     throw new Error("REPOSITION_SINGLE_FLIGHT_LEASE_INPUT_INVALID");
+  return repositionPersistence({
+    ...input,
+    operation: "v4_bid_ladder_reposition_lease_acquire",
+    semanticStage: "REPOSITION_LEASE",
+    run: () => {
   const changed = input.repo.db.prepare(`
     INSERT INTO v4_bid_ladder_usdg_reset_execution_leases(
       ladder_id,owner_id,caller_source,generation,phase_at_acquire,
@@ -867,6 +1033,8 @@ export function acquireV4BidLadderRepositionLease(input: {
         phaseAtAcquire: String(current?.phase_at_acquire ?? reset.phase),
         generation: Number(current?.generation ?? reset.generation),
       };
+    },
+  });
 }
 
 export function renewV4BidLadderRepositionLease(input: {
@@ -875,21 +1043,35 @@ export function renewV4BidLadderRepositionLease(input: {
   ownerId: string;
   nowMs?: number;
   leaseMs?: number;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
   const now = input.nowMs ?? Date.now(), leaseMs = input.leaseMs ?? REPOSITION_EXECUTION_LEASE_MS;
-  return input.repo.db.prepare(
-    "UPDATE v4_bid_ladder_usdg_reset_execution_leases SET lease_until_ms=?,updated_at_ms=? WHERE ladder_id=? AND owner_id=? AND lease_until_ms>?",
-  ).run(now + leaseMs, now, input.ladderId, input.ownerId, now).changes === 1;
+  return repositionPersistence({
+    ...input,
+    operation: "v4_bid_ladder_reposition_lease_renew",
+    semanticStage: "REPOSITION_LEASE",
+    run: () => input.repo.db.prepare(
+      "UPDATE v4_bid_ladder_usdg_reset_execution_leases SET lease_until_ms=?,updated_at_ms=? WHERE ladder_id=? AND owner_id=? AND lease_until_ms>?",
+    ).run(now + leaseMs, now, input.ladderId, input.ownerId, now).changes === 1,
+  });
 }
 
 export function releaseV4BidLadderRepositionLease(input: {
   repo: SqliteLedgerRepository;
   ladderId: string;
   ownerId: string;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
-  return input.repo.db.prepare(
-    "DELETE FROM v4_bid_ladder_usdg_reset_execution_leases WHERE ladder_id=? AND owner_id=?",
-  ).run(input.ladderId, input.ownerId).changes === 1;
+  return repositionPersistence({
+    ...input,
+    operation: "v4_bid_ladder_reposition_lease_release",
+    semanticStage: "REPOSITION_LEASE",
+    run: () => input.repo.db.prepare(
+      "DELETE FROM v4_bid_ladder_usdg_reset_execution_leases WHERE ladder_id=? AND owner_id=?",
+    ).run(input.ladderId, input.ownerId).changes === 1,
+  });
 }
 
 function assertV4BidLadderRepositionLease(
@@ -903,6 +1085,8 @@ function assertV4BidLadderRepositionLease(
     ownerId: input.executionLease.ownerId,
     nowMs: (input.nowMs ?? Date.now)(),
     leaseMs: input.executionLease.leaseMs,
+    correlationId: input.correlationId,
+    telemetry: input.telemetry,
   })) throw new Error("REPOSITION_SINGLE_FLIGHT_LEASE_LOST");
 }
 
@@ -912,11 +1096,23 @@ function transitionV4BidLadderUsdResetOnce(input: {
   from: V4BidLadderUsdResetPhase | readonly V4BidLadderUsdResetPhase[];
   to: V4BidLadderUsdResetPhase;
   reopenWorkflowIdentity?: string;
-  blockReason?: string;
+  blockReason?: string | null;
+  closeReason?: "NORMAL_OPERATOR_CLOSE" | "USDG_RESET_REPOSITION";
+  closeWorkflowIdentity?: string;
   nowMs?: number;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
 }) {
   try {
-    const row = input.repo.transitionBidLadderUsdReset(input);
+    const row = repositionPersistence({
+      repo: input.repo,
+      ladderId: input.ladderId,
+      operation: `v4_bid_ladder_reposition_phase_${String(input.from).toLowerCase()}_to_${input.to.toLowerCase()}`,
+      semanticStage: "REPOSITION_PHASE_CAS",
+      correlationId: input.correlationId,
+      telemetry: input.telemetry,
+      run: () => input.repo.transitionBidLadderUsdReset(input),
+    });
     return { result: "APPLIED" as const, row };
   } catch (error) {
     if (!(error instanceof Error) || error.message !== "V4_BID_LADDER_USDG_RESET_TRANSITION_CONFLICT")
@@ -935,7 +1131,7 @@ export function classifyV4BidLadderRepositionExecutionError(error: unknown) {
     nativeCode = isRecord(error) && typeof error.code === "string" ? error.code : "",
     signature = `${code}:${nativeCode}:${message}`,
     retryable = /(?:DURABLE_TRANSACTION_NONCE_MUTEX_HELD|REPOSITION_SINGLE_FLIGHT_LEASE_LOST|RPC|PROVIDER|TIMEOUT|SQLITE_BUSY|SQLITE_LOCKED|database is (?:busy|locked)|FRESH_(?:POOL_)?STATE_UNAVAILABLE|STATE_CACHE|TEMPORARY)/i.test(signature),
-    terminal = /(?:CHILD_OPEN_FAILED|FUNDING_ONLY|MINT_ESTIMATE_FAILED|JIT_(?:STRATEGY_INTENT_MISMATCH|REMATERIALIZATION_LIMIT_EXHAUSTED)|POOL_IDENTITY_MISMATCH|PRINCIPAL_(?:MISMATCH|EXCEEDS_RECEIPT_TRANSFER)|NON_USDG_PRINCIPAL|SAME_BLOCK_LATER_SWAP_AMBIGUOUS|EXECUTION_PRICE_EVIDENCE_MISMATCH|ADMISSION|SAFETY|CANCELLED|REPLACEMENT_OPEN_STOPPED|NONCE_(?:DIVERGENCE|MISMATCH|AMBIGUOUS))/.test(signature);
+    terminal = /(?:CHILD_OPEN_FAILED|FUNDING_ONLY|MINT_ESTIMATE_FAILED|JIT_(?:STRATEGY_INTENT_MISMATCH|REMATERIALIZATION_LIMIT_EXHAUSTED)|POOL_IDENTITY_MISMATCH|PRINCIPAL_(?:MISMATCH|EXCEEDS_RECEIPT_TRANSFER)|NON_USDG_PRINCIPAL|SAME_BLOCK_LATER_SWAP_AMBIGUOUS|EXECUTION_PRICE_EVIDENCE_MISMATCH|ADMISSION|SAFETY|CANCELLED|REPLACEMENT_OPEN_STOPPED|REPLACEMENT_(?:AUTHORIZATION|TRANSACTION)|APPROVAL_REVERTED|FUNDING_BALANCE_INSUFFICIENT|ALLOWANCE_INSUFFICIENT|GAS_CAP|EXACT_HASH_ABSENT_NONCE_UNAVAILABLE|PREPARED_TRANSACTION_METADATA_MISMATCH|NONCE_(?:DIVERGENCE|MISMATCH|AMBIGUOUS))/.test(signature);
   return {
     classification: retryable || !terminal ? "RETRYABLE" as const : "DETERMINISTIC_TERMINAL" as const,
     code,
@@ -966,6 +1162,41 @@ function confirmedCloseReceiptExists(repo: SqliteLedgerRepository, ladderId: str
 }
 
 const activeRepositionChildId=(reset:Record<string,unknown>|undefined)=>reset?.reopen_workflow_identity?String(reset.reopen_workflow_identity):reset?.next_ladder_id?String(reset.next_ladder_id):undefined;
+
+/** Binds replacement approval/OPEN authority to the one consumed manual
+ * Reposition authorization and its exact source -> child lineage. Approval
+ * transaction identity and amount remain enforced by the child-scoped durable
+ * OPEN approval journal. */
+export function assertV4BidLadderReplacementAuthorization(input:{
+  repo:SqliteLedgerRepository;
+  sourceLadderId:string;
+  childLadderId:string;
+}) {
+  const source=input.repo.loadBidLadder(input.sourceLadderId),
+    sourceReset=input.repo.loadBidLadderUsdReset(input.sourceLadderId),
+    child=input.repo.loadBidLadder(input.childLadderId),
+    childReset=input.repo.loadBidLadderUsdReset(input.childLadderId),
+    fail=(reason:string):never=>{throw new Error(`REPOSITION_REPLACEMENT_AUTHORIZATION_${reason}`);};
+  if(!source)return fail('SOURCE_STATE_MISSING');
+  if(!sourceReset)return fail('SOURCE_RESET_MISSING');
+  if(!child)return fail('CHILD_STATE_MISSING');
+  if(!childReset)return fail('CHILD_RESET_MISSING');
+  if(String(source.status)!=='CLOSED')fail('SOURCE_NOT_CLOSED');
+  if(!manualAuthorization(sourceReset.close_workflow_identity))fail('MANUAL_CONFIRM_MISSING');
+  if(!['REOPEN_PLANNED','REOPEN_PREPARED','REOPEN_SUBMITTED'].includes(String(sourceReset.phase)))fail('SOURCE_PHASE_INVALID');
+  if(activeRepositionChildId(sourceReset)!==input.childLadderId||String(childReset.previous_ladder_id)!==input.sourceLadderId)fail('CHILD_IDENTITY_MISMATCH');
+  if(String(childReset.root_ladder_id)!==String(sourceReset.root_ladder_id)||Number(childReset.generation)!==Number(sourceReset.generation)+1||String(childReset.creation_reason)!=='USDG_RESET_REPOSITION')fail('LINEAGE_MISMATCH');
+  const principal=BigInt(String(sourceReset.returned_usdg_principal_raw??'0'));
+  if(principal<=0n||BigInt(String(sourceReset.returned_target_principal_raw??'-1'))!==0n)fail('PRINCIPAL_INVALID');
+  if(BigInt(String(child.total_funding_amount_raw??'0'))!==principal)fail('PRINCIPAL_MISMATCH');
+  if(!same(source.funding_token,child.funding_token)||!same(source.target_token,child.target_token)||!same(source.pool_id,child.pool_id)||String(source.strategy_version)!==String(child.strategy_version))fail('STRATEGY_OR_TOKEN_MISMATCH');
+  if(input.repo.v4BidLadderStrategyDepthBps(input.sourceLadderId)!==input.repo.v4BidLadderStrategyDepthBps(input.childLadderId))fail('RETAINED_DEPTH_MISMATCH');
+  const journalRows=input.repo.db.prepare("SELECT semantic_stage,status,failure_reason,COUNT(*) OVER (PARTITION BY semantic_stage) AS stage_count FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage IN ('OPEN_ERC20_APPROVAL','OPEN_PERMIT2_APPROVAL','OPEN_BATCH') ORDER BY created_at").all(CHAIN_ID,input.childLadderId) as Array<{semantic_stage:string;status:string;failure_reason:string|null;stage_count:number}>;
+  if(journalRows.some(row=>Number(row.stage_count)>1))fail('DUPLICATE_CHILD_TRANSACTION_STAGE');
+  const failed=journalRows.find(row=>row.status==='FAILED');
+  if(failed){const reason=String(failed.failure_reason??'FAILED').replace(/[^A-Za-z0-9_]/g,'_').slice(0,80);throw new Error(`REPOSITION_REPLACEMENT_TRANSACTION_FAILED_${failed.semantic_stage}_${reason}`);}
+  return {sourceLadderId:input.sourceLadderId,childLadderId:input.childLadderId,rootLadderId:String(sourceReset.root_ladder_id),sourceGeneration:Number(sourceReset.generation),childGeneration:Number(childReset.generation),principal,retainedDepthBps:input.repo.v4BidLadderStrategyDepthBps(input.sourceLadderId),fundingToken:getAddress(String(source.funding_token)),targetToken:getAddress(String(source.target_token)),manualAuthorizationIdentity:String(sourceReset.close_workflow_identity)};
+}
 
 export async function v4BidLadderRepositionResumeEligibility(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;wallet:Address;nowMs?:number;leaseOwnerId?:string;context?:()=>Promise<LadderLiveContext>;readWalletBalance?:()=>Promise<bigint>;readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>}){
   const now=input.nowMs??Date.now(),source=input.repo.loadBidLadder(input.ladderId),reset=input.repo.loadBidLadderUsdReset(input.ladderId),priorChildId=reset?.next_ladder_id?String(reset.next_ladder_id):undefined,priorChild=priorChildId?input.repo.loadBidLadder(priorChildId):undefined,priorReset=priorChildId?input.repo.loadBidLadderUsdReset(priorChildId):undefined,legs=priorChildId?input.repo.listBidLadderLegs(priorChildId):[],blockers:string[]=[];
@@ -1000,8 +1231,8 @@ export async function v4BidLadderRepositionResumeEligibility(input:{repo:SqliteL
   return {eligible:blockers.length===0,ladderId:input.ladderId,rootLadderId:String(reset?.root_ladder_id??''),sourceGeneration:Number(reset?.generation??-1),priorChildId,priorChildGeneration:Number(priorReset?.generation??-1),nextGeneration:Number(priorReset?.generation??Number(reset?.generation??0))+1,principalRaw:principal.toString(),walletBalanceRaw:walletBalance.toString(),allowanceReady:Boolean(allowance?.ready),nonce,blockers:[...new Set(blockers)],signingCount:0,broadcastCount:0};
 }
 
-export async function resumeV4BidLadderReposition(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;wallet:Address;context:()=>Promise<LadderLiveContext>;nowMs?:number;readWalletBalance?:()=>Promise<bigint>;readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>}){
-  const now=input.nowMs??Date.now(),ownerId=`reposition-resume:${process.pid}:${randomUUID()}`,lease=acquireV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,callerSource:'USER_CONFIRM',nowMs:now});
+export async function resumeV4BidLadderReposition(input:{repo:SqliteLedgerRepository;rpc:FallbackRpc;ladderId:string;wallet:Address;context:()=>Promise<LadderLiveContext>;nowMs?:number;readWalletBalance?:()=>Promise<bigint>;readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>;executionOwnerId?:string;correlationId?:string;telemetry?:(event:Record<string,unknown>)=>void}){
+  const now=input.nowMs??Date.now(),ownerId=input.executionOwnerId??`reposition-resume:${process.pid}:${randomUUID()}`,lease=input.executionOwnerId?{result:'ACQUIRED' as const}:acquireV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,callerSource:'USER_CONFIRM',nowMs:now,correlationId:input.correlationId,telemetry:input.telemetry});
   if(lease.result!=='ACQUIRED')throw new Error('REPOSITION_RESUME_ALREADY_PROGRESSING');
   try{
     const eligibility=await v4BidLadderRepositionResumeEligibility({...input,nowMs:now,leaseOwnerId:ownerId});if(!eligibility.eligible)throw new Error(`REPOSITION_RESUME_NOT_ELIGIBLE:${eligibility.blockers.join(',')}`);
@@ -1010,23 +1241,101 @@ export async function resumeV4BidLadderReposition(input:{repo:SqliteLedgerReposi
     const funding=tokenFromParent(input.repo,source.parent,'funding'),target=tokenFromParent(input.repo,source.parent,'target'),[fundingEvidence,targetEvidence]=await Promise.all([inspectErc20(input.rpc,funding.address),inspectErc20(input.rpc,target.address)]);
     if(fundingEvidence.status!=='available'||targetEvidence.status!=='available'||fundingEvidence.value.decimals!==funding.decimals||targetEvidence.value.decimals!==target.decimals||!sameV4PoolKey(pool.value.key,source.key)||!same(pool.value.id,source.parent.pool_id))throw new Error('REPOSITION_RESUME_FRESH_CANONICAL_STATE_INVALID');
     const preview=previewV4BidLadder({pool:pool.value,funding,target,totalFundingAmount:capital,maxDownsideBps:depth,owner:input.wallet,deadline:BigInt(Math.floor(now/1000)+600),nowMs:now}),generation=Number(priorReset.generation)+1;
-    input.repo.db.transaction(()=>{
+    repositionPersistence({repo:input.repo,ladderId:input.ladderId,operation:'v4_bid_ladder_reposition_jit_resume_generation_commit',semanticStage:'REOPEN_PLANNED',correlationId:input.correlationId,telemetry:input.telemetry,run:()=>input.repo.db.transaction(()=>{
       const current=input.repo.loadBidLadderUsdReset(input.ladderId),old=input.repo.loadBidLadder(priorChildId),oldReset=input.repo.loadBidLadderUsdReset(priorChildId);if(String(current?.phase)!=='BLOCKED'||String(current?.block_reason)!=='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED'||String(old?.status)!=='CANCELLED'||String(oldReset?.phase)!=='BLOCKED'||oldReset?.next_ladder_id)throw new Error('REPOSITION_RESUME_STATE_CHANGED');
       createV4BidLadderLive(input.repo,preview,Number(capital)/10**funding.decimals,{rootLadderId:String(current!.root_ladder_id),previousLadderId:priorChildId,generation,creationReason:'USDG_RESET_REPOSITION'});
       input.repo.transitionBidLadderUsdReset({ladderId:input.ladderId,from:'BLOCKED',to:'REOPEN_PLANNED',reopenWorkflowIdentity:preview.plan.ladderId,blockReason:null,nowMs:now});
-    })();
+    })()});
     return {status:'RESUMED_REOPEN_PLANNED' as const,ladderId:input.ladderId,previousChildId:priorChildId,childId:preview.plan.ladderId,rootLadderId:String(sourceReset.root_ladder_id),generation,principalRaw:capital.toString(),depthBps:depth,jitAttemptsUsed:0,maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,signingCount:0,broadcastCount:0};
-  }finally{releaseV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId});}
+  }finally{if(!input.executionOwnerId)releaseV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,correlationId:input.correlationId,telemetry:input.telemetry});}
 }
 
-export function convergeBlockedRepositionOrphanChild(input:{repo:SqliteLedgerRepository;sourceLadderId:string;nowMs?:number}){
+const repositionAllowanceBlockers = new Set([
+  "REPOSITION_ERC20_EXACT_ALLOWANCE_REQUIRED",
+  "REPOSITION_PERMIT2_EXACT_ALLOWANCE_REQUIRED",
+]);
+
+export async function v4BidLadderRepositionContinuationEligibility(input:{
+  repo:SqliteLedgerRepository;
+  rpc:FallbackRpc;
+  ladderId:string;
+  wallet:Address;
+  context?:()=>Promise<LadderLiveContext>;
+  nowMs?:number;
+  leaseOwnerId?:string;
+  readWalletBalance?:()=>Promise<bigint>;
+  readAllowanceReadiness?:()=>Promise<{ready:boolean;blockers:readonly string[]}>;
+}) {
+  const reset=input.repo.loadBidLadderUsdReset(input.ladderId);
+  if(String(reset?.block_reason)==='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED'){
+    const eligibility=await v4BidLadderRepositionResumeEligibility(input);
+    return {...eligibility,mode:'JIT_RESUME' as const};
+  }
+  const now=input.nowMs??Date.now(),source=input.repo.loadBidLadder(input.ladderId),blockers:string[]=[];
+  if(String(source?.status)!=='CLOSED'||String(source?.close_provenance)!=='FUNI_EXECUTED')blockers.push('REPOSITION_CONTINUE_SOURCE_NOT_CANONICALLY_CLOSED');
+  if(String(reset?.phase)!=='BLOCKED')blockers.push('REPOSITION_CONTINUE_SOURCE_NOT_BLOCKED');
+  if(String(reset?.block_reason)!=='REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED')blockers.push('REPOSITION_CONTINUE_BLOCK_REASON_NOT_APPROVAL_REQUIRED');
+  if(!manualAuthorization(reset?.close_workflow_identity))blockers.push('REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING');
+  const principal=BigInt(String(reset?.returned_usdg_principal_raw??'0')),targetPrincipal=BigInt(String(reset?.returned_target_principal_raw??'-1'));
+  if(principal<=0n)blockers.push('REPOSITION_CONTINUE_PRINCIPAL_MISSING');
+  if(targetPrincipal!==0n)blockers.push('REPOSITION_CONTINUE_TARGET_PRINCIPAL_CONVERSION_REQUIRED');
+  if(reset?.next_ladder_id||reset?.reopen_workflow_identity)blockers.push('REPOSITION_CONTINUE_ACTIVE_CHILD_EXISTS');
+  const children=Number((input.repo.db.prepare("SELECT COUNT(*) count FROM v4_bid_ladder_usdg_reset_v1 WHERE previous_ladder_id=?").get(input.ladderId) as {count:number}).count);
+  if(children!==0)blockers.push('REPOSITION_CONTINUE_CHILD_HISTORY_UNEXPECTED');
+  const closeRows=input.repo.db.prepare("SELECT status,receipt_json,expected_hash FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' ORDER BY attempt").all(CHAIN_ID,input.ladderId) as Array<Record<string,unknown>>;
+  if(closeRows.length!==1||String(closeRows[0]?.status)!=='CONFIRMED'||!closeRows[0]?.receipt_json)blockers.push('REPOSITION_CONTINUE_CLOSE_RECEIPT_NOT_EXACTLY_ONCE');
+  else try{const receipt=receiptJson(closeRows[0]!.receipt_json);if(receipt.status!=='success'||!same(receipt.transactionHash,String(closeRows[0]!.expected_hash)))blockers.push('REPOSITION_CONTINUE_CLOSE_RECEIPT_INVALID');}catch{blockers.push('REPOSITION_CONTINUE_CLOSE_RECEIPT_INVALID');}
+  const unresolved=Number((input.repo.db.prepare("SELECT COUNT(*) count FROM chain_transaction_journal WHERE chain_id=? AND lower(wallet_address)=? AND status IN ('PREPARED','SUBMITTED')").get(CHAIN_ID,input.wallet.toLowerCase()) as {count:number}).count);
+  if(unresolved)blockers.push('REPOSITION_CONTINUE_UNRESOLVED_WALLET_TRANSACTION');
+  if(input.repo.db.prepare("SELECT 1 FROM chain_nonce_mutex WHERE chain_id=? AND lower(wallet_address)=? AND expires_at>?").get(CHAIN_ID,input.wallet.toLowerCase(),new Date(now).toISOString())||input.repo.db.prepare("SELECT 1 FROM nonce_mutex WHERE lower(wallet)=? AND expires_at>?").get(input.wallet.toLowerCase(),new Date(now).toISOString()))blockers.push('REPOSITION_CONTINUE_NONCE_MUTEX_HELD');
+  const lease=input.repo.db.prepare("SELECT owner_id FROM v4_bid_ladder_usdg_reset_execution_leases WHERE ladder_id=? AND lease_until_ms>?").get(input.ladderId,now) as {owner_id:string}|undefined;
+  if(lease&&lease.owner_id!==input.leaseOwnerId)blockers.push('REPOSITION_CONTINUE_ACTIVE_LEASE');
+  let nonce:{latest:number;pending:number}|undefined;
+  try{const truth=await nonceTruth(input.repo,input.rpc,input.wallet,now);nonce={latest:truth.latest,pending:truth.pending};if(truth.latest!==truth.pending)blockers.push('REPOSITION_CONTINUE_NONCE_AMBIGUOUS');}catch{blockers.push('REPOSITION_CONTINUE_NONCE_EVIDENCE_UNAVAILABLE');}
+  let walletBalance=0n;
+  try{walletBalance=input.readWalletBalance?await input.readWalletBalance():await input.rpc.withClient(client=>client.readContract({address:getAddress(String(source?.funding_token)),abi:erc20Abi,functionName:'balanceOf',args:[input.wallet]}),{stage:'reposition_continue_eligibility',method:'ERC20.balanceOf'});if(walletBalance<principal)blockers.push('REPOSITION_CONTINUE_PRINCIPAL_BALANCE_INSUFFICIENT');}catch{blockers.push('REPOSITION_CONTINUE_PRINCIPAL_BALANCE_UNAVAILABLE');}
+  let allowance:{ready:boolean;blockers:readonly string[]}|undefined;
+  try{allowance=input.readAllowanceReadiness?await input.readAllowanceReadiness():input.context?await v4BidLadderFundingAllowanceReadiness({...(await input.context()),fundingAmount:principal}):undefined;if(!allowance?.ready)blockers.push(...(allowance?.blockers??['REPOSITION_CONTINUE_ALLOWANCE_EVIDENCE_UNAVAILABLE']));}catch{blockers.push('REPOSITION_CONTINUE_ALLOWANCE_EVIDENCE_UNAVAILABLE');}
+  return {eligible:blockers.length===0,mode:'FIRST_CHILD' as const,ladderId:input.ladderId,rootLadderId:String(reset?.root_ladder_id??''),sourceGeneration:Number(reset?.generation??-1),nextGeneration:Number(reset?.generation??0)+1,principalRaw:principal.toString(),walletBalanceRaw:walletBalance.toString(),allowanceReady:Boolean(allowance?.ready),nonce,blockers:[...new Set(blockers)],signingCount:0,broadcastCount:0};
+}
+
+/** Explicit operator healer. It owns one lease from allowance preparation
+ * through the same canonical child/open executor used by hot and recovery. */
+export async function prepareAllowanceAndContinueV4BidLadderReposition(
+  input: V4BidLadderUsdResetCycleInput & { ladderId:string },
+) {
+  const now=(input.nowMs??Date.now)(),correlationId=input.correlationId??`reposition-continue:${input.ladderId}:${randomUUID()}`,ownerId=input.executionOwnerId??correlationId,leaseMs=input.executionLeaseMs??REPOSITION_EXECUTION_LEASE_MS,
+    acquired=acquireV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,callerSource:'USER_CONFIRM',nowMs:now,leaseMs,correlationId,telemetry:input.telemetry});
+  if(acquired.result!=='ACQUIRED')throw new Error('REPOSITION_CONTINUE_ALREADY_PROGRESSING');
+  const ownedInput:V4BidLadderUsdResetCycleInput={...input,correlationId,callerSource:'USER_CONFIRM',executionOwnerId:ownerId,executionLease:{ownerId,leaseMs}};
+  try{
+    const principal=BigInt(String(input.repo.loadBidLadderUsdReset(input.ladderId)?.returned_usdg_principal_raw??'0')),
+      eligibility=await v4BidLadderRepositionContinuationEligibility({repo:input.repo,rpc:input.rpc,ladderId:input.ladderId,wallet:input.wallet,context:()=>repositionContext(ownedInput,input.ladderId),nowMs:now,leaseOwnerId:ownerId,readWalletBalance:input.readWalletBalance,readAllowanceReadiness:input.readAllowanceReadiness?async()=>input.readAllowanceReadiness!({...await repositionContext(ownedInput,input.ladderId),fundingAmount:principal}):undefined});
+    const nonAllowance=eligibility.blockers.filter(blocker=>!repositionAllowanceBlockers.has(blocker));
+    if(nonAllowance.length)throw new Error(`REPOSITION_CONTINUE_NOT_ELIGIBLE:${nonAllowance.join(',')}`);
+    const liveContext=await repositionContext(ownedInput,input.ladderId),approvalIdentity=`g${eligibility.nextGeneration}`,
+      preparation=await (input.prepareAllowance??prepareV4BidLadderFundingAllowance)({...liveContext,walletClient:input.walletClient(),fundingAmount:BigInt(eligibility.principalRaw),approvalIdentity}),
+      fresh=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...await repositionContext(ownedInput,input.ladderId),fundingAmount:BigInt(eligibility.principalRaw)});
+    if(!fresh.ready)throw new Error(`REPOSITION_ALLOWANCE_PREPARATION_INCOMPLETE:${fresh.blockers.join(',')}`);
+    if(eligibility.mode==='FIRST_CHILD'){
+      const transition=transitionV4BidLadderUsdResetOnce({repo:input.repo,ladderId:input.ladderId,from:'BLOCKED',to:'PRINCIPAL_RECONCILED',blockReason:null,nowMs:now,correlationId,telemetry:input.telemetry});
+      if(transition.result!=='APPLIED')throw new Error('REPOSITION_CONTINUE_STATE_CHANGED');
+    }else{
+      await resumeV4BidLadderReposition({repo:input.repo,rpc:input.rpc,ladderId:input.ladderId,wallet:input.wallet,context:()=>repositionContext(ownedInput,input.ladderId),nowMs:now,executionOwnerId:ownerId,correlationId,telemetry:input.telemetry});
+    }
+    const continuation=await processV4BidLadderUsdResetOwned(ownedInput,input.ladderId);
+    return {status:'REPOSITION_ALLOWANCE_PREPARED_AND_CONTINUED' as const,mode:eligibility.mode,correlationId,approvalIdentity,preparation,continuation};
+  }finally{releaseV4BidLadderRepositionLease({repo:input.repo,ladderId:input.ladderId,ownerId,correlationId,telemetry:input.telemetry});}
+}
+
+export function convergeBlockedRepositionOrphanChild(input:{repo:SqliteLedgerRepository;sourceLadderId:string;nowMs?:number;correlationId?:string;telemetry?:(event:Record<string,unknown>)=>void}){
   const source=input.repo.loadBidLadderUsdReset(input.sourceLadderId),childId=source?activeRepositionChildId(source):undefined;
   if(!source||String(source.phase)!=='BLOCKED'||!childId)return {status:'NOT_ELIGIBLE' as const,sourceLadderId:input.sourceLadderId};
   const child=input.repo.loadBidLadder(childId),childReset=input.repo.loadBidLadderUsdReset(childId),legs=input.repo.listBidLadderLegs(childId),openBatch=input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='OPEN_BATCH' LIMIT 1").get(CHAIN_ID,childId),pending=input.repo.db.prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND status IN ('PREPARED','SUBMITTED') LIMIT 1").get(CHAIN_ID,childId);
   if(String(child?.status)==='CANCELLED'&&String(childReset?.phase)==='BLOCKED')return {status:'ALREADY_CONVERGED' as const,sourceLadderId:input.sourceLadderId,childId};
   if(!child||String(child.status)!=='PLANNED'||String(childReset?.phase)!=='OPEN_PENDING'||legs.length!==5||legs.some(leg=>String(leg.status)!=='PLANNED'||leg.token_id||leg.open_batch_id)||openBatch||pending)return {status:'UNSAFE_TO_CONVERGE' as const,sourceLadderId:input.sourceLadderId,childId};
   const now=input.nowMs??Date.now(),reason=`REPOSITION_SOURCE_BLOCKED_PRE_OPEN:${String(source.root_ladder_id)}:${String(childReset?.generation)}:${String(source.block_reason??'UNKNOWN')}`;
-  input.repo.db.transaction(()=>{if(input.repo.db.prepare("UPDATE v4_bid_ladders SET status='CANCELLED',terminal_reason=?,terminal_at_ms=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED'").run(reason,now,now,childId).changes!==1)throw new Error('REPOSITION_ORPHAN_CHILD_CONVERGENCE_CONFLICT');if(input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET status='CANCELLED',updated_at_ms=? WHERE ladder_id=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL").run(now,childId).changes!==5)throw new Error('REPOSITION_ORPHAN_CHILD_CONVERGENCE_CONFLICT');input.repo.transitionBidLadderUsdReset({ladderId:childId,from:'OPEN_PENDING',to:'BLOCKED',blockReason:reason,nowMs:now});})();
+  repositionPersistence({repo:input.repo,ladderId:input.sourceLadderId,operation:'v4_bid_ladder_reposition_orphan_convergence_commit',semanticStage:'REPOSITION_CHILD_TERMINAL',correlationId:input.correlationId,telemetry:input.telemetry,run:()=>input.repo.db.transaction(()=>{if(input.repo.db.prepare("UPDATE v4_bid_ladders SET status='CANCELLED',terminal_reason=?,terminal_at_ms=?,updated_at_ms=?,revision=revision+1 WHERE ladder_id=? AND status='PLANNED'").run(reason,now,now,childId).changes!==1)throw new Error('REPOSITION_ORPHAN_CHILD_CONVERGENCE_CONFLICT');if(input.repo.db.prepare("UPDATE v4_bid_ladder_legs SET status='CANCELLED',updated_at_ms=? WHERE ladder_id=? AND status='PLANNED' AND token_id IS NULL AND open_batch_id IS NULL").run(now,childId).changes!==5)throw new Error('REPOSITION_ORPHAN_CHILD_CONVERGENCE_CONFLICT');input.repo.transitionBidLadderUsdReset({ladderId:childId,from:'OPEN_PENDING',to:'BLOCKED',blockReason:reason,nowMs:now});})()});
   return {status:'CONVERGED' as const,sourceLadderId:input.sourceLadderId,childId,rootLadderId:String(source.root_ladder_id),generation:Number(childReset?.generation),blockReason:String(source.block_reason??'UNKNOWN')};
 }
 
@@ -1041,16 +1350,23 @@ function convergeInvalidV4BidLadderUsdResetParentState(
   const phase = String(reset.phase) as V4BidLadderUsdResetPhase,
     parentStatus = String(parent.status),
     policy = v4BidLadderUsdResetParentStatePolicy(phase, parentStatus);
+  if (parentStatus === "CLOSED" && ["CLOSE_PREPARED","CLOSE_SUBMITTED"].includes(phase)) {
+    const journal = input.repo.db.prepare("SELECT status FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' ORDER BY attempt DESC LIMIT 1").get(CHAIN_ID,ladderId) as {status:string}|undefined;
+    if (String(journal?.status) === "CONFIRMED") {
+      try {
+        convergeConfirmedV4BidLadderRepositionClose({repo:input.repo,ladderId,nowMs,correlationId:input.correlationId,telemetry:input.telemetry});
+        return undefined;
+      } catch (error) {
+        const reason = `REPOSITION_CLOSE_CONFIRMATION_AUTHORITY_INVALID:${error instanceof Error ? error.message : "UNKNOWN"}`;
+        transitionV4BidLadderUsdResetOnce({repo:input.repo,ladderId,from:phase,to:"BLOCKED",blockReason:reason,nowMs,correlationId:input.correlationId,telemetry:input.telemetry});
+        return {status:"BLOCKED" as const,ladderId,reason,parentState:policy};
+      }
+    }
+  }
   if (policy.valid) return undefined;
 
   const block = (reason: string) => {
-    input.repo.transitionBidLadderUsdReset({
-      ladderId,
-      from: phase,
-      to: "BLOCKED",
-      blockReason: reason,
-      nowMs,
-    });
+    transitionV4BidLadderUsdResetOnce({repo:input.repo,ladderId,from:phase,to:"BLOCKED",blockReason:reason,nowMs,correlationId:input.correlationId,telemetry:input.telemetry});
     return { status: "BLOCKED" as const, ladderId, reason, parentState: policy };
   };
 
@@ -1062,13 +1378,14 @@ function convergeInvalidV4BidLadderUsdResetParentState(
       confirmedCloseJournal(input.repo, ladderId);
       if (!manualAuthorization(reset.close_workflow_identity))
         return block("REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING");
-      input.repo.transitionBidLadderUsdReset({
+      transitionV4BidLadderUsdResetOnce({repo:input.repo,
         ladderId,
         from: "CLOSE_PREPARED",
         to: "CLOSE_CONFIRMED",
         closeReason: "USDG_RESET_REPOSITION",
         closeWorkflowIdentity: String(reset.close_workflow_identity),
         nowMs,
+        correlationId:input.correlationId,telemetry:input.telemetry,
       });
       return undefined;
     } catch (error) {
@@ -1084,13 +1401,14 @@ function convergeInvalidV4BidLadderUsdResetParentState(
       provenance === "EXTERNAL_OPERATOR_CLOSE" ||
       (provenance === "FUNI_EXECUTED" && !manualAuthorization(reset.close_workflow_identity))
     ) {
-      input.repo.transitionBidLadderUsdReset({
+      transitionV4BidLadderUsdResetOnce({repo:input.repo,
         ladderId,
         from: phase,
         to: "OPERATOR_CLOSED",
         closeReason: "NORMAL_OPERATOR_CLOSE",
         closeWorkflowIdentity: ladderId,
         nowMs,
+        correlationId:input.correlationId,telemetry:input.telemetry,
       });
       return {
         status: "OPERATOR_CLOSED" as const,
@@ -1131,7 +1449,15 @@ export async function processV4BidLadderUsdReset(
   input: V4BidLadderUsdResetCycleInput,
   ladderId: string,
 ) {
-  const reset = input.repo.loadBidLadderUsdReset(ladderId),
+  const reset = withSqliteTransientRetrySync({
+      operation: "v4_bid_ladder_reposition_dispatch_authority_read",
+      run: () => input.repo.loadBidLadderUsdReset(ladderId),
+      onEvent: event => repositionTelemetry(input, {
+        ladderId,
+        semanticStage: "REPOSITION_AUTHORITY_READ",
+        ...event,
+      }),
+    }),
     phase = String(reset?.phase ?? "MISSING"),
     terminal = ["COMPLETED", "BLOCKED", "OPERATOR_CLOSED"].includes(phase),
     needsOwnership = Boolean(input.manualAuthorizationIdentity) || [
@@ -1145,7 +1471,8 @@ export async function processV4BidLadderUsdReset(
     ].includes(phase);
   if (!reset || terminal || !needsOwnership)
     return processV4BidLadderUsdResetOwned(input, ladderId);
-  const ownerId = input.executionOwnerId ?? `reposition:${process.pid}:${randomUUID()}`,
+  const correlationId=input.correlationId??ladderId,
+    ownerId = input.executionOwnerId ?? `reposition:${process.pid}:${randomUUID()}`,
     callerSource = input.callerSource ?? (input.manualAuthorizationIdentity ? "USER_CONFIRM" : "PERIODIC_RECOVERY"),
     leaseMs = input.executionLeaseMs ?? REPOSITION_EXECUTION_LEASE_MS,
     now = (input.nowMs ?? Date.now)(),
@@ -1156,6 +1483,8 @@ export async function processV4BidLadderUsdReset(
       callerSource,
       nowMs: now,
       leaseMs,
+      correlationId,
+      telemetry: input.telemetry,
     });
   repositionTelemetry(input, {
     ladderId,
@@ -1180,6 +1509,7 @@ export async function processV4BidLadderUsdReset(
     };
   const ownedInput: V4BidLadderUsdResetCycleInput = {
       ...input,
+      correlationId,
       callerSource,
       executionOwnerId: ownerId,
       executionLease: { ownerId, leaseMs },
@@ -1192,6 +1522,8 @@ export async function processV4BidLadderUsdReset(
         ownerId,
         nowMs: (input.nowMs ?? Date.now)(),
         leaseMs,
+        correlationId,
+        telemetry: input.telemetry,
       });
       if (!renewed) clearInterval(heartbeat);
     }, heartbeatMs);
@@ -1200,7 +1532,7 @@ export async function processV4BidLadderUsdReset(
     return await processV4BidLadderUsdResetOwned(ownedInput, ladderId);
   } finally {
     clearInterval(heartbeat);
-    releaseV4BidLadderRepositionLease({ repo: input.repo, ladderId, ownerId });
+    releaseV4BidLadderRepositionLease({ repo: input.repo, ladderId, ownerId, correlationId, telemetry: input.telemetry });
   }
 }
 
@@ -1210,12 +1542,14 @@ async function processV4BidLadderUsdResetOwned(
 ) {
   const now = (input.nowMs ?? Date.now)();
   const confirmAtMs=input.confirmAtMs??now,componentStartedAtMs=Date.now();
-  let preflightEndedAtMs:number|undefined,closeConfirmedAtMs:number|undefined,principalReconciledAtMs:number|undefined,childPlannedAtMs:number|undefined;
+  let preflightEndedAtMs:number|undefined,closeConfirmedAtMs:number|undefined,nextStageStartedAtMs:number|undefined,principalReconciledAtMs:number|undefined,childPlannedAtMs:number|undefined;
   let reset = input.repo.loadBidLadderUsdReset(ladderId);
   if (!reset) return { status: "DISABLED" as const, ladderId };
   if (["COMPLETED", "BLOCKED", "OPERATOR_CLOSED"].includes(String(reset.phase))) {
-    const orphan=String(reset.phase)==='BLOCKED'?convergeBlockedRepositionOrphanChild({repo:input.repo,sourceLadderId:ladderId,nowMs:now}):undefined;
-    return { status: String(reset.phase), ladderId, ...(orphan?{orphan}: {}) };
+    const orphan=String(reset.phase)==='BLOCKED'?convergeBlockedRepositionOrphanChild({repo:input.repo,sourceLadderId:ladderId,nowMs:now,correlationId:input.correlationId,telemetry:input.telemetry}):undefined;
+    const childId=activeRepositionChildId(reset),child=childId?input.repo.loadBidLadder(childId):undefined,
+      semantics=classifyV4BidLadderRepositionState({parentStatus:String(input.repo.loadBidLadder(ladderId)?.status??'CANCELLED') as V4BidLadderParentStatus,phase:String(reset.phase) as V4BidLadderUsdResetPhase,childState:!childId?'NONE':String(child?.status)==='CANCELLED'?'CANCELLED':String(child?.status)==='OPEN'?'OPEN':String(child?.status)==='PLANNED'?'PLANNED':'BLOCKED',approvalReadiness:'UNKNOWN',journalState:'NONE',leaseState:'OWNED',blockReason:String(reset.block_reason??'')});
+    return { status: String(reset.phase), ladderId, reason:reset.block_reason,semantics, ...(orphan?{orphan}: {}) };
   }
   assertV4BidLadderRepositionLease(input, ladderId);
   const parentConvergence = convergeInvalidV4BidLadderUsdResetParentState(
@@ -1245,7 +1579,7 @@ async function processV4BidLadderUsdResetOwned(
       };
     if (!manualAuthorization(input.manualAuthorizationIdentity))
       throw new Error("REPOSITION_MANUAL_AUTHORIZATION_INVALID");
-    const sourceContext=await input.context(ladderId),allowance=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...sourceContext,fundingAmount:first.usdgPrincipal});
+    const sourceContext=await repositionContext(input,ladderId),allowance=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...sourceContext,fundingAmount:first.usdgPrincipal});
     if(!allowance.ready)return {status:'PREPARE_ALLOWANCE_REQUIRED' as const,ladderId,blockers:allowance.blockers,signingUsed:false,broadcastUsed:false};
     notifyWithoutBlocking(input,`USDG Reset Reposition · READY\nOld ladder: ${ladderId}\nPrincipal: USDG-only\nDepth retained: -${input.repo.v4BidLadderStrategyDepthBps(ladderId) / 100}%`);
     assertV4BidLadderRepositionLease(input, ladderId);
@@ -1255,6 +1589,9 @@ async function processV4BidLadderUsdResetOwned(
       closeReason: "USDG_RESET_REPOSITION",
       manualRepositionAuthorization: input.manualAuthorizationIdentity,
     });
+    const postClose = input.repo.loadBidLadderUsdReset(ladderId);
+    if (["CLOSE_PREPARED","CLOSE_SUBMITTED"].includes(String(postClose?.phase)) && String(input.repo.loadBidLadder(ladderId)?.status) === "CLOSED")
+      convergeConfirmedV4BidLadderRepositionClose({repo:input.repo,ladderId,nowMs:(input.nowMs??Date.now)(),correlationId:input.correlationId,telemetry:input.telemetry});
     const closeJournal=input.repo.db.prepare("SELECT confirmed_at FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' AND status='CONFIRMED' ORDER BY attempt DESC LIMIT 1").get(CHAIN_ID,ladderId) as {confirmed_at:string}|undefined;
     closeConfirmedAtMs=closeJournal?.confirmed_at?Date.parse(closeJournal.confirmed_at):Date.now();
     reset = input.repo.loadBidLadderUsdReset(ladderId);
@@ -1280,14 +1617,19 @@ async function processV4BidLadderUsdResetOwned(
         "SELECT status,receipt_json FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' ORDER BY attempt DESC LIMIT 1",
       )
       .get(CHAIN_ID, ladderId) as Record<string, unknown> | undefined;
+    if (!failed) {
+      transitionV4BidLadderUsdResetOnce({repo:input.repo,ladderId,from:String(reset!.phase) as V4BidLadderUsdResetPhase,to:"BLOCKED",blockReason:"REPOSITION_CLOSE_JOURNAL_MISSING",correlationId:input.correlationId,telemetry:input.telemetry});
+      return {status:"BLOCKED" as const,ladderId,reason:"REPOSITION_CLOSE_JOURNAL_MISSING"};
+    }
     if (String(failed?.status) === "FAILED") {
-      input.repo.transitionBidLadderUsdReset({
+      transitionV4BidLadderUsdResetOnce({repo:input.repo,
         ladderId,
         from: String(reset!.phase) as V4BidLadderUsdResetPhase,
         to: "BLOCKED",
         blockReason: failed?.receipt_json
           ? "REPOSITION_CLOSE_CONFIRMED_REVERT"
           : "REPOSITION_CLOSE_FAILED_WITHOUT_FINAL_RECEIPT",
+        correlationId:input.correlationId,telemetry:input.telemetry,
       });
       return {
         status: "BLOCKED" as const,
@@ -1297,18 +1639,36 @@ async function processV4BidLadderUsdResetOwned(
           : "REPOSITION_CLOSE_FAILED_WITHOUT_FINAL_RECEIPT",
       };
     }
-    assertV4BidLadderRepositionLease(input, ladderId);
-    await (input.executeClose ?? executeV4BidLadderManualClose)({
-      ...(await input.context(ladderId)),
-      walletClient: input.walletClient(),
-      closeReason: "USDG_RESET_REPOSITION",
-    });
+    if (String(failed.status) === "CONFIRMED") {
+      if (String(input.repo.loadBidLadder(ladderId)?.status) !== "CLOSED")
+        return {status:"AUTOMATIC_RECOVERY_ACTIVE" as const,ladderId,reason:"REPOSITION_WAITING_FOR_CLOSE_CANONICAL_PROJECTION"};
+      convergeConfirmedV4BidLadderRepositionClose({repo:input.repo,ladderId,nowMs:(input.nowMs??Date.now)(),correlationId:input.correlationId,telemetry:input.telemetry});
+    }
+    else {
+      assertV4BidLadderRepositionLease(input, ladderId);
+      await (input.executeClose ?? executeV4BidLadderManualClose)({
+        ...(await repositionContext(input,ladderId)),
+        walletClient: input.walletClient(),
+        closeReason: "USDG_RESET_REPOSITION",
+      });
+      const postClose=input.repo.loadBidLadderUsdReset(ladderId);
+      if (["CLOSE_PREPARED","CLOSE_SUBMITTED"].includes(String(postClose?.phase)) && String(input.repo.loadBidLadder(ladderId)?.status) === "CLOSED")
+        convergeConfirmedV4BidLadderRepositionClose({repo:input.repo,ladderId,nowMs:(input.nowMs??Date.now)(),correlationId:input.correlationId,telemetry:input.telemetry});
+    }
     reset = input.repo.loadBidLadderUsdReset(ladderId);
     if (input.returnAfterCloseReceipt && confirmedCloseReceiptExists(input.repo, ladderId))
       return { status: "CLOSE_CONFIRMED_PREPARING_REPLACEMENT" as const, ladderId, durableContinuation: true as const };
   }
   if (String(reset?.phase) === "CLOSE_CONFIRMED") {
     assertV4BidLadderRepositionLease(input, ladderId);
+    nextStageStartedAtMs=Date.now();
+    repositionTelemetry(input,{
+      ladderId,
+      generation:Number(reset?.generation??0),
+      semanticStage:"REPOSITION_PRINCIPAL_RECONCILIATION",
+      next_stage_started_at:new Date(nextStageStartedAtMs).toISOString(),
+      projection_to_next_stage_ms:closeConfirmedAtMs===undefined?null:nextStageStartedAtMs-closeConfirmedAtMs,
+    });
     const reconcilePrincipal = input.reconcilePrincipal ?? reconcileV4BidLadderUsdResetPrincipal,
       amounts = await reconcilePrincipal({ ...input, ladderId });
     principalReconciledAtMs=Date.now();
@@ -1334,9 +1694,7 @@ async function processV4BidLadderUsdResetOwned(
   let childId = activeRepositionChildId(reset);
   if(String(reset?.phase)==='PRINCIPAL_RECONCILED'){
     if(!reset) throw new Error('REPOSITION_RESET_NOT_FOUND');
-    if(BigInt(String(reset.returned_target_principal_raw??'-1'))!==0n){input.repo.transitionBidLadderUsdReset({ladderId,from:'PRINCIPAL_RECONCILED',to:'BLOCKED',blockReason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL'});return {status:'BLOCKED' as const,ladderId,reason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL'};}
-    const returned=BigInt(String(reset.returned_usdg_principal_raw??'0')),sourceContext=await input.context(ladderId),allowance=await (input.readAllowanceReadiness??v4BidLadderFundingAllowanceReadiness)({...sourceContext,fundingAmount:returned});
-    if(!allowance.ready){input.repo.transitionBidLadderUsdReset({ladderId,from:'PRINCIPAL_RECONCILED',to:'BLOCKED',blockReason:'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED'});return {status:'BLOCKED' as const,ladderId,reason:'REPOSITION_POST_CONFIRM_APPROVAL_REQUIRED'};}
+    if(BigInt(String(reset.returned_target_principal_raw??'-1'))!==0n){transitionV4BidLadderUsdResetOnce({repo:input.repo,ladderId,from:'PRINCIPAL_RECONCILED',to:'BLOCKED',blockReason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL',correlationId:input.correlationId,telemetry:input.telemetry});return {status:'BLOCKED' as const,ladderId,reason:'REPOSITION_BLOCKED_NON_USDG_PRINCIPAL'};}
   }
   if (String(reset?.phase) === "PRINCIPAL_RECONCILED") {
     try {
@@ -1356,7 +1714,7 @@ async function processV4BidLadderUsdResetOwned(
         errorCode: failure.code,
       });
       if (failure.classification === "RETRYABLE")
-        return { status: "RECOVERY_REQUIRED" as const, ladderId, reason: failure.code };
+        return { status: "AUTOMATIC_RECOVERY_ACTIVE" as const, ladderId, reason: failure.code };
       const blocked = transitionV4BidLadderUsdResetOnce({
         repo: input.repo,
         ladderId,
@@ -1378,14 +1736,18 @@ async function processV4BidLadderUsdResetOwned(
       const executeOpen = input.executeOpen ?? executeV4BidLadderLiveOpen,jitStartedAtMs=(input.nowMs??Date.now)();
       let opened;
       for(;;){
-        try{opened=await executeOpen({...(await input.context(childId)),walletClient:input.walletClient(),requirePreapprovedFunding:true});break;}
+        try{
+          const authorization=assertV4BidLadderReplacementAuthorization({repo:input.repo,sourceLadderId:ladderId,childLadderId:childId});
+          repositionTelemetry(input,{ladderId,childId,rootLadderId:authorization.rootLadderId,generation:authorization.childGeneration,principalRaw:authorization.principal.toString(),retainedDepthBps:authorization.retainedDepthBps,approvalAuthorityBound:true,phaseAtAcquire:String(input.repo.loadBidLadderUsdReset(ladderId)?.phase)});
+          opened=await executeOpen({...(await repositionContext(input,childId)),walletClient:input.walletClient(),requirePreapprovedFunding:false});break;
+        }
         catch(error){
           const message=error instanceof Error?error.message:String(error),failureCode=message.startsWith('V4_BID_LADDER_LEG_NOT_FUNDING_ONLY')?'V4_BID_LADDER_LEG_NOT_FUNDING_ONLY' as const:message.startsWith('V4_BID_LADDER_MINT_ESTIMATE_FAILED')?'V4_BID_LADDER_MINT_ESTIMATE_FAILED' as const:undefined;
           if(!failureCode)throw error;
           const drift=await childFundingOnlyDrift({repo:input.repo,rpc:input.rpc,childId});if(!drift.drifted)throw error;
           assertV4BidLadderRepositionLease(input,ladderId);
           try{
-            const rematerialized=await rematerializeV4BidLadderRepositionChildOnce({repo:input.repo,rpc:input.rpc,ladderId,childId,wallet:input.wallet,nowMs:(input.nowMs??Date.now)(),failureCode,pool:drift.pool});
+            const rematerialized=await rematerializeV4BidLadderRepositionChildOnce({repo:input.repo,rpc:input.rpc,ladderId,childId,wallet:input.wallet,nowMs:(input.nowMs??Date.now)(),failureCode,pool:drift.pool,correlationId:input.correlationId,telemetry:input.telemetry});
             repositionTelemetry(input,{ladderId,childId,generation:Number(input.repo.loadBidLadderUsdReset(childId)?.generation),ownerId:input.executionLease?.ownerId??null,callerSource:input.callerSource??null,jitAttempt:rematerialized.rematerializations,maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,freshReferenceTick:rematerialized.referenceTick,freshReferenceBlock:rematerialized.referenceBlock.toString(),preflightFailureClass:failureCode,elapsedMs:(input.nowMs??Date.now)()-jitStartedAtMs});
           }catch(rematerializationError){
             if(rematerializationError instanceof Error&&rematerializationError.message==='REPOSITION_JIT_REMATERIALIZATION_LIMIT_EXHAUSTED')repositionTelemetry(input,{ladderId,childId,generation:Number(input.repo.loadBidLadderUsdReset(childId)?.generation),ownerId:input.executionLease?.ownerId??null,callerSource:input.callerSource??null,jitAttempt:Number(input.repo.loadBidLadderUsdReset(childId)?.jit_rematerialization_attempts??0),maxJitAttempts:V4_REPOSITION_MAX_JIT_REMATERIALIZATIONS,preflightFailureClass:failureCode,jitBudgetExhausted:true,elapsedMs:(input.nowMs??Date.now)()-jitStartedAtMs});
@@ -1414,7 +1776,7 @@ async function processV4BidLadderUsdResetOwned(
         duplicateNotificationSuppressed: completion.result !== "APPLIED",
       });
       const child = input.repo.loadBidLadderUsdReset(childId);
-      const completedAtMs=Date.now(),journalRows=input.repo.db.prepare("SELECT semantic_stage,created_at,submitted_at,confirmed_at FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity IN (?,?) AND semantic_stage IN ('CLOSE_BATCH','OPEN_ERC20_APPROVAL','OPEN_PERMIT2_APPROVAL','OPEN_BATCH') ORDER BY created_at").all(CHAIN_ID,ladderId,childId) as Array<{semantic_stage:string;created_at:string;submitted_at:string|null;confirmed_at:string|null}>,stage=(name:string)=>journalRows.find(row=>row.semantic_stage===name),close=stage('CLOSE_BATCH'),erc20=stage('OPEN_ERC20_APPROVAL'),permit2=stage('OPEN_PERMIT2_APPROVAL'),open=stage('OPEN_BATCH'),childOpenConfirmedAtMs=open?.confirmed_at?Date.parse(open.confirmed_at):completedAtMs,context={ladderId,childId,confirm_at:confirmAtMs,close_prepare_at:close?.created_at?Date.parse(close.created_at):null,close_submit_at:close?.submitted_at?Date.parse(close.submitted_at):null,close_confirmed_at:closeConfirmedAtMs??(close?.confirmed_at?Date.parse(close.confirmed_at):null),principal_reconciled_at:principalReconciledAtMs??null,child_planned_at:childPlannedAtMs??null,erc20_approval_prepare_at:erc20?.created_at?Date.parse(erc20.created_at):null,erc20_approval_confirmed_at:erc20?.confirmed_at?Date.parse(erc20.confirmed_at):null,permit2_prepare_at:permit2?.created_at?Date.parse(permit2.created_at):null,permit2_confirmed_at:permit2?.confirmed_at?Date.parse(permit2.confirmed_at):null,child_open_prepare_at:open?.created_at?Date.parse(open.created_at):null,child_open_submit_at:open?.submitted_at?Date.parse(open.submitted_at):null,child_open_confirmed_at:childOpenConfirmedAtMs,completed_at:completedAtMs,total_ms:childOpenConfirmedAtMs-confirmAtMs,sla:childOpenConfirmedAtMs-confirmAtMs<10_000?'PASS':'FAIL',preflight_ms:(preflightEndedAtMs??componentStartedAtMs)-componentStartedAtMs,close_ms:(closeConfirmedAtMs??componentStartedAtMs)-(preflightEndedAtMs??componentStartedAtMs),principal_ms:(principalReconciledAtMs??closeConfirmedAtMs??componentStartedAtMs)-(closeConfirmedAtMs??componentStartedAtMs),child_plan_ms:(childPlannedAtMs??principalReconciledAtMs??componentStartedAtMs)-(principalReconciledAtMs??componentStartedAtMs),child_open_ms:childOpenConfirmedAtMs-(childPlannedAtMs??childOpenConfirmedAtMs),internal_orchestration_ms:completedAtMs-componentStartedAtMs};
+      const completedAtMs=Date.now(),journalRows=input.repo.db.prepare("SELECT semantic_stage,created_at,submitted_at,confirmed_at FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity IN (?,?) AND semantic_stage IN ('CLOSE_BATCH','OPEN_ERC20_APPROVAL','OPEN_PERMIT2_APPROVAL','OPEN_BATCH') ORDER BY created_at").all(CHAIN_ID,ladderId,childId) as Array<{semantic_stage:string;created_at:string;submitted_at:string|null;confirmed_at:string|null}>,stage=(name:string)=>journalRows.find(row=>row.semantic_stage===name),close=stage('CLOSE_BATCH'),erc20=stage('OPEN_ERC20_APPROVAL'),permit2=stage('OPEN_PERMIT2_APPROVAL'),open=stage('OPEN_BATCH'),childOpenConfirmedAtMs=open?.confirmed_at?Date.parse(open.confirmed_at):completedAtMs,context={ladderId,childId,confirm_at:confirmAtMs,operator_authority_at:new Date(confirmAtMs).toISOString(),close_prepare_at:close?.created_at?Date.parse(close.created_at):null,close_submit_at:close?.submitted_at?Date.parse(close.submitted_at):null,close_confirmed_at:closeConfirmedAtMs??(close?.confirmed_at?Date.parse(close.confirmed_at):null),next_stage_started_at:nextStageStartedAtMs===undefined?null:new Date(nextStageStartedAtMs).toISOString(),projection_to_next_stage_ms:nextStageStartedAtMs===undefined||closeConfirmedAtMs===undefined?null:nextStageStartedAtMs-closeConfirmedAtMs,principal_reconciled_at:principalReconciledAtMs??null,child_planned_at:childPlannedAtMs??null,erc20_approval_prepare_at:erc20?.created_at?Date.parse(erc20.created_at):null,erc20_approval_confirmed_at:erc20?.confirmed_at?Date.parse(erc20.confirmed_at):null,permit2_prepare_at:permit2?.created_at?Date.parse(permit2.created_at):null,permit2_confirmed_at:permit2?.confirmed_at?Date.parse(permit2.confirmed_at):null,child_open_prepare_at:open?.created_at?Date.parse(open.created_at):null,child_open_submit_at:open?.submitted_at?Date.parse(open.submitted_at):null,child_open_confirmed_at:childOpenConfirmedAtMs,completed_at:completedAtMs,total_ms:childOpenConfirmedAtMs-confirmAtMs,sla:childOpenConfirmedAtMs-confirmAtMs<10_000?'PASS':'FAIL',preflight_ms:(preflightEndedAtMs??componentStartedAtMs)-componentStartedAtMs,close_ms:(closeConfirmedAtMs??componentStartedAtMs)-(preflightEndedAtMs??componentStartedAtMs),principal_ms:(principalReconciledAtMs??closeConfirmedAtMs??componentStartedAtMs)-(closeConfirmedAtMs??componentStartedAtMs),child_plan_ms:(childPlannedAtMs??principalReconciledAtMs??componentStartedAtMs)-(principalReconciledAtMs??componentStartedAtMs),child_open_ms:childOpenConfirmedAtMs-(childPlannedAtMs??childOpenConfirmedAtMs),internal_orchestration_ms:completedAtMs-componentStartedAtMs};
       if(input.confirmAtMs!==undefined)try{input.repo.recordLatency('v4_bid_ladder_reposition_sla',context.total_ms,{context});}catch{}
       if (completion.result === "APPLIED")
         notifyWithoutBlocking(input,`USDG Reset Reposition · OPEN\nNew ladder: ${childId}\nDepth: -${input.repo.v4BidLadderStrategyDepthBps(childId) / 100}%\nGeneration: ${child?.generation}`);
@@ -1422,13 +1784,15 @@ async function processV4BidLadderUsdResetOwned(
     } catch (error) {
       const journal = input.repo.db
         .prepare("SELECT status FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND status IN ('PREPARED','SUBMITTED') LIMIT 1")
-        .get(CHAIN_ID, childId);
-      if (journal) return { status: "RECOVERY_REQUIRED" as const, ladderId, childId };
+        .get(CHAIN_ID, childId) as {status:string}|undefined;
+      const pendingApproval=input.repo.db.prepare("SELECT semantic_stage,status FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage IN ('OPEN_ERC20_APPROVAL','OPEN_PERMIT2_APPROVAL') AND status IN ('PREPARED','SUBMITTED') ORDER BY created_at LIMIT 1").get(CHAIN_ID,childId) as {semantic_stage:string;status:string}|undefined;
+      if(pendingApproval)return {status:"REPLACEMENT_APPROVAL_PREPARING" as const,ladderId,childId,approvalStage:pendingApproval.semantic_stage,journalStatus:pendingApproval.status,durableContinuation:true as const};
+      if (journal) return { status: "AUTOMATIC_RECOVERY_ACTIVE" as const, ladderId, childId, reason:"REPOSITION_OPEN_EXACT_HASH_RECOVERY_PENDING" };
       const confirmed = input.repo.db
         .prepare("SELECT 1 FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage='OPEN_BATCH' AND status='CONFIRMED' LIMIT 1")
         .get(CHAIN_ID, childId);
       if (confirmed)
-        return { status: "RECOVERY_REQUIRED" as const, ladderId, childId };
+        return { status: "AUTOMATIC_RECOVERY_ACTIVE" as const, ladderId, childId };
       const failure = classifyV4BidLadderRepositionExecutionError(error),
         latest = input.repo.loadBidLadderUsdReset(ladderId)!;
       repositionTelemetry(input, {
@@ -1441,7 +1805,7 @@ async function processV4BidLadderUsdResetOwned(
         errorCode: failure.code,
       });
       if (failure.classification === "RETRYABLE")
-        return { status: "RECOVERY_REQUIRED" as const, ladderId, childId, reason: failure.code };
+        return { status: "AUTOMATIC_RECOVERY_ACTIVE" as const, ladderId, childId, reason: failure.code };
       const blocked = ["REOPEN_PLANNED", "REOPEN_PREPARED", "REOPEN_SUBMITTED"].includes(String(latest.phase))
         ? transitionV4BidLadderUsdResetOnce({
           repo: input.repo,
@@ -1453,7 +1817,7 @@ async function processV4BidLadderUsdResetOwned(
         : { result: "ALREADY_ADVANCED" as const, row: latest };
       if (blocked.result !== "APPLIED")
         return { status: "ALREADY_PROGRESSING" as const, ladderId, childId, concurrentConsumerSuppressed: true };
-      const orphan=convergeBlockedRepositionOrphanChild({repo:input.repo,sourceLadderId:ladderId,nowMs:(input.nowMs??Date.now)()});
+      const orphan=convergeBlockedRepositionOrphanChild({repo:input.repo,sourceLadderId:ladderId,nowMs:(input.nowMs??Date.now)(),correlationId:input.correlationId,telemetry:input.telemetry});
       await input.notify?.(`USDG Reset Reposition · BLOCKED\nReason: ${failure.code}`);
       return { status: "BLOCKED" as const, ladderId, childId, reason: failure.code, orphan };
     }
@@ -1466,7 +1830,7 @@ const terminalResetPhases = new Set(["COMPLETED", "BLOCKED", "OPERATOR_CLOSED"])
 export function classifyV4BidLadderUsdResetCandidateError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error),
     code = (message.split(":", 1)[0] || "REPOSITION_CANDIDATE_UNKNOWN_ERROR").slice(0, 160),
-    deterministic = /(?:DURABLE_MANUAL_AUTHORIZATION|PARENT_STATE_INVALID|SOURCE_LADDER_CANCELLED|POOL_IDENTITY_MISMATCH|FUNDING_NOT_USDG|LEG_SET_INVALID|TOKEN_METADATA_INVALID|PRINCIPAL_EXCEEDS_RECEIPT_TRANSFER|CLOSE_PREPARED_EVIDENCE_MISSING|CLOSE_RECEIPT_INVALID|CLOSE_NOT_FIVE_LEGS|NATIVE_TRANSFER_UNSUPPORTED|CHILD_MISSING|SAME_BLOCK_LATER_SWAP_AMBIGUOUS|EXECUTION_PRICE_EVIDENCE_MISMATCH)/.test(
+    deterministic = /(?:DURABLE_MANUAL_AUTHORIZATION|PARENT_STATE_INVALID|SOURCE_LADDER_CANCELLED|POOL_IDENTITY_MISMATCH|FUNDING_NOT_USDG|LEG_SET_INVALID|TOKEN_METADATA_INVALID|PRINCIPAL_EXCEEDS_RECEIPT_TRANSFER|CLOSE_(?:PREPARED_EVIDENCE_MISSING|RECEIPT_INVALID|NOT_FIVE_LEGS|JOURNAL_MISSING|JOURNAL_CONFLICT|WORKFLOW_IDENTITY_MISMATCH|CONFIRMED_REVERT|RECEIPT_HASH_OR_PREPARED_EVIDENCE_MISMATCH)|NATIVE_TRANSFER_UNSUPPORTED|CHILD_MISSING|SAME_BLOCK_LATER_SWAP_AMBIGUOUS|EXECUTION_PRICE_EVIDENCE_MISMATCH)/.test(
       code,
     );
   return {
@@ -1506,7 +1870,7 @@ export async function runV4BidLadderUsdResetCycle(input: V4BidLadderUsdResetCycl
       const result = await processV4BidLadderUsdReset(input, ladderId),
         latest = input.repo.loadBidLadderUsdReset(ladderId),
         nonterminal = latest && !terminalResetPhases.has(String(latest.phase)),
-        retryReason = String(result.status) === "RECOVERY_REQUIRED"
+        retryReason = ["RECOVERY_REQUIRED","AUTOMATIC_RECOVERY_ACTIVE"].includes(String(result.status))
           ? "REPOSITION_RECOVERY_REQUIRED"
           : null,
         rotated = nonterminal

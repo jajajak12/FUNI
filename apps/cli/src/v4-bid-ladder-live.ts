@@ -180,6 +180,9 @@ export type LadderLiveContext = {
   entryPriceFetch?: Parameters<typeof freshLpEntryPriceGuard>[0]["fetch"];
   marketCapEvidence?: V4BidLadderMarketCapEvidence;
   nowMs?: () => number;
+  /** Authority timestamp supplied by an interactive caller when available. */
+  operatorAuthorityAtMs?: number;
+  canonicalProjectionLane?: "FOREGROUND" | "RECOVERY";
   telemetry?: (event: string, data: Record<string, unknown>) => void;
 };
 export type V4BidLadderGasProjection = {
@@ -431,6 +434,60 @@ function journalRow(
       "SELECT * FROM chain_transaction_journal WHERE chain_id=? AND workflow_identity=? AND semantic_stage=? ORDER BY attempt DESC LIMIT 1",
     )
     .get(CHAIN_ID, ladderId, stage) as Record<string, unknown> | undefined;
+}
+
+/** Canonical receipt-to-Reposition phase convergence. This is deliberately
+ * SQLite-only: callers must release it before principal RPC proof or OPEN work. */
+export function convergeConfirmedV4BidLadderRepositionClose(input: {
+  repo: SqliteLedgerRepository;
+  ladderId: string;
+  nowMs?: number;
+  correlationId?: string;
+  telemetry?: (event: Record<string, unknown>) => void;
+}): { result: "APPLIED" | "ALREADY_ADVANCED"; row: Record<string,unknown>; transactionHash: Hash; closeReason: "USDG_RESET_REPOSITION" } {
+  return withEconomicForegroundPersistenceSync({
+    databasePath: input.repo.path,
+    component: "v4-bid-ladder-reposition",
+    operation: "v4_bid_ladder_reposition_close_confirmed_cas",
+    workflow: input.ladderId,
+    semanticStage: "CLOSE_BATCH",
+    onTelemetry: (event) => input.telemetry?.({event:"sqlite_write_window",correlationId:input.correlationId??input.ladderId,...event}),
+    run: () => input.repo.db.transaction(() => {
+      const parent = input.repo.loadBidLadder(input.ladderId),
+        reset = input.repo.loadBidLadderUsdReset(input.ladderId),
+        phase = String(reset?.phase ?? "MISSING"),
+        convergedPhases = new Set(["CLOSE_CONFIRMED","PRINCIPAL_RECONCILED","REOPEN_PLANNED","REOPEN_PREPARED","REOPEN_SUBMITTED","COMPLETED"]);
+      if (!parent || !reset) throw new Error("REPOSITION_CLOSE_STATE_MISSING");
+      if (!["CLOSE_PREPARED","CLOSE_SUBMITTED"].includes(phase) && !convergedPhases.has(phase))
+        throw new Error(`REPOSITION_CLOSE_CONFIRM_PHASE_INVALID:${phase}`);
+      if (String(parent.status) !== "CLOSED" || String(parent.close_provenance) !== "FUNI_EXECUTED" || String(parent.terminal_provenance) !== "FUNI_AUTHORED_CLOSE_BATCH")
+        throw new Error("REPOSITION_CLOSE_PARENT_NOT_CANONICALLY_CLOSED");
+      if (String(reset.policy) !== "USDG_RESET_REPOSITION_V1" || !isManualRepositionAuthorization(reset.close_workflow_identity) || (reset.close_reason !== null && String(reset.close_reason) !== "USDG_RESET_REPOSITION"))
+        throw new Error("REPOSITION_DURABLE_MANUAL_AUTHORIZATION_MISSING");
+      const rows = input.repo.db.prepare("SELECT * FROM chain_transaction_journal WHERE chain_id=? AND semantic_stage='CLOSE_BATCH' AND (workflow_identity=? OR journal_id LIKE ?) ORDER BY attempt").all(CHAIN_ID,input.ladderId,`${input.ladderId}:CLOSE_BATCH:%`) as Record<string,unknown>[];
+      if (rows.length === 0) throw new Error("REPOSITION_CLOSE_JOURNAL_MISSING");
+      if (rows.length !== 1) throw new Error("REPOSITION_CLOSE_JOURNAL_CONFLICT");
+      const row = rows[0]!;
+      if (Number(row.chain_id) !== CHAIN_ID || String(row.workflow_identity) !== input.ladderId || String(row.semantic_stage) !== "CLOSE_BATCH")
+        throw new Error("REPOSITION_CLOSE_WORKFLOW_IDENTITY_MISMATCH");
+      if (String(row.status) !== "CONFIRMED" || !row.receipt_json)
+        throw new Error("REPOSITION_CLOSE_RECEIPT_NOT_CONFIRMED");
+      const receipt = confirmedReceipt(row), prepared = preparedFrom(row);
+      if (!receipt || receipt.status !== "success") throw new Error("REPOSITION_CLOSE_CONFIRMED_REVERT");
+      if (!prepared?.request?.data || !same(prepared.expectedHash,String(row.expected_hash)) || !same(receipt.transactionHash,String(row.expected_hash)) || Number(prepared.request.nonce) !== Number(row.nonce))
+        throw new Error("REPOSITION_CLOSE_RECEIPT_HASH_OR_PREPARED_EVIDENCE_MISMATCH");
+      if (convergedPhases.has(phase)) {
+        if (String(reset.close_reason) !== "USDG_RESET_REPOSITION") throw new Error("REPOSITION_CLOSE_REASON_INVALID");
+        return { result: "ALREADY_ADVANCED" as const,row: reset,transactionHash: receipt.transactionHash,closeReason: "USDG_RESET_REPOSITION" as const };
+      }
+      const nowMs = input.nowMs ?? Date.now(), expectedRevision = Number(reset.revision),
+        changed = input.repo.db.prepare("UPDATE v4_bid_ladder_usdg_reset_v1 SET phase='CLOSE_CONFIRMED',close_reason='USDG_RESET_REPOSITION',close_workflow_identity=?,block_reason=NULL,revision=revision+1,updated_at_ms=? WHERE ladder_id=? AND phase=? AND revision=?")
+          .run(String(reset.close_workflow_identity),nowMs,input.ladderId,phase,expectedRevision).changes;
+      if (changed !== 1) throw new Error("REPOSITION_CLOSE_CONFIRM_TRANSITION_CONFLICT");
+      const rowAfter = input.repo.loadBidLadderUsdReset(input.ladderId)!;
+      return { result: "APPLIED" as const,row: rowAfter,transactionHash: receipt.transactionHash,closeReason: "USDG_RESET_REPOSITION" as const };
+    })(),
+  });
 }
 function confirmedOpenTokenIds(receipt: TransactionReceipt) {
   return receipt.logs.flatMap((log) => {
@@ -751,6 +808,12 @@ async function submit(
     closeValuation?: BoundCloseValuation;
   },
 ) {
+  const timing: {
+    journalPreparedAtMs?: number;
+    signedAtMs?: number;
+    broadcastAtMs?: number;
+    receiptDetectedAtMs?: number;
+  } = {};
   assertDurableV4RecoveryStage(input.stage);
   const existing = journalRow(input.repo, input.ladderId, input.stage),
     attempt =
@@ -760,7 +823,7 @@ async function submit(
     id = batchId(input.ladderId, input.stage, attempt),
     already = confirmedReceipt(existing ?? {});
   if (already)
-    return { hash: already.transactionHash, receipt: already, recovered: true };
+    return { hash: already.transactionHash, receipt: already, recovered: true, timing };
   const result = await broadcastDurableTransaction({
     repo: input.repo,
     rpc: input.rpc,
@@ -879,6 +942,7 @@ async function submit(
                   );
               }
             })();
+        timing.journalPreparedAtMs = Date.now();
       },
       markSubmitted: () => {
         input.repo.db.transaction(() => {
@@ -921,6 +985,8 @@ async function submit(
               });
           }
         })();
+        timing.signedAtMs ??= Date.now();
+        timing.broadcastAtMs = Date.now();
       },
       handoffRecovery: (prepared) =>
         ensureEconomicReconciliationWork(input.repo, {
@@ -944,6 +1010,7 @@ async function submit(
     (await input.rpc.withClient((client) =>
       client.waitForTransactionReceipt({ hash: result.hash, timeout: 60_000 }),
     ))) as TransactionReceipt;
+  timing.receiptDetectedAtMs = Date.now();
   const persistTerminal = <T>(operation: string, run: () => T) =>
     withEconomicForegroundPersistenceSync({
       databasePath: input.repo.path,
@@ -1002,7 +1069,7 @@ async function submit(
           actualGasNative: receipt.gasUsed * receipt.effectiveGasPrice,
         }),
     );
-  return { hash: result.hash, receipt, recovered: result.recovered };
+  return { hash: result.hash, receipt, recovered: result.recovered, timing };
 }
 
 type OpenChainState = {
@@ -1502,7 +1569,19 @@ async function validateFinalOpenAuthority(
       Number.isFinite(poolPrice) && poolPrice > 0
         ? freshLpEntryPriceGuard({ target: targetAddress, poolPriceFundingPerTarget: poolPrice, fundingUsd: input.fundingUsd, fetch: priceMemo.fetch })
         : Promise.resolve({ status: "BLOCK" as const, poolPriceFundingPerTarget: String(poolPrice), tokenPriceFundingPerTarget: null, deviationBps: null, blocker: "POOL_PRICE_INVALID", evidence: undefined }),
-      input.rpc.withClient((client) => client.estimateGas({ account: input.wallet, to: V4_ROBINHOOD_DEPLOYMENTS.positionManager, data: plan.calldata, value: 0n })).catch(() => null),
+      input.rpc.withClient((client) => client.estimateGas({ account: input.wallet, to: V4_ROBINHOOD_DEPLOYMENTS.positionManager, data: plan.calldata, value: 0n })).catch(error => {
+        try { input.telemetry?.("v4_bid_ladder_estimate_gas_failure", {
+          ladderId: input.ladderId,
+          stage: "FINAL_OPEN_AUTHORITY",
+          errorClass: error instanceof Error ? error.name : "NonError",
+          errorCode: typeof (error as { code?:unknown })?.code === "string" ? String((error as { code:string }).code) : null,
+          message: error instanceof Error ? error.message : String(error),
+          outcome: "BLOCKED",
+          signingUsed: false,
+          broadcastUsed: false,
+        }); } catch {}
+        return null;
+      }),
     ]), memoAfter = priceMemo.stats();
   if (priceGuard.status === "BLOCK") blockers.push(priceGuard.blocker ?? "V4_BID_LADDER_PRICE_BLOCKED");
   if (estimatedGas === null) blockers.push("V4_BID_LADDER_MINT_ESTIMATE_FAILED");
@@ -1529,11 +1608,13 @@ export async function v4BidLadderFundingAllowanceReadiness(input:LadderLiveConte
   return {ready:erc20Ready&&permit2Ready,erc20Ready,permit2Ready,erc20Allowance,permit2Amount:permit[0],permit2Expiration:BigInt(permit[1]),amount,approvalUsd,blockers:[...(erc20Ready?[]:['REPOSITION_ERC20_EXACT_ALLOWANCE_REQUIRED']),...(permit2Ready?[]:['REPOSITION_PERMIT2_EXACT_ALLOWANCE_REQUIRED'])]};
 }
 
-export async function prepareV4BidLadderFundingAllowance(input:LadderLiveContext&{walletClient:WalletClient;fundingAmount:bigint}){
+export async function prepareV4BidLadderFundingAllowance(input:LadderLiveContext&{walletClient:WalletClient;fundingAmount:bigint;approvalIdentity?:string}){
   if(!input.runtime.executionEnabled||input.runtime.dryRun||input.runtime.emergencyPause||!input.runtime.signerConfigured||!input.runtime.allowlisted)throw new Error('V4_BID_LADDER_RUNTIME_BLOCKED');
   let readiness=await v4BidLadderFundingAllowanceReadiness(input),sent=0;
   if(readiness.blockers.includes('V4_BID_LADDER_POSITION_OR_APPROVAL_CAP_EXCEEDED'))throw new Error(readiness.blockers[0]);
-  const state=rows(input.repo,input.ladderId),token=getAddress(String(state.parent.funding_token)),stageSuffix=input.fundingAmount.toString();
+  const state=rows(input.repo,input.ladderId),token=getAddress(String(state.parent.funding_token)),approvalIdentity=input.approvalIdentity;
+  if(approvalIdentity&&!/^[A-Za-z0-9_-]{1,80}$/.test(approvalIdentity))throw new Error('REPOSITION_APPROVAL_IDENTITY_INVALID');
+  const stageSuffix=approvalIdentity?`${approvalIdentity}:${input.fundingAmount}`:input.fundingAmount.toString();
   if(!readiness.erc20Ready){const data=encodeFunctionData({abi:erc20ApprovalAbi,functionName:'approve',args:[V4_ROBINHOOD_DEPLOYMENTS.permit2,input.fundingAmount]}),gas=await input.rpc.withClient(client=>client.estimateGas({account:input.wallet,to:token,data})),result=await submit({...input,stage:`REPOSITION_PREPARE_ERC20_APPROVAL:${stageSuffix}`,to:token,data,estimatedGas:gas});if(!result.recovered)sent++;readiness=await v4BidLadderFundingAllowanceReadiness(input);}
   if(!readiness.permit2Ready){const approval=buildPermit2Approval(token,input.fundingAmount,BigInt(Math.floor(Date.now()/1000)+3600)),gas=await input.rpc.withClient(client=>client.estimateGas({account:input.wallet,to:approval.to,data:approval.data})),result=await submit({...input,stage:`REPOSITION_PREPARE_PERMIT2_APPROVAL:${stageSuffix}`,to:approval.to,data:approval.data,estimatedGas:gas});if(!result.recovered)sent++;readiness=await v4BidLadderFundingAllowanceReadiness(input);}
   if(!readiness.ready)throw new Error(`REPOSITION_ALLOWANCE_PREPARATION_INCOMPLETE:${readiness.blockers.join(',')}`);
@@ -1857,8 +1938,10 @@ export function persistV4BidLadderOpenReceiptProjection(input:LadderLiveContext,
  enqueueV4BidLadderOpenFreshness(input,rows(input.repo,input.ladderId),receipt,now,openContext);
  postReceiptOpenSqliteWrite(input,'v4_bid_ladder_open_portfolio_refresh_handoff',openContext,()=>enqueuePortfolioRefresh(input.repo,'V4_BID_LADDER_OPEN_RECEIPT_CONFIRMED'));return {bindings,canonicalMirror:{writes,positionIds:bindings.map(binding=>`v4:${binding.tokenId}`),fundingTotal:total}};
 }
-async function finalizeV4BidLadderOpenProjection(input:LadderLiveContext,receipt:TransactionReceipt){
- const openContext={priorReceiptReuse:false},projection=persistV4BidLadderOpenReceiptProjection(input,receipt,openContext),state=rows(input.repo,input.ladderId),block=await input.rpc.withClient(client=>client.getBlock({blockNumber:receipt.blockNumber}));
+async function finalizeV4BidLadderOpenProjection(input:LadderLiveContext,receipt:TransactionReceipt,openContext:OpenPostReceiptContext={priorReceiptReuse:false}){
+ const projection=persistV4BidLadderOpenReceiptProjection(input,receipt,openContext),state=rows(input.repo,input.ladderId),projectionUnchanged=Object.values(projection.canonicalMirror.writes).every(value=>value===0),depositsComplete=projection.bindings.every(binding=>input.repo.db.prepare("SELECT 1 FROM position_deposits WHERE id=?").get(`v4-bid-ladder-open:${input.ladderId}:${binding.legIndex}`));
+ if(projectionUnchanged&&depositsComplete)return {...projection,canonicalMirror:{...projection.canonicalMirror,writes:{...projection.canonicalMirror.writes,deposits:0}}};
+ const block=await input.rpc.withClient(client=>client.getBlock({blockNumber:receipt.blockNumber}));
  if(!block||block.timestamp===undefined)throw new Error('OPEN_RECEIPT_BLOCK_TIMESTAMP_UNAVAILABLE');
  let deposits=0;
  postReceiptOpenSqliteWrite(input,'v4_bid_ladder_open_deposit_projection',openContext,()=>input.repo.db.transaction(()=>{for(const binding of projection.bindings){const leg=state.legs[binding.legIndex]!,fundingAmount=BigInt(String(leg.funding_amount_raw)),positionId=`v4:${binding.tokenId}`,inserted=input.repo.ingestDeposit({id:`v4-bid-ladder-open:${input.ladderId}:${binding.legIndex}`,positionId,txHash:receipt.transactionHash,logIndex:binding.logIndex,amounts:{token0:Number(state.parent.funding_index)===0?fundingAmount:0n,token1:Number(state.parent.funding_index)===1?fundingAmount:0n},blockNumber:receipt.blockNumber,blockTimestamp:new Date(Number(block.timestamp)*1000).toISOString()});if(inserted)deposits++;}})());
@@ -1873,6 +1956,7 @@ export async function reconcileConfirmedV4BidLadderJournal(
   input: LadderLiveContext & {
     semanticStage: "OPEN_BATCH" | "CLOSE_BATCH" | `COLLECT_BATCH:${string}`;
     receipt: TransactionReceipt;
+    openContext?: OpenPostReceiptContext;
   },
 ) {
   const journal = journalRow(input.repo, input.ladderId, input.semanticStage);
@@ -1889,7 +1973,7 @@ export async function reconcileConfirmedV4BidLadderJournal(
   )
     throw new Error("V4_BID_LADDER_DURABLE_RECEIPT_IDENTITY_MISMATCH");
   if (input.semanticStage === "OPEN_BATCH")
-    return finalizeV4BidLadderOpenProjection(input, input.receipt);
+    return finalizeV4BidLadderOpenProjection(input, input.receipt, input.openContext);
   if (input.semanticStage.startsWith("COLLECT_BATCH:")) {
     const expected = collectExpectedFromJournal(input, input.semanticStage),evidence={positions:expected.map(leg=>({tokenId:leg.tokenId,token0:leg.liquidity,token1:leg.liquidity}))};
     return reconcileCollect(input, input.receipt, expected, evidence, input.semanticStage);
@@ -1899,6 +1983,11 @@ export async function reconcileConfirmedV4BidLadderJournal(
       "CLOSE_PREPARED",
       "CLOSE_SUBMITTED",
       "CLOSE_CONFIRMED",
+      "PRINCIPAL_RECONCILED",
+      "REOPEN_PLANNED",
+      "REOPEN_PREPARED",
+      "REOPEN_SUBMITTED",
+      "COMPLETED",
     ].includes(String(reset?.phase));
   if (
     resetClose &&
@@ -1913,35 +2002,173 @@ export async function reconcileConfirmedV4BidLadderJournal(
   );
 }
 
-function confirmedOpenExecutionResult(
+type EconomicActionSubmitTiming = {
+  journalPreparedAtMs?: number;
+  signedAtMs?: number;
+  broadcastAtMs?: number;
+  receiptDetectedAtMs?: number;
+};
+
+function canonicalEconomicProjectionCommit<T>(
+  input:LadderLiveContext,
+  operation:string,
+  semanticStage:string,
+  run:()=>T,
+){
+  if(input.canonicalProjectionLane==="FOREGROUND")return withEconomicForegroundPersistenceSync({
+    databasePath:input.repo.path,
+    component:"v4-bid-ladder-inline-projection",
+    operation,
+    workflow:input.ladderId,
+    semanticStage,
+    run,
+    onTelemetry:event=>input.telemetry?.("sqlite_write_window",event),
+  });
+  return withSqliteTransientRetrySync({operation,run});
+}
+
+/** Normal confirmed-receipt continuation. The durable row is persisted first,
+ * then the exact same idempotent projection engine used by recovery is invoked
+ * before the foreground action returns. A confirmed journal remains sufficient
+ * for discovery/recovery even if either local step encounters transient SQLite. */
+async function inlineCanonicalBidLadderReceipt(
   input: LadderLiveContext,
+  semanticStage: "OPEN_BATCH" | "CLOSE_BATCH" | `COLLECT_BATCH:${string}`,
   receipt: TransactionReceipt,
-  options: { priorReceiptReuse: boolean; mainnetTransactionsSent: number },
+  options: {
+    openContext?: OpenPostReceiptContext;
+    timing?: EconomicActionSubmitTiming;
+  } = {},
 ) {
-  const openContext = { priorReceiptReuse: options.priorReceiptReuse };
-  let reconciliation: ReturnType<typeof persistV4BidLadderOpenReceiptProjection> | undefined,
-    durableHandoff = false,
-    recoveryError: unknown;
-  try {
-    reconciliation = persistV4BidLadderOpenReceiptProjection(
-      input,
-      receipt,
-      openContext,
-    );
-  } catch (error) {
-    recoveryError = error;
-  }
+  let durableHandoff = false,
+    handoffError: unknown;
   try {
     durableHandoff = handoffBidLadderReceipt(
       input,
-      "OPEN_BATCH",
+      semanticStage,
       receipt,
-      openContext,
+      options.openContext,
     ).durable;
   } catch (error) {
-    recoveryError ??= error;
+    handoffError = error;
   }
-  const postReceiptRecoveryRequired = Boolean(recoveryError) || !durableHandoff,
+  const inlineReconcileStartAtMs = Date.now(),
+    journal = journalRow(input.repo, input.ladderId, semanticStage),
+    parsedAt = (value: unknown) => {
+      const parsed = value ? Date.parse(String(value)) : Number.NaN;
+      return Number.isFinite(parsed) ? parsed : undefined;
+    },
+    receiptDetectedAtMs =
+      options.timing?.receiptDetectedAtMs ??
+      parsedAt(journal?.confirmed_at) ??
+      inlineReconcileStartAtMs,
+    receiptLatencyMeasurable = options.timing?.receiptDetectedAtMs !== undefined,
+    timestamp = (value?: number) =>
+      value === undefined ? null : new Date(value).toISOString(),
+    emit = (
+      continuationStatus: "COMPLETED" | "AUTOMATIC_RECOVERY_ACTIVE",
+      canonicalProjectionCommittedAtMs?: number,
+      error?: unknown,
+    ) => {
+      const data = {
+        ladderId: input.ladderId,
+        workflowId: input.ladderId,
+        semanticStage,
+        continuationStatus,
+        operator_authority_at: timestamp(input.operatorAuthorityAtMs),
+        journal_prepared_at: timestamp(
+          options.timing?.journalPreparedAtMs ?? parsedAt(journal?.created_at),
+        ),
+        signed_at: timestamp(options.timing?.signedAtMs),
+        broadcast_at: timestamp(
+          options.timing?.broadcastAtMs ?? parsedAt(journal?.submitted_at),
+        ),
+        receipt_detected_at: timestamp(receiptDetectedAtMs),
+        inline_reconcile_start_at: timestamp(inlineReconcileStartAtMs),
+        canonical_projection_committed_at: timestamp(
+          canonicalProjectionCommittedAtMs,
+        ),
+        next_stage_started_at: null,
+        terminal_visible_at: null,
+        receipt_to_projection_ms:
+          canonicalProjectionCommittedAtMs === undefined || !receiptLatencyMeasurable
+            ? null
+            : canonicalProjectionCommittedAtMs - receiptDetectedAtMs,
+        projection_to_next_stage_ms: null,
+        durableHandoff,
+        durableHandoffError:
+          handoffError instanceof Error ? handoffError.message : handoffError ? String(handoffError) : null,
+        inlineReconcileError:
+          error instanceof Error ? error.message : error ? String(error) : null,
+        sqliteCode: error ? sqliteTransientCode(error) : undefined,
+      };
+      try {
+        input.telemetry?.("interactive_economic_action_latency", data);
+      } catch {}
+      if(data.receipt_to_projection_ms!==null)try {
+        input.repo.recordLatency(
+          "interactive_economic_receipt_to_projection",
+          data.receipt_to_projection_ms,
+          { context: data },
+        );
+      } catch {}
+    };
+  try {
+      const reconciliation = await reconcileConfirmedV4BidLadderJournal({
+        ...input,
+        semanticStage,
+        receipt,
+        openContext: options.openContext,
+        canonicalProjectionLane:"FOREGROUND",
+      }),
+      canonicalProjectionCommittedAtMs = Date.now();
+    emit("COMPLETED", canonicalProjectionCommittedAtMs);
+    return {
+      continuationStatus: "COMPLETED" as const,
+      reconciliation,
+      reconciliationPending: false as const,
+      durableHandoff,
+      inlineReconcileStartAtMs,
+      canonicalProjectionCommittedAtMs,
+      receiptDetectedAtMs,
+    };
+  } catch (error) {
+    emit("AUTOMATIC_RECOVERY_ACTIVE", undefined, error);
+    return {
+      continuationStatus: "AUTOMATIC_RECOVERY_ACTIVE" as const,
+      reconciliation: undefined,
+      reconciliationPending: true as const,
+      durableHandoff,
+      recoveryError: error,
+      inlineReconcileStartAtMs,
+      canonicalProjectionCommittedAtMs: undefined,
+      receiptDetectedAtMs,
+    };
+  }
+}
+
+async function confirmedOpenExecutionResult(
+  input: LadderLiveContext,
+  receipt: TransactionReceipt,
+  options: {
+    priorReceiptReuse: boolean;
+    mainnetTransactionsSent: number;
+    timing?: EconomicActionSubmitTiming;
+  },
+) {
+  const openContext = { priorReceiptReuse: options.priorReceiptReuse };
+  const inline = await inlineCanonicalBidLadderReceipt(
+      input,
+      "OPEN_BATCH",
+      receipt,
+      { openContext, timing: options.timing },
+    ),
+    reconciliation = inline.reconciliation as
+      | Awaited<ReturnType<typeof finalizeV4BidLadderOpenProjection>>
+      | undefined,
+    durableHandoff = inline.durableHandoff,
+    recoveryError = "recoveryError" in inline ? inline.recoveryError : undefined,
+    postReceiptRecoveryRequired = inline.continuationStatus === "AUTOMATIC_RECOVERY_ACTIVE",
     retryable = Boolean(recoveryError && sqliteTransientCode(recoveryError)),
     sqliteOperation =
       recoveryError && typeof (recoveryError as { operation?: unknown }).operation === "string"
@@ -1979,8 +2206,9 @@ function confirmedOpenExecutionResult(
     confirmedTokenIds: reconciliation?.bindings.map((binding) => binding.tokenId) ??
       confirmedOpenTokenIds(receipt),
     reconciliation,
-    reconciliationPending: true as const,
+    reconciliationPending: inline.reconciliationPending,
     durableHandoff,
+    continuationStatus: inline.continuationStatus,
     executionPhase: postReceiptRecoveryRequired
       ? ("POST_RECEIPT_RECOVERY_REQUIRED" as const)
       : ("POST_RECEIPT_CONVERGED" as const),
@@ -2090,6 +2318,7 @@ export async function executeV4BidLadderLiveOpen(
   return confirmedOpenExecutionResult(input, receipt, {
     priorReceiptReuse: sent.recovered,
     mainnetTransactionsSent: sent.recovered ? 0 : 1,
+    timing: sent.timing,
   });
 }
 
@@ -2443,9 +2672,11 @@ async function reconcileCollect(
     valuation=bound.status==="AVAILABLE"&&bound.sqrtPriceX96!==null&&bound.tick!==null&&bound.activeLiquidity!==null&&bound.initialized!==null?valueV4ReturnsFromSqrtPriceX96({token0:state.key.currency0,token1:state.key.currency1,decimals0:bound.token0Decimals,decimals1:bound.token1Decimals,amount0:result.aggregateTransfers.token0,amount1:result.aggregateTransfers.token1,sqrtPriceX96:BigInt(bound.sqrtPriceX96),source:{poolId:bound.poolId,poolKey:bound.poolKey,sqrtPriceX96:BigInt(bound.sqrtPriceX96),tick:bound.tick,activeLiquidity:BigInt(bound.activeLiquidity),initialized:bound.initialized,blockNumber:BigInt(bound.observationBlock),token0Decimals:bound.token0Decimals,token1Decimals:bound.token1Decimals}}):{status:"INCOMPLETE" as const,reason:bound.reason??"INCOMPLETE_HISTORICAL_POOL_STATE_UNAVAILABLE"},
     feeUsd = valuation.status==="AVAILABLE" ? usdMicrosToText(valuation.totalUsdMicros) : undefined,
     finalAtMs = Number(finalBlock.timestamp) * 1000;
-  withSqliteTransientRetrySync({
-    operation: "v4_bid_ladder_collect_reconciliation_commit",
-    run: () =>
+  canonicalEconomicProjectionCommit(
+    input,
+    "v4_bid_ladder_collect_reconciliation_commit",
+    stage,
+    () =>
       input.repo.db.transaction(() => {
         expected.forEach((leg, index) => {
           const positionId = `v4:${leg.tokenId}`;
@@ -2487,7 +2718,7 @@ async function reconcileCollect(
           presentationMetadata: { pair: `${String(parent.target_token)}/${String(parent.funding_token)}`, strategy: "V4 BID LADDER" },
         });
       })(),
-  });
+  );
   enqueuePortfolioRefresh(input.repo,'ECONOMIC_CLAIM_RECONCILED');
   return {
     ...result,
@@ -2518,12 +2749,14 @@ export async function executeV4BidLadderCollect(
   const prior = journalRow(input.repo, input.ladderId, stage),
     receipt = confirmedReceipt(prior ?? {});
   if (receipt) {
-    const handoff=handoffBidLadderReceipt(input,stage,receipt);
+    const inline=await inlineCanonicalBidLadderReceipt(input,stage,receipt);
     return {
       status: "COLLECTED" as const,
       hash: receipt.transactionHash,
-      reconciliation: undefined,
-      reconciliationPending:true as const,durableHandoff:handoff.durable,
+      reconciliation: inline.reconciliation as Awaited<ReturnType<typeof reconcileCollect>> | undefined,
+      reconciliationPending:inline.reconciliationPending,
+      durableHandoff:inline.durableHandoff,
+      continuationStatus:inline.continuationStatus,
       mainnetTransactionsSent: 0,
       collectAuthorizationId: input.collectAuthorizationId,
     };
@@ -2551,12 +2784,14 @@ export async function executeV4BidLadderCollect(
       data: plan.calldata,
       estimatedGas,
     });
-    const handoff=handoffBidLadderReceipt(input,stage,sent.receipt);
+    const inline=await inlineCanonicalBidLadderReceipt(input,stage,sent.receipt,{timing:sent.timing});
     return {
       status: "COLLECTED" as const,
       hash: sent.hash,
-      reconciliation: undefined,
-      reconciliationPending:true as const,durableHandoff:handoff.durable,
+      reconciliation: inline.reconciliation as Awaited<ReturnType<typeof reconcileCollect>> | undefined,
+      reconciliationPending:inline.reconciliationPending,
+      durableHandoff:inline.durableHandoff,
+      continuationStatus:inline.continuationStatus,
       mainnetTransactionsSent: sent.recovered ? 0 : 1,
       collectAuthorizationId: input.collectAuthorizationId,
     };
@@ -2631,6 +2866,68 @@ function closeCanonicalMirrors(
     throw new Error("V4_BID_LADDER_CLOSE_PARENT_CONFLICT");
   return writes;
 }
+function assertCanonicalClosePostcondition(input: {
+  repo: SqliteLedgerRepository;
+  ladderId: string;
+  receipt: TransactionReceipt;
+  revisionBefore: number;
+  parentWasOpen: boolean;
+  mirrorWrites: ReturnType<typeof closeCanonicalMirrors>;
+}) {
+  const parent = input.repo.loadBidLadder(input.ladderId);
+  if (
+    !parent ||
+    String(parent.status) !== "CLOSED" ||
+    String(parent.close_provenance) !== "FUNI_EXECUTED" ||
+    String(parent.terminal_provenance) !== "FUNI_AUTHORED_CLOSE_BATCH"
+  )
+    throw new Error("V4_BID_LADDER_CLOSE_CANONICAL_POSTCONDITION_FAILED");
+  if (
+    input.mirrorWrites.parent !== 0 ||
+    Number(parent.revision) !== input.revisionBefore + (input.parentWasOpen ? 1 : 0)
+  )
+    throw new Error("V4_BID_LADDER_CLOSE_TERMINAL_TRANSITION_NOT_EXACTLY_ONCE");
+  const journal = input.repo.db.prepare(
+    "SELECT journal_id,status,expected_hash,receipt_json FROM chain_transaction_journal WHERE chain_id=? AND protocol='uniswap_v4' AND workflow_identity=? AND semantic_stage='CLOSE_BATCH' AND lower(expected_hash)=lower(?)",
+  ).get(CHAIN_ID, input.ladderId, input.receipt.transactionHash) as Record<string, unknown> | undefined;
+  const journalReceipt = journal ? confirmedReceipt(journal) : undefined;
+  if (
+    !journal ||
+    String(journal.status) !== "CONFIRMED" ||
+    !journalReceipt ||
+    journalReceipt.status !== "success" ||
+    !same(journalReceipt.transactionHash, input.receipt.transactionHash)
+  )
+    throw new Error("V4_BID_LADDER_CLOSE_JOURNAL_POSTCONDITION_FAILED");
+  const mirrors = input.repo.db.prepare(
+    `SELECT COUNT(*) count,
+      SUM(CASE WHEN leg.status='CLOSED' AND leg.close_batch_id=? THEN 1 ELSE 0 END) closed_legs,
+      SUM(CASE WHEN position.status='closed' THEN 1 ELSE 0 END) closed_positions,
+      SUM(CASE WHEN v4.status='closed' AND v4.liquidity_raw='0' AND v4.open_intent_id=? THEN 1 ELSE 0 END) closed_v4_positions
+     FROM v4_bid_ladder_legs leg
+     LEFT JOIN v4_positions v4 ON v4.token_id=leg.token_id
+     LEFT JOIN positions position ON position.id='v4:'||leg.token_id
+     WHERE leg.ladder_id=?`,
+  ).get(String(journal.journal_id), input.ladderId, input.ladderId) as {
+    count: number;
+    closed_legs: number;
+    closed_positions: number;
+    closed_v4_positions: number;
+  };
+  if (
+    mirrors.count !== 5 ||
+    mirrors.closed_legs !== 5 ||
+    mirrors.closed_positions !== 5 ||
+    mirrors.closed_v4_positions !== 5
+  )
+    throw new Error("V4_BID_LADDER_CLOSE_MIRROR_POSTCONDITION_FAILED");
+  return {
+    status: "PROVEN" as const,
+    parentRevision: Number(parent.revision),
+    journalId: String(journal.journal_id),
+    terminalTransitions: input.parentWasOpen ? 1 : 0,
+  };
+}
 export function reconcileTerminalV4BidLadderParent(input: {
   repo: SqliteLedgerRepository;
   ladderId: string;
@@ -2645,9 +2942,10 @@ type V4BidLadderManualCloseReconciliation = {
       >["aggregateTransfers"]
     | undefined;
   canonicalMirror: { writes: ReturnType<typeof closeCanonicalMirrors> };
+  atomicPostcondition: ReturnType<typeof assertCanonicalClosePostcondition>;
   perLegCloseAccounting: "UNAVAILABLE_FROM_AGGREGATE_TAKE_PAIR";
 };
-const pendingCloseReconciliation=()=>({aggregateTransfers:undefined,canonicalMirror:{writes:{positions:0,v4Positions:0,legs:0,parent:0}},perLegCloseAccounting:"UNAVAILABLE_FROM_AGGREGATE_TAKE_PAIR" as const,reconciliationPending:true as const});
+const pendingCloseReconciliation=()=>({aggregateTransfers:undefined,canonicalMirror:{writes:{positions:0,v4Positions:0,legs:0,parent:0}},atomicPostcondition:undefined,perLegCloseAccounting:"UNAVAILABLE_FROM_AGGREGATE_TAKE_PAIR" as const,reconciliationPending:true as const});
 async function reconcileClose(
   input: LadderLiveContext,
   receipt: TransactionReceipt,
@@ -2687,25 +2985,22 @@ async function reconcileClose(
     priced = returnedMicros !== null,
     finalAtMs = Number(finalBlock.timestamp) * 1000;
   const firstPosition=input.repo.v4Position(String(state.legs[0]?.token_id??"")),pair=v4BidLadderClosePairLabel({targetSymbol:firstPosition?.target_symbol,fundingSymbol:firstPosition?.funding_symbol,targetAddress:parent.target_token,fundingAddress:parent.funding_token}),opened=input.repo.db.prepare("SELECT MIN(block_timestamp) opened_at FROM position_deposits WHERE position_id IN (SELECT 'v4:'||token_id FROM v4_positions WHERE open_intent_id=?)").get(input.ladderId) as {opened_at:string|null},eventId=`${input.ladderId}:CLOSE_BATCH:${receipt.transactionHash.toLowerCase()}:CLOSE`;
-  let mirrorWrites: ReturnType<typeof closeCanonicalMirrors>;
+  let mirrorWrites: ReturnType<typeof closeCanonicalMirrors>,
+    atomicPostcondition: ReturnType<typeof assertCanonicalClosePostcondition>;
   const apply = input.repo.db.transaction(() => {
+    const parentBefore = input.repo.loadBidLadder(input.ladderId);
+    if (!parentBefore) throw new Error("V4_BID_LADDER_CLOSE_PARENT_MISSING");
+    convergeTerminalV4BidLadder({repo:input.repo,ladderId:input.ladderId,provenance:"FUNI_CLOSE_CONFIRMED",nowMs:finalAtMs});
     mirrorWrites = closeCanonicalMirrors(
       input.repo,
       rows(input.repo, input.ladderId),
     );
-    convergeTerminalV4BidLadder({repo:input.repo,ladderId:input.ladderId,provenance:"FUNI_CLOSE_CONFIRMED",nowMs:finalAtMs});
     const reset = input.repo.loadBidLadderUsdReset(input.ladderId);
     if (reset) {
       if (closeReason === "USDG_RESET_REPOSITION") {
         if (["CLOSE_PREPARED", "CLOSE_SUBMITTED"].includes(String(reset.phase)))
-      input.repo.transitionBidLadderUsdReset({
-            ladderId: input.ladderId,
-            from: ["CLOSE_PREPARED", "CLOSE_SUBMITTED"],
-            to: "CLOSE_CONFIRMED",
-            closeReason,
-            closeWorkflowIdentity: String(reset.close_workflow_identity),
-          });
-        else if (String(reset.phase) !== "CLOSE_CONFIRMED")
+          convergeConfirmedV4BidLadderRepositionClose({repo:input.repo,ladderId:input.ladderId,nowMs:finalAtMs});
+        else if (!["CLOSE_CONFIRMED", "PRINCIPAL_RECONCILED", "REOPEN_PLANNED", "REOPEN_PREPARED", "REOPEN_SUBMITTED", "COMPLETED"].includes(String(reset.phase)))
           throw new Error("V4_BID_LADDER_USDG_RESET_CLOSE_PHASE_INVALID");
       } else if (String(reset.phase) !== "OPERATOR_CLOSED")
         input.repo.transitionBidLadderUsdReset({
@@ -2747,15 +3042,21 @@ async function reconcileClose(
       chatIdentity:closeCardChatIdentity,
       metadata:{automatic:true,eventPersistedAtMs:durableCloseEvent.created_at_ms},
     });
+    atomicPostcondition = assertCanonicalClosePostcondition({
+      repo: input.repo,
+      ladderId: input.ladderId,
+      receipt,
+      revisionBefore: Number(parentBefore.revision),
+      parentWasOpen: String(parentBefore.status) === "OPEN",
+      mirrorWrites,
+    });
   });
-  withSqliteTransientRetrySync({
-    operation: "v4_bid_ladder_close_reconciliation_commit",
-    run: apply,
-  });
+  canonicalEconomicProjectionCommit(input,"v4_bid_ladder_close_reconciliation_commit","CLOSE_BATCH",apply);
   for(const leg of expected)enqueueTargetedPositionReconciliation(input.repo,{positionId:`v4:${leg.tokenId}`,tokenId:leg.tokenId.toString(),protocol:'v4',reason:'ECONOMIC_CLOSE_RECEIPT_CONFIRMED',priority:1_000});
   return {
     ...result,
     canonicalMirror: { writes: mirrorWrites! },
+    atomicPostcondition: atomicPostcondition!,
     perLegCloseAccounting: "UNAVAILABLE_FROM_AGGREGATE_TAKE_PAIR",
   };
 }
@@ -2832,14 +3133,18 @@ export async function executeV4BidLadderManualClose(
   }
   const prior = journalRow(input.repo, input.ladderId, "CLOSE_BATCH"),
     priorReceipt = confirmedReceipt(prior ?? {});
-  if (priorReceipt)
-    return (()=>{const handoff=handoffBidLadderReceipt(input,'CLOSE_BATCH',priorReceipt);return {
+  if (priorReceipt) {
+    const inline=await inlineCanonicalBidLadderReceipt(input,"CLOSE_BATCH",priorReceipt);
+    return {
       status: "CLOSED" as const,
       hash: priorReceipt.transactionHash,
-      reconciliation: pendingCloseReconciliation(),
-      reconciliationPending:true as const,durableHandoff:handoff.durable,
+      reconciliation: (inline.reconciliation as V4BidLadderManualCloseReconciliation | undefined) ?? pendingCloseReconciliation(),
+      reconciliationPending:inline.reconciliationPending,
+      durableHandoff:inline.durableHandoff,
+      continuationStatus:inline.continuationStatus,
       mainnetTransactionsSent: 0,
-    };})();
+    };
+  }
   let recoveredRevert = false;
   const unresolved =
     prior && ["PREPARED", "SUBMITTED"].includes(String(prior.status))
@@ -2861,12 +3166,14 @@ export async function executeV4BidLadderManualClose(
             closeReason,
             manualRepositionAuthorization: input.manualRepositionAuthorization,
           });
-          const handoff=handoffBidLadderReceipt(input,'CLOSE_BATCH',recovered.receipt);
+          const inline=await inlineCanonicalBidLadderReceipt(input,"CLOSE_BATCH",recovered.receipt,{timing:recovered.timing});
           return {
             status: "CLOSED" as const,
             hash: recovered.hash,
-            reconciliation: pendingCloseReconciliation(),
-            reconciliationPending:true as const,durableHandoff:handoff.durable,
+            reconciliation: (inline.reconciliation as V4BidLadderManualCloseReconciliation | undefined) ?? pendingCloseReconciliation(),
+            reconciliationPending:inline.reconciliationPending,
+            durableHandoff:inline.durableHandoff,
+            continuationStatus:inline.continuationStatus,
             mainnetTransactionsSent: recovered.recovered ? 0 : 1,
           };
         },
@@ -2912,6 +3219,7 @@ export async function executeV4BidLadderManualClose(
       reconciliation: {
         aggregateTransfers: undefined,
         canonicalMirror: { writes: writes! },
+        atomicPostcondition: undefined,
         perLegCloseAccounting: "UNAVAILABLE_FROM_AGGREGATE_TAKE_PAIR",
       },
       mainnetTransactionsSent: 0,
@@ -2933,12 +3241,14 @@ export async function executeV4BidLadderManualClose(
         closeValuation: preview.closeValuation,
         closeReason,
         manualRepositionAuthorization: input.manualRepositionAuthorization,
-      }),handoff=handoffBidLadderReceipt(input,'CLOSE_BATCH',sent.receipt);
+      }),inline=await inlineCanonicalBidLadderReceipt(input,"CLOSE_BATCH",sent.receipt,{timing:sent.timing});
     return {
       status: "CLOSED" as const,
       hash: sent.hash,
-      reconciliation: pendingCloseReconciliation(),
-      reconciliationPending:true as const,durableHandoff:handoff.durable,
+      reconciliation: (inline.reconciliation as V4BidLadderManualCloseReconciliation | undefined) ?? pendingCloseReconciliation(),
+      reconciliationPending:inline.reconciliationPending,
+      durableHandoff:inline.durableHandoff,
+      continuationStatus:inline.continuationStatus,
       mainnetTransactionsSent: sent.recovered ? 0 : 1,
     };
   });

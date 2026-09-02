@@ -23,6 +23,12 @@ export const strictBooleanSchema=(key:string,fallback:boolean)=>z.preprocess(
  value=>value===undefined?fallback:parseStrictBoolean(key,value),z.boolean(),
 );
 
+export const MAX_GAS_COST_USD_CEILING=2;
+export const maxGasCostUsdSchema=z.coerce
+ .number()
+ .positive()
+ .max(MAX_GAS_COST_USD_CEILING);
+
 export type ExecutionOperation='open'|'close'|'collect'|'burn';
 export type CanonicalExecutionGates={
  executionEnabled:boolean;dryRun:boolean;emergencyPause:boolean;
